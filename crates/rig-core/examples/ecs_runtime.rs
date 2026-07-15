@@ -52,6 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run = runtime
         .resolve_run(&pending)
         .ok_or("prompt was not ingested")?;
+    let summary = runtime.snapshot_summary(run)?;
+    println!("snapshot: {}", serde_json::to_string(&summary)?);
     let Some(RunState::Completed(output)) = runtime.observe_run(run)? else {
         return Err("run did not complete".into());
     };

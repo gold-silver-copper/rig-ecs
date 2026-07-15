@@ -677,18 +677,18 @@ The table below is the audit map for the pre-ECS runtime. Test names refer to
 | invalid-tool hook | pending-invalid component plus ordered durable evaluation | repair/retry/skip bundles and invocation event | invalid-tool action, budget, streaming, and snapshot tests | `gemini_default_api_recovery` |
 | tool-call hook | per-operation policy evaluation with immutable tool decision | rewrite/approval/skip bundles | rewrite, approval, skip, and snapshot tests | `agent_with_approval_policy` |
 | tool-result hook | immutable raw effect plus mutable presentation evaluation | `ToolResultRedactionPolicyBundle` | raw/presentation separation, content-free settlement telemetry, and stop tests | `tool_result_outcomes` |
-| hook scratchpad/context | extension-owned typed components and relationship queries | `RigOperationContext`, ordinary `Component` | extension/SystemParam test | `ecs_extension`, `tool_result_outcomes` |
+| hook scratchpad/context | extension-owned typed components and tenant-checked relationship queries | `RigOperationContext`, `RigRunContext`, `RigPolicyContext`, `TenantScopedQuery`, ordinary `Component` | extension/SystemParam and tenant-scope tests | `ecs_extension`, `tool_result_outcomes` |
 | asynchronous hooks | approval operation entities and owned effect I/O | `PolicyRule::RequireApproval` | request/tool/result/invalid approval snapshot tests | `agent_with_durable_approval` |
 | tools and dynamic tools | capability and grant entities with revisioned immutable snapshots | agent builder tools, `spawn_tool`, `grant_tool` | collision, retirement, batch, and provider suites | `agent_with_tools`, `rag_dynamic_tools` |
 | MCP/tool-server refresh | discovery-source and discovered-capability relationships | discovery commands and RMCP adapter | generation/retirement tests plus the local live-protocol example | `rmcp` |
 | memory and retrieval | store capability/grant/operation entities | builder `memory` and `dynamic_context` | memory and vector-retrieval tests | `agent_with_memory`, `rag` |
 | structured output | `OutputRequirement` plus run-local retry counters | output schema/mode/retry builder methods | validation, retry, snapshot, provider extraction tests | `extractor` |
 | cancellation and suspension | `RunControl` orthogonal to `RunState` | pause modes, resume, cancel commands | drain/freeze/cancel-and-suspend race tests | `agent_run_stepping`, `multi_agent` |
-| active `AgentRun` serialization | stable-ID `ActiveRunSnapshot` | `snapshot_active_run`, `restore_active_run` | every waiting-phase restoration test | `agent_with_durable_approval` |
+| active `AgentRun` serialization | stable-ID `ActiveRunSnapshot` with migrations, limits, integrity envelope, and extension codecs | `snapshot_active_run`, `restore_active_run`, `snapshot_summary` | waiting-phase, migration, limit, integrity, and extension-rebinding tests | `agent_with_durable_approval`, `ecs_runtime` |
 | child-agent delegation | `ParentRun`/`ChildRuns`, `WaitingForChildren`, explicit ordinal | `spawn_agent`, `spawn_child_run` | deterministic result and cancellation tests | `agent_with_agent_tool` |
 | telemetry hooks | observe-only entity events and optional typed counters | `LifecycleTelemetryBundle` | lifecycle event ordering and telemetry tests | `agent_with_tools_otel` |
 | provider diagnostics | canonical effect outcome plus immutable serialized and concrete typed response components on the model operation | `TypedProviderResponseDiagnostics<M::Response>`, `ProviderResponseDiagnostics`, and generation-validated ingress | typed facade query, response-policy query, streaming ingress, and snapshot tests | provider examples |
-| WASM | identical ECS state with target-specific effect transport only | normal Rust bounds | WASM compile gate | browser-capable core consumers |
+| WASM | identical ECS state with target-specific effect transport only | normal Rust bounds | WASM compile gate plus headless-Chrome local future/effect round trip | `crates/rig-core/tests/wasm_runtime.rs` |
 
 ## Hook-to-ECS migration guide
 
@@ -747,7 +747,16 @@ policy helpers—`RequestPatchPolicyBundle`, `ToolApprovalPolicyBundle`,
 the installer. `LifecycleTelemetryBundle` is inserted on an agent to opt into
 queryable observe-only counters. `RigOperationContext` is a read-only
 `SystemParam` resolving operation → run → agent metadata without allowing a
-borrow to escape into asynchronous work.
+borrow to escape into asynchronous work. `RigRunContext` and
+`RigPolicyContext` expose the corresponding tenant-validated ownership facts,
+while `TenantScopedQuery` keeps its underlying read-only query private and
+requires an explicit tenant on every lookup or iteration.
+
+`EcsEffect` gives extensions typed input, output, and error components while
+reusing core operation ownership, generation, phase, cancellation, stable ID,
+and tenant correlation. `spawn_extension_effect`,
+`dispatch_extension_effect`, and `settle_extension_effect` enforce the common
+lifecycle without adding extension variants to `EffectInput` or `EffectOutput`.
 
 Custom behavior may add components and systems at the public `RigSet`
 boundaries or attach one targeted steering observer to a `PolicyRule::Custom`
@@ -807,20 +816,35 @@ immediately-ready policy-heavy run cannot exclude a ready sibling. Waiting and
 paused runs do not report progress. Separate worlds remain the isolation and
 scheduling-shard boundary for distinct trust domains.
 
+Core effect dispatch uses `RunPriority`, the run's monotonic `ReadyAt` admission
+tick, and stable identity as its deterministic order. The bounded per-pass
+budget is divided round-robin across every ready `(tenant, effect kind)` pair;
+the cursor advances across passes so a noisy tenant or earlier schedule stage
+cannot monopolize a small budget. In-flight run, agent, and tenant counters are
+rebuilt once per pass and updated per reservation, avoiding a world scan for
+every dispatched operation.
+
+`ReadyAt` is a runtime-local logical order, not a portable wall-clock value.
+Active-run restoration rebases distinct captured readiness ranks at or before
+the target runtime's current tick. This preserves relative captured order while
+ensuring subsequently admitted equal-priority work cannot indefinitely jump
+ahead of a checkpoint restored from an older world.
+
 ## Active-run snapshot format
 
-`ActiveRunSnapshot` format version 5 contains only stable domain IDs plus opaque
+`ActiveRunSnapshot` format version 6 contains only stable domain IDs plus opaque
 snapshot-local references. It records:
 
 - root and descendant runs, parent identity, child ordinal, and committed-child status;
-- authoritative run phase and orthogonal pause mode;
+- authoritative run phase, orthogonal pause mode, priority, and readiness age;
 - prompt, transcript, usage, turn/model budgets, invalid-tool retries, and structured-output retries;
 - memory/retrieval decisions, conversation state, pending output, and persistence state;
 - operation generation/phase, immutable model/tool/store decisions, stream sequence, settled output, and serialized provider diagnostics;
 - tool batches and explicit call order;
 - accepted policy IDs/revisions/order/lifecycle capability, evaluation kind/cursor, accumulated request patch, effective arguments/presentation, and pending approvals;
 - run-scoped policy definitions, status, and stable run relationships;
-- committed-turn audit records.
+- committed-turn audit records;
+- extension-owned JSON sections keyed by stable binding ID and exact codec revision.
 
 Raw entity IDs, observers, registered systems, clients, secrets, channels, and
 task handles are never serialized. Restoration validates tenant and revision
@@ -832,14 +856,33 @@ tool data, policy decisions, and provider content and must therefore be handled
 as application-sensitive data. Runtime-only custom observers/systems must be
 reinstalled after domain restoration before runs resume.
 
+Versions 4 and 5 migrate explicitly to version 6. Version 6 adds a
+default-empty extension section, so historical snapshots require no invented
+extension state. `ActiveRunSnapshotLimits` rejects oversized byte counts, run
+graphs, depths, child fan-out, operation/evaluation counts, transcripts, and
+extension payloads before entity creation. Required extension codecs and exact
+revisions are validated before mutation; optional missing sections are ignored.
+`encode_active_run_snapshot` adds a SHA-256 integrity envelope and optionally
+invokes an application-owned reversible protection hook. Core never owns or
+serializes protection keys, and decoding requires the caller's expected
+protection mode to match the envelope. Typed extension-effect inputs/results
+remain concrete application components, so core capture rejects non-discarded
+extension operations rather than silently losing them. `snapshot_summary`
+returns a structured JSON-ready
+inventory of topology, states, operation kinds, transcript size, and extension
+size. `ActiveRunCheckpointJournal` provides optional append-only, hash-chained
+complete checkpoints; it deliberately does not define field-level deltas.
+
 ## Known behavior not yet equivalent
 
-None identified. The merge-base capability, provider, feature, cassette, test,
-and example inventories are retained, and each pre-ECS hook boundary has a
-tested ECS-native replacement in the capability matrix above. Runtime-only
-extension behavior remains intentionally application-owned and must be
-reinstalled after restoration, as documented in the snapshot contract; this is
-an explicit rebinding boundary rather than a lost runtime capability.
+No merge-base examples, provider tests, cassettes, or documented features were
+removed. The remaining improvement work tracked by this PR is evidence and
+hardening rather than restoration of a deleted public capability: independent
+policy evaluations currently make deterministic progress in one shared
+schedule but are not executed on multiple worker threads. Worker-thread
+parallelism must not be described as implemented until benchmark evidence
+shows it improves these short, ordered evaluation steps without changing
+rewrite chaining or browser behavior.
 
 ## Restored example inventory
 
@@ -868,12 +911,16 @@ complete restored root package set is:
 `sentiment_classifier`, `tool_result_outcomes`, `transcription`,
 `vector_search_cohere`, `vector_search_ollama`, and `vector_search`.
 
-Core-native `ecs_runtime` and `ecs_extension` examples additionally demonstrate
-standalone and embedded-world execution. The feature-to-example map is:
+Core-native `ecs_runtime`, `ecs_extension`, and `ecs_async_extension` examples
+additionally demonstrate standalone execution with structured diagnostics,
+embedded-world execution, and typed asynchronous extension effects. The
+feature-to-example map is:
 
 | Runtime feature | Example |
 | --- | --- |
 | targeted lifecycle observation / embedded world | `crates/rig-core/examples/ecs_extension.rs` |
+| structured snapshot diagnostics | `crates/rig-core/examples/ecs_runtime.rs` |
+| typed asynchronous extension effects | `crates/rig-core/examples/ecs_async_extension.rs` |
 | request patch / deterministic ordering | `request_hook` |
 | tool rewrite, skip, result redaction | `agent_with_human_in_the_loop`, `agent_with_approval_policy`, `tool_result_outcomes` |
 | approval / durable approval | `agent_with_human_in_the_loop`, `agent_with_approval_policy`, `agent_with_durable_approval` |
@@ -885,21 +932,28 @@ standalone and embedded-world execution. The feature-to-example map is:
 ## Benchmark matrix
 
 `cargo bench -p rig-core --bench ecs_runtime` measures all required operational
-shapes with deterministic fake effects: one-shot prompts, 100 concurrent runs
-on one agent, 100 concurrent runs across eight agents, freeze/resume beside an
-active sibling, dynamic child orchestration, 100-policy evaluation, 100 stream
-deltas, and a 16-call parallel logical tool batch. Results are machine-specific;
+shapes with deterministic fake effects: no-policy one-shot prompts, one policy
+on one run, 100 policies on one run, one shared policy across 1,000 runs,
+asynchronous approval, 100 concurrent runs on one agent, 100 concurrent runs
+across eight agents, freeze/resume beside an active sibling, dynamic child
+orchestration, 100 plain and policy-steered stream deltas, and a 16-call logical
+tool batch with a policy on every call. Results are machine-specific;
 the final PR verification record captures the exact run used for review rather
 than presenting these smoke timings as stable performance guarantees. The
 2026-07-15 verification run on the PR workstation reported:
 
 | Shape | Result |
 | --- | ---: |
-| one-shot prompt | 2,088,351.7 ns/op |
-| 100 runs, one agent | 30,498.3 ns/op |
-| 100 runs, eight agents | 29,802.5 ns/op |
-| freeze/resume beside active | 532,625.0 ns/op |
-| dynamic child orchestration | 935,812.5 ns/op |
-| 100-policy run | 298,031.7 ns/op |
-| 100 streaming deltas | 5,725.4 ns/op |
-| 16-call tool batch | 48,224.0 ns/op |
+| no-policy one-shot prompt | 2,026,842.5 ns/op |
+| 100 runs, one agent | 27,394.6 ns/op |
+| 100 runs, eight agents | 27,096.2 ns/op |
+| freeze/resume beside active | 578,854.0 ns/op |
+| dynamic child orchestration | 1,204,625.0 ns/op |
+| 100-policy run | 245,717.1 ns/op |
+| one policy, one run | 2,057,834.0 ns/op |
+| one policy, 1,000 runs | 21,491.4 ns/op |
+| asynchronous approval | 2,514,959.0 ns/op |
+| 1,000 advertised capabilities | 3,020,875.0 ns/op |
+| 100 streaming deltas, no policy | 6,550.8 ns/op |
+| 100 streaming deltas, one policy | 6,552.9 ns/op |
+| 16-call tool batch, policy on each call | 49,520.9 ns/op |

@@ -76,7 +76,16 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - name: Run cargo check wasm target
-        run: cargo check --package rig-core --features wasm --target wasm32-unknown-unknown
+        run: cargo check --package rig-core --no-default-features --features wasm --target wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen test runner
+        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
+
+      - name: Run ECS runtime smoke test in Chrome
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          WASM_BINDGEN_TEST_ONLY_WEB: "1"
+        run: cargo test --package rig-core --target wasm32-unknown-unknown --no-default-features --features wasm --test wasm_runtime -- --nocapture
 
   clippy:
     name: stable / clippy

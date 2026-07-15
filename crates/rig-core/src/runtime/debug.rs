@@ -221,7 +221,7 @@ impl Runtime {
             .world
             .get::<RunOperations>(run.entity)
             .into_iter()
-            .flat_map(|operations| operations.0.iter().copied())
+            .flat_map(RunOperations::iter)
             .filter_map(|operation| operation_debug(&self.world, operation))
             .collect::<Vec<_>>();
         operations.sort_by(|left, right| left.id.cmp(&right.id));
@@ -269,12 +269,12 @@ impl Runtime {
             .world
             .get::<RunOperations>(run.entity)
             .into_iter()
-            .flat_map(|operations| operations.0.iter().copied())
+            .flat_map(RunOperations::iter)
             .flat_map(|operation| {
                 self.world
                     .get::<OperationPolicyEvaluations>(operation)
                     .into_iter()
-                    .flat_map(|evaluations| evaluations.0.iter().copied())
+                    .flat_map(OperationPolicyEvaluations::iter)
             })
             .filter_map(|evaluation| evaluation_debug(&self.world, evaluation))
             .collect::<Vec<_>>();
@@ -314,9 +314,8 @@ impl Runtime {
             && self.world.get::<WaitingForChildren>(run.entity).is_some()
         {
             let mut ids = children
-                .0
                 .iter()
-                .filter_map(|child| self.world.get::<StableId>(*child).cloned())
+                .filter_map(|child| self.world.get::<StableId>(child).cloned())
                 .collect::<Vec<_>>();
             ids.sort();
             return Ok(StalledReason::WaitingForChildren(ids));
@@ -337,7 +336,7 @@ impl Runtime {
                     .world
                     .get::<BatchOperations>(*batch)
                     .into_iter()
-                    .flat_map(|operations| operations.0.iter().copied())
+                    .flat_map(BatchOperations::iter)
                     .filter(|operation| {
                         self.world
                             .get::<OperationState>(*operation)
@@ -383,7 +382,7 @@ impl Runtime {
             .world
             .get::<ChildRuns>(run.entity)
             .into_iter()
-            .flat_map(|children| children.0.iter().copied())
+            .flat_map(ChildRuns::iter)
             .filter_map(|child| {
                 Some((
                     self.world.get::<StableId>(child)?.clone(),

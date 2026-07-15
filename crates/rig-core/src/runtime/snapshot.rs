@@ -5,15 +5,263 @@
 //! channels, deadlines, and provider clients are deliberately reconstructed by
 //! the installed runtime rather than serialized.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use bevy_ecs::{prelude::*, relationship::Relationship};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::*;
 
-const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 5;
+const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 6;
+const ACTIVE_RUN_ENVELOPE_VERSION: u32 = 1;
+
+/// Application-supplied encryption or reversible redaction boundary.
+///
+/// Core never stores keys. The protected bytes are checksummed after this hook,
+/// and the inverse hook runs only after integrity validation.
+pub trait ActiveRunSnapshotProtection {
+    /// Protects canonical checkpoint JSON before it leaves the process.
+    fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// Recovers canonical checkpoint JSON after integrity validation.
+    fn unprotect(&self, protected: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+#[derive(Deserialize, Serialize)]
+struct ActiveRunSnapshotEnvelope {
+    version: u32,
+    protected: bool,
+    sha256: String,
+    payload: Vec<u8>,
+}
+
+/// Append-only, hash-chained active-run checkpoint journal.
+///
+/// Entries are complete encoded envelopes. This keeps recovery deterministic
+/// and permits later compaction without defining fragile field-level deltas.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveRunCheckpointJournal {
+    /// Journal schema version.
+    pub version: u32,
+    /// Stable root run shared by every appended checkpoint.
+    pub root_run: StableId,
+    /// Ordered hash-chained checkpoint entries.
+    pub entries: Vec<ActiveRunCheckpointEntry>,
+}
+
+/// One encoded checkpoint in an append-only journal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveRunCheckpointEntry {
+    /// Monotonic zero-based sequence.
+    pub sequence: u64,
+    /// SHA-256 of the preceding encoded envelope, or `None` for the first entry.
+    pub previous_sha256: Option<String>,
+    /// Integrity-checked envelope produced by [`encode_active_run_snapshot`].
+    pub encoded: Vec<u8>,
+}
+
+impl ActiveRunCheckpointJournal {
+    /// Creates an empty journal for `root_run`.
+    pub fn new(root_run: StableId) -> Self {
+        Self {
+            version: 1,
+            root_run,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Appends an encoded checkpoint after verifying its root and envelope.
+    pub fn append(
+        &mut self,
+        encoded: Vec<u8>,
+        protection: Option<&dyn ActiveRunSnapshotProtection>,
+        limits: ActiveRunSnapshotLimits,
+    ) -> Result<(), ActiveRunSnapshotError> {
+        let snapshot = decode_active_run_snapshot(&encoded, protection, limits)?;
+        if snapshot.root_run != self.root_run {
+            return Err(ActiveRunSnapshotError::InvalidSnapshot(
+                "checkpoint journal root changed".to_owned(),
+            ));
+        }
+        let sequence = u64::try_from(self.entries.len()).map_err(|_| {
+            ActiveRunSnapshotError::InvalidSnapshot(
+                "checkpoint journal sequence exhausted".to_owned(),
+            )
+        })?;
+        let previous_sha256 = self.entries.last().map(|entry| sha256_hex(&entry.encoded));
+        self.entries.push(ActiveRunCheckpointEntry {
+            sequence,
+            previous_sha256,
+            encoded,
+        });
+        Ok(())
+    }
+
+    /// Verifies sequence and hash-chain integrity without decoding payloads.
+    pub fn verify(&self) -> Result<(), ActiveRunSnapshotError> {
+        if self.version != 1 {
+            return Err(ActiveRunSnapshotError::Integrity);
+        }
+        let mut previous = None;
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.sequence
+                != u64::try_from(index).map_err(|_| ActiveRunSnapshotError::Integrity)?
+                || entry.previous_sha256 != previous
+            {
+                return Err(ActiveRunSnapshotError::Integrity);
+            }
+            previous = Some(sha256_hex(&entry.encoded));
+        }
+        Ok(())
+    }
+
+    /// Returns the most recent encoded checkpoint after verifying the chain.
+    pub fn latest(&self) -> Result<Option<&[u8]>, ActiveRunSnapshotError> {
+        self.verify()?;
+        Ok(self.entries.last().map(|entry| entry.encoded.as_slice()))
+    }
+}
+
+/// Explicit codec for extension-owned active-run state.
+///
+/// Validation runs before core entities are created. `restore` is infallible by
+/// design: codecs must reject malformed or unavailable state in `validate` so
+/// restoration cannot fail after mutating the world.
+pub trait ActiveRunSnapshotCodec: Send + Sync + 'static {
+    /// Stable application or crate-defined binding identity.
+    fn binding_id(&self) -> &'static str;
+
+    /// Exact codec revision.
+    fn revision(&self) -> u64;
+
+    /// Whether restoration must fail when this codec is not rebound.
+    fn required(&self) -> bool {
+        true
+    }
+
+    /// Captures state related to the ordered run entities, if any.
+    fn capture(&self, world: &World, runs: &[Entity]) -> Result<Option<serde_json::Value>, String>;
+
+    /// Validates payload and external rebinding before world mutation.
+    fn validate(&self, payload: &serde_json::Value) -> Result<(), String>;
+
+    /// Applies a payload previously accepted by [`Self::validate`].
+    fn restore(&self, world: &mut World, runs: &RestoredRuns, payload: &serde_json::Value);
+}
+
+#[derive(Resource, Default)]
+pub(super) struct SnapshotExtensionCodecs(
+    BTreeMap<String, std::sync::Arc<dyn ActiveRunSnapshotCodec>>,
+);
+
+/// Registers one stable extension codec before capture or restoration.
+pub fn register_active_run_snapshot_codec(
+    world: &mut World,
+    codec: std::sync::Arc<dyn ActiveRunSnapshotCodec>,
+) -> Result<(), ActiveRunSnapshotError> {
+    if !world.contains_resource::<RuntimeIdentity>() {
+        return Err(ActiveRunSnapshotError::InvalidSnapshot(
+            "target world has no installed runtime".to_owned(),
+        ));
+    }
+    let id = codec.binding_id();
+    if id.trim().is_empty() {
+        return Err(ActiveRunSnapshotError::ExtensionCodec {
+            id: id.to_owned(),
+            message: "binding ID must not be empty".to_owned(),
+        });
+    }
+    let mut codecs = world.resource_mut::<SnapshotExtensionCodecs>();
+    if codecs.0.contains_key(id) {
+        return Err(ActiveRunSnapshotError::ExtensionCodec {
+            id: id.to_owned(),
+            message: "binding is already registered".to_owned(),
+        });
+    }
+    codecs.0.insert(id.to_owned(), codec);
+    Ok(())
+}
+
+/// Resource limits applied before an active-run checkpoint may be restored.
+///
+/// Limits are checked before domain rebinding or entity creation, so an
+/// oversized untrusted checkpoint cannot partially mutate the target world.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveRunSnapshotLimits {
+    /// Maximum canonical JSON size of the checkpoint.
+    pub max_encoded_bytes: usize,
+    /// Maximum number of runs, including descendants.
+    pub max_runs: usize,
+    /// Maximum parent-to-child nesting depth, where the root has depth zero.
+    pub max_depth: usize,
+    /// Maximum direct children owned by any one run.
+    pub max_children_per_run: usize,
+    /// Maximum external operations retained by the checkpoint.
+    pub max_operations: usize,
+    /// Maximum durable policy evaluations retained by the checkpoint.
+    pub max_policy_evaluations: usize,
+    /// Maximum transcript entries across all captured runs.
+    pub max_transcript_entries: usize,
+    /// Maximum extension-owned sections.
+    pub max_extension_sections: usize,
+    /// Maximum encoded JSON bytes across extension payloads.
+    pub max_extension_bytes: usize,
+}
+
+impl Default for ActiveRunSnapshotLimits {
+    fn default() -> Self {
+        Self {
+            max_encoded_bytes: 16 * 1024 * 1024,
+            max_runs: 1_024,
+            max_depth: 64,
+            max_children_per_run: 256,
+            max_operations: 16_384,
+            max_policy_evaluations: 65_536,
+            max_transcript_entries: 1_000_000,
+            max_extension_sections: 256,
+            max_extension_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+/// Structured, serializable inventory of an active-run checkpoint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActiveRunSnapshotSummary {
+    /// Checkpoint schema version.
+    pub version: u32,
+    /// Stable root-run identity.
+    pub root_run: StableId,
+    /// Canonical JSON size in bytes.
+    pub encoded_bytes: usize,
+    /// Number of captured runs.
+    pub runs: usize,
+    /// Deepest descendant level, where the root is zero.
+    pub max_depth: usize,
+    /// Largest direct child fan-out.
+    pub max_children_per_run: usize,
+    /// Number of run-scoped policy definitions.
+    pub run_policies: usize,
+    /// Number of external operations.
+    pub operations: usize,
+    /// Number of atomic tool batches.
+    pub tool_batches: usize,
+    /// Number of durable policy evaluations.
+    pub policy_evaluations: usize,
+    /// Number of committed turn audit records.
+    pub turns: usize,
+    /// Total transcript entries across captured runs.
+    pub transcript_entries: usize,
+    /// Number of extension-owned sections.
+    pub extension_sections: usize,
+    /// Encoded JSON bytes across extension payloads.
+    pub extension_bytes: usize,
+    /// Run-state counts keyed by stable diagnostic names.
+    pub run_states: BTreeMap<String, usize>,
+    /// Operation-kind counts keyed by stable diagnostic names.
+    pub operation_kinds: BTreeMap<String, usize>,
+}
 
 /// Serializable checkpoint for one run and all of its descendant runs.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -34,6 +282,22 @@ pub struct ActiveRunSnapshot {
     pub policy_evaluations: Vec<PersistedPolicyEvaluation>,
     /// Committed model-turn audit entities.
     pub turns: Vec<PersistedCommittedTurn>,
+    /// Explicit extension-owned state keyed by stable binding ID.
+    #[serde(default)]
+    pub extensions: Vec<SnapshotExtensionSection>,
+}
+
+/// Extension-owned active-run state with an explicit rebinding contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotExtensionSection {
+    /// Stable application or crate-defined codec identity.
+    pub binding_id: String,
+    /// Exact codec revision required to interpret `payload`.
+    pub revision: u64,
+    /// Whether restoration must fail when the codec is unavailable.
+    pub required: bool,
+    /// Codec-owned canonical data. It must not contain runtime entities or secrets.
+    pub payload: serde_json::Value,
 }
 
 /// Restored stable run identities and their new runtime-local entities.
@@ -49,6 +313,52 @@ pub enum ActiveRunSnapshotError {
     /// The checkpoint format is newer or otherwise unsupported.
     #[error("unsupported active-run snapshot version {0}")]
     UnsupportedVersion(u32),
+    /// The checkpoint exceeds a caller-selected resource limit.
+    #[error("active-run snapshot limit exceeded for {field}: {actual} > {limit}")]
+    LimitExceeded {
+        /// Stable limit name.
+        field: &'static str,
+        /// Observed value.
+        actual: usize,
+        /// Accepted maximum.
+        limit: usize,
+    },
+    /// The checkpoint could not be encoded for size or integrity checks.
+    #[error("active-run snapshot serialization failed: {0}")]
+    Serialization(String),
+    /// Encoded checkpoint integrity did not match its envelope.
+    #[error("active-run snapshot integrity validation failed")]
+    Integrity,
+    /// Protected bytes were supplied without the corresponding application hook.
+    #[error("active-run snapshot requires an application protection hook")]
+    MissingProtection,
+    /// A protection hook was supplied for an envelope that claims to be plaintext.
+    #[error("active-run snapshot protection mode does not match the decoder configuration")]
+    ProtectionModeMismatch,
+    /// The application protection hook failed.
+    #[error("active-run snapshot protection failed: {0}")]
+    Protection(String),
+    /// A required extension codec was not rebound before restoration.
+    #[error("missing active-run snapshot extension binding `{0}`")]
+    MissingExtensionBinding(String),
+    /// A rebound extension codec has a different revision.
+    #[error("extension binding `{id}` revision mismatch: expected {expected}, found {found}")]
+    ExtensionRevisionMismatch {
+        /// Stable binding identity.
+        id: String,
+        /// Revision recorded by the checkpoint.
+        expected: u64,
+        /// Revision installed in the target world.
+        found: u64,
+    },
+    /// Extension capture or validation rejected its payload.
+    #[error("active-run snapshot extension `{id}` failed: {message}")]
+    ExtensionCodec {
+        /// Stable binding identity.
+        id: String,
+        /// Codec-provided diagnostic.
+        message: String,
+    },
     /// A stable identity is duplicated or already live in the target world.
     #[error("conflicting stable id `{0}`")]
     ConflictingStableId(String),
@@ -74,6 +384,16 @@ pub enum ActiveRunSnapshotError {
         "operation `{0}` is still in flight; use cancel-and-suspend and wait for its prepared checkpoint"
     )]
     UnsafeInFlightEffect(String),
+    /// A typed extension operation cannot be represented by the core snapshot schema.
+    #[error("extension operation `{id}` ({kind}) in phase {phase} is not checkpoint-safe")]
+    UnsafeExtensionEffect {
+        /// Stable operation identity, or an entity diagnostic for malformed extensions.
+        id: String,
+        /// Stable extension effect kind.
+        kind: String,
+        /// Live phase whose extension-owned payload would otherwise be lost.
+        phase: &'static str,
+    },
     /// A live ECS relationship is stale during capture.
     #[error("stale runtime relationship on entity {0:?}")]
     StaleRelationship(Entity),
@@ -95,6 +415,12 @@ pub struct PersistedActiveRun {
     pub state: PersistedRunState,
     /// Orthogonal suspension state.
     pub control: RunControl,
+    /// Scheduling priority retained across restoration.
+    #[serde(default)]
+    pub priority: RunPriority,
+    /// Original eligibility tick used for deterministic age ordering.
+    #[serde(default)]
+    pub ready_at: ReadyAt,
     /// Prompt, transcript, usage, budgets, and memory state.
     pub record: RunRecord,
     /// Stable parent identity, if this is a delegated run.
@@ -523,6 +849,42 @@ pub fn snapshot_active_run(
         .filter(|row| selected.contains(&row.0))
         .map(|row| row.3)
         .collect::<HashSet<_>>();
+
+    // Extension inputs and results are concrete application components, so core
+    // cannot serialize them generically. Never omit a live extension operation:
+    // the application must first consume/remove it or move it to a discard-safe
+    // cancellation phase before taking a core checkpoint.
+    let mut extension_operation_query = world.query::<(
+        Entity,
+        &OperationOf,
+        &OperationState,
+        &ExtensionEffectKind,
+        Option<&StableId>,
+    )>();
+    for (entity, operation_of, state, kind, id) in extension_operation_query.iter(world) {
+        if selected.contains(&operation_of.get())
+            && !matches!(
+                state.phase,
+                OperationPhase::Cancelled | OperationPhase::Superseded
+            )
+        {
+            return Err(ActiveRunSnapshotError::UnsafeExtensionEffect {
+                id: id
+                    .map(|id| id.as_str().to_owned())
+                    .unwrap_or_else(|| format!("{entity:?}")),
+                kind: kind.0.to_owned(),
+                phase: match state.phase {
+                    OperationPhase::Prepared => "prepared",
+                    OperationPhase::InFlight => "in-flight",
+                    OperationPhase::Settled(_) => "settled",
+                    OperationPhase::ExtensionSettled => "extension-settled",
+                    OperationPhase::Cancelled => "cancelled",
+                    OperationPhase::Superseded => "superseded",
+                },
+            });
+        }
+    }
+
     let mut agent_query = world.query::<(Entity, &StableId, &TenantId)>();
     let agents = agent_query
         .iter(world)
@@ -629,6 +991,11 @@ pub fn snapshot_active_run(
             agent_id: agent_id.clone(),
             state,
             control: row.5,
+            priority: world
+                .get::<RunPriority>(entity)
+                .copied()
+                .unwrap_or_default(),
+            ready_at: world.get::<ReadyAt>(entity).copied().unwrap_or_default(),
             record,
             parent_run,
             child_ordinal: row.8,
@@ -857,6 +1224,39 @@ pub fn snapshot_active_run(
             .then_with(|| left.index.cmp(&right.index))
     });
 
+    let mut ordered_run_entities = run_ids
+        .iter()
+        .map(|(entity, id)| (id, *entity))
+        .collect::<Vec<_>>();
+    ordered_run_entities.sort_by(|left, right| left.0.cmp(right.0));
+    let ordered_run_entities = ordered_run_entities
+        .into_iter()
+        .map(|(_, entity)| entity)
+        .collect::<Vec<_>>();
+    let codecs = world
+        .resource::<SnapshotExtensionCodecs>()
+        .0
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut extensions = Vec::new();
+    for codec in codecs {
+        if let Some(payload) = codec
+            .capture(world, &ordered_run_entities)
+            .map_err(|message| ActiveRunSnapshotError::ExtensionCodec {
+                id: codec.binding_id().to_owned(),
+                message,
+            })?
+        {
+            extensions.push(SnapshotExtensionSection {
+                binding_id: codec.binding_id().to_owned(),
+                revision: codec.revision(),
+                required: codec.required(),
+                payload,
+            });
+        }
+    }
+
     Ok(ActiveRunSnapshot {
         version: ACTIVE_RUN_SNAPSHOT_VERSION,
         root_run: root_id,
@@ -866,6 +1266,7 @@ pub fn snapshot_active_run(
         tool_batches,
         policy_evaluations,
         turns,
+        extensions,
     })
 }
 
@@ -1277,12 +1678,312 @@ struct DomainRefs {
 ///
 /// Domain configuration must already be present. Exact accepted model, tool,
 /// store, and policy revisions are checked before any run entity is spawned.
-/// Subscriptions are runtime-local and must be reattached by the caller.
-pub fn restore_active_run(
+/// Migrates a supported historical checkpoint into the current schema.
+///
+/// Version 5 added tool-call-delta policy evaluation variants. Version 6 added
+/// a default-empty extension section. Versions 4 and 5 therefore upgrade
+/// without inventing runtime state. Older and future versions are rejected.
+pub fn migrate_active_run_snapshot(
+    mut snapshot: ActiveRunSnapshot,
+) -> Result<ActiveRunSnapshot, ActiveRunSnapshotError> {
+    match snapshot.version {
+        4 | 5 => {
+            snapshot.version = ACTIVE_RUN_SNAPSHOT_VERSION;
+            Ok(snapshot)
+        }
+        ACTIVE_RUN_SNAPSHOT_VERSION => Ok(snapshot),
+        version => Err(ActiveRunSnapshotError::UnsupportedVersion(version)),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Encodes a versioned, integrity-checked checkpoint envelope.
+pub fn encode_active_run_snapshot(
+    snapshot: &ActiveRunSnapshot,
+    protection: Option<&dyn ActiveRunSnapshotProtection>,
+) -> Result<Vec<u8>, ActiveRunSnapshotError> {
+    let plaintext = serde_json::to_vec(snapshot)
+        .map_err(|error| ActiveRunSnapshotError::Serialization(error.to_string()))?;
+    let payload = match protection {
+        Some(hook) => hook
+            .protect(&plaintext)
+            .map_err(ActiveRunSnapshotError::Protection)?,
+        None => plaintext,
+    };
+    let envelope = ActiveRunSnapshotEnvelope {
+        version: ACTIVE_RUN_ENVELOPE_VERSION,
+        protected: protection.is_some(),
+        sha256: sha256_hex(&payload),
+        payload,
+    };
+    serde_json::to_vec(&envelope)
+        .map_err(|error| ActiveRunSnapshotError::Serialization(error.to_string()))
+}
+
+/// Decodes, verifies, unprotects, migrates, and bounds-checks a checkpoint.
+pub fn decode_active_run_snapshot(
+    encoded: &[u8],
+    protection: Option<&dyn ActiveRunSnapshotProtection>,
+    limits: ActiveRunSnapshotLimits,
+) -> Result<ActiveRunSnapshot, ActiveRunSnapshotError> {
+    if encoded.len() > limits.max_encoded_bytes {
+        return Err(ActiveRunSnapshotError::LimitExceeded {
+            field: "encoded_bytes",
+            actual: encoded.len(),
+            limit: limits.max_encoded_bytes,
+        });
+    }
+    let envelope: ActiveRunSnapshotEnvelope = serde_json::from_slice(encoded)
+        .map_err(|error| ActiveRunSnapshotError::Serialization(error.to_string()))?;
+    if envelope.version != ACTIVE_RUN_ENVELOPE_VERSION
+        || sha256_hex(&envelope.payload) != envelope.sha256
+    {
+        return Err(ActiveRunSnapshotError::Integrity);
+    }
+    if envelope.protected && protection.is_none() {
+        return Err(ActiveRunSnapshotError::MissingProtection);
+    }
+    if !envelope.protected && protection.is_some() {
+        return Err(ActiveRunSnapshotError::ProtectionModeMismatch);
+    }
+    let plaintext = if envelope.protected {
+        protection
+            .ok_or(ActiveRunSnapshotError::MissingProtection)?
+            .unprotect(&envelope.payload)
+            .map_err(ActiveRunSnapshotError::Protection)?
+    } else {
+        envelope.payload
+    };
+    if plaintext.len() > limits.max_encoded_bytes {
+        return Err(ActiveRunSnapshotError::LimitExceeded {
+            field: "decoded_bytes",
+            actual: plaintext.len(),
+            limit: limits.max_encoded_bytes,
+        });
+    }
+    let snapshot: ActiveRunSnapshot = serde_json::from_slice(&plaintext)
+        .map_err(|error| ActiveRunSnapshotError::Serialization(error.to_string()))?;
+    enforce_snapshot_limits(&snapshot, limits)?;
+    migrate_active_run_snapshot(snapshot)
+}
+
+fn snapshot_topology(
+    snapshot: &ActiveRunSnapshot,
+) -> Result<(usize, usize), ActiveRunSnapshotError> {
+    let mut children = HashMap::<&StableId, Vec<&StableId>>::new();
+    let ids = snapshot
+        .runs
+        .iter()
+        .map(|run| &run.id)
+        .collect::<HashSet<_>>();
+    if !ids.contains(&snapshot.root_run) {
+        return Err(ActiveRunSnapshotError::MissingSnapshotReference(
+            snapshot.root_run.as_str().to_owned(),
+        ));
+    }
+    for run in &snapshot.runs {
+        if let Some(parent) = &run.parent_run {
+            if !ids.contains(parent) {
+                return Err(ActiveRunSnapshotError::MissingSnapshotReference(
+                    parent.as_str().to_owned(),
+                ));
+            }
+            children.entry(parent).or_default().push(&run.id);
+        }
+    }
+    let max_children = children.values().map(Vec::len).max().unwrap_or(0);
+    let mut visited = HashSet::new();
+    let mut frontier = VecDeque::from([(&snapshot.root_run, 0_usize)]);
+    let mut max_depth = 0;
+    while let Some((run, depth)) = frontier.pop_front() {
+        if !visited.insert(run) {
+            return Err(ActiveRunSnapshotError::InvalidSnapshot(
+                "run graph contains a cycle".to_owned(),
+            ));
+        }
+        max_depth = max_depth.max(depth);
+        if let Some(descendants) = children.get(run) {
+            frontier.extend(descendants.iter().map(|child| (*child, depth + 1)));
+        }
+    }
+    if visited.len() != snapshot.runs.len() {
+        return Err(ActiveRunSnapshotError::InvalidSnapshot(
+            "run graph contains a cycle or disconnected run".to_owned(),
+        ));
+    }
+    Ok((max_depth, max_children))
+}
+
+/// Builds a structured inventory without restoring the checkpoint.
+pub fn summarize_active_run_snapshot(
+    snapshot: &ActiveRunSnapshot,
+) -> Result<ActiveRunSnapshotSummary, ActiveRunSnapshotError> {
+    let encoded_bytes = serde_json::to_vec(snapshot)
+        .map_err(|error| ActiveRunSnapshotError::Serialization(error.to_string()))?
+        .len();
+    let (max_depth, max_children_per_run) = snapshot_topology(snapshot)?;
+    let mut run_states = BTreeMap::new();
+    for run in &snapshot.runs {
+        let name = match run.state {
+            PersistedRunState::Queued => "queued",
+            PersistedRunState::WaitingModel { .. } => "waiting_model",
+            PersistedRunState::WaitingTools { .. } => "waiting_tools",
+            PersistedRunState::WaitingStore { .. } => "waiting_store",
+            PersistedRunState::Completed(_) => "completed",
+            PersistedRunState::Failed(_) => "failed",
+            PersistedRunState::Cancelled => "cancelled",
+        };
+        *run_states.entry(name.to_owned()).or_default() += 1;
+    }
+    let mut operation_kinds = BTreeMap::new();
+    for operation in &snapshot.operations {
+        let name = match operation.kind {
+            PersistedOperationKind::Model => "model",
+            PersistedOperationKind::Tool => "tool",
+            PersistedOperationKind::Store => "store",
+            PersistedOperationKind::PolicyApproval => "policy_approval",
+        };
+        *operation_kinds.entry(name.to_owned()).or_default() += 1;
+    }
+    let extension_bytes = snapshot
+        .extensions
+        .iter()
+        .map(|section| {
+            serde_json::to_vec(&section.payload)
+                .map_err(|error| ActiveRunSnapshotError::Serialization(error.to_string()))
+                .map(|value| value.len())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum();
+    Ok(ActiveRunSnapshotSummary {
+        version: snapshot.version,
+        root_run: snapshot.root_run.clone(),
+        encoded_bytes,
+        runs: snapshot.runs.len(),
+        max_depth,
+        max_children_per_run,
+        run_policies: snapshot.run_policies.len(),
+        operations: snapshot.operations.len(),
+        tool_batches: snapshot.tool_batches.len(),
+        policy_evaluations: snapshot.policy_evaluations.len(),
+        turns: snapshot.turns.len(),
+        transcript_entries: snapshot
+            .runs
+            .iter()
+            .map(|run| run.record.transcript.len())
+            .sum(),
+        extension_sections: snapshot.extensions.len(),
+        extension_bytes,
+        run_states,
+        operation_kinds,
+    })
+}
+
+fn enforce_snapshot_limits(
+    snapshot: &ActiveRunSnapshot,
+    limits: ActiveRunSnapshotLimits,
+) -> Result<(), ActiveRunSnapshotError> {
+    let summary = summarize_active_run_snapshot(snapshot)?;
+    let checks = [
+        (
+            "encoded_bytes",
+            summary.encoded_bytes,
+            limits.max_encoded_bytes,
+        ),
+        ("runs", summary.runs, limits.max_runs),
+        ("depth", summary.max_depth, limits.max_depth),
+        (
+            "children_per_run",
+            summary.max_children_per_run,
+            limits.max_children_per_run,
+        ),
+        ("operations", summary.operations, limits.max_operations),
+        (
+            "policy_evaluations",
+            summary.policy_evaluations,
+            limits.max_policy_evaluations,
+        ),
+        (
+            "transcript_entries",
+            summary.transcript_entries,
+            limits.max_transcript_entries,
+        ),
+        (
+            "extension_sections",
+            summary.extension_sections,
+            limits.max_extension_sections,
+        ),
+        (
+            "extension_bytes",
+            summary.extension_bytes,
+            limits.max_extension_bytes,
+        ),
+    ];
+    for (field, actual, limit) in checks {
+        if actual > limit {
+            return Err(ActiveRunSnapshotError::LimitExceeded {
+                field,
+                actual,
+                limit,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Restores a checkpoint using caller-selected resource limits.
+///
+/// Subscriptions are runtime-local and must be reattached by the caller. All
+/// migration, topology, size, and domain checks run before entity creation.
+pub fn restore_active_run_with_limits(
     world: &mut World,
     snapshot: ActiveRunSnapshot,
+    limits: ActiveRunSnapshotLimits,
 ) -> Result<RestoredRuns, ActiveRunSnapshotError> {
+    enforce_snapshot_limits(&snapshot, limits)?;
+    let snapshot = migrate_active_run_snapshot(snapshot)?;
     let mut domain = validate_active_snapshot(world, &snapshot)?;
+
+    let mut captured_ready_order = snapshot
+        .runs
+        .iter()
+        .map(|run| run.ready_at.0)
+        .collect::<Vec<_>>();
+    captured_ready_order.sort_unstable();
+    captured_ready_order.dedup();
+    let target_ready = i128::from(world.resource::<RuntimeClock>().tick);
+    let rebased_ready = snapshot
+        .runs
+        .iter()
+        .map(|run| {
+            let rank = captured_ready_order
+                .binary_search(&run.ready_at.0)
+                .map_err(|_| {
+                    ActiveRunSnapshotError::InvalidSnapshot(
+                        "run readiness order is inconsistent".to_owned(),
+                    )
+                })?;
+            let newer = captured_ready_order.len().saturating_sub(rank + 1);
+            let newer = i128::try_from(newer).map_err(|_| {
+                ActiveRunSnapshotError::InvalidSnapshot(
+                    "run readiness order exceeds supported range".to_owned(),
+                )
+            })?;
+            let ready = target_ready.checked_sub(newer).ok_or_else(|| {
+                ActiveRunSnapshotError::InvalidSnapshot(
+                    "run readiness order cannot be rebased".to_owned(),
+                )
+            })?;
+            Ok((run.id.clone(), ReadyAt(ready)))
+        })
+        .collect::<Result<HashMap<_, _>, ActiveRunSnapshotError>>()?;
 
     let mut runs = HashMap::new();
     for persisted in &snapshot.runs {
@@ -1296,6 +1997,12 @@ pub fn restore_active_run(
                 RunOf(agent),
                 RunState::Queued,
                 persisted.control,
+                persisted.priority,
+                *rebased_ready.get(&persisted.id).ok_or_else(|| {
+                    ActiveRunSnapshotError::InvalidSnapshot(
+                        "run readiness order is missing".to_owned(),
+                    )
+                })?,
                 record,
             ))
             .id();
@@ -1472,7 +2179,22 @@ pub fn restore_active_run(
             index.0.insert(id, entity);
         }
     }
-    Ok(RestoredRuns(runs))
+    let restored = RestoredRuns(runs);
+    let codecs = world.resource::<SnapshotExtensionCodecs>().0.clone();
+    for section in &snapshot.extensions {
+        if let Some(codec) = codecs.get(&section.binding_id) {
+            codec.restore(world, &restored, &section.payload);
+        }
+    }
+    Ok(restored)
+}
+
+/// Restores a checkpoint using conservative default resource limits.
+pub fn restore_active_run(
+    world: &mut World,
+    snapshot: ActiveRunSnapshot,
+) -> Result<RestoredRuns, ActiveRunSnapshotError> {
+    restore_active_run_with_limits(world, snapshot, ActiveRunSnapshotLimits::default())
 }
 
 fn validate_active_snapshot(
@@ -1486,6 +2208,38 @@ fn validate_active_snapshot(
     }
     if snapshot.version != ACTIVE_RUN_SNAPSHOT_VERSION {
         return Err(ActiveRunSnapshotError::UnsupportedVersion(snapshot.version));
+    }
+    let codecs = world.resource::<SnapshotExtensionCodecs>().0.clone();
+    let mut extension_ids = HashSet::new();
+    for section in &snapshot.extensions {
+        if section.binding_id.trim().is_empty()
+            || !extension_ids.insert(section.binding_id.as_str())
+        {
+            return Err(ActiveRunSnapshotError::InvalidSnapshot(
+                "extension binding IDs must be non-empty and unique".to_owned(),
+            ));
+        }
+        let Some(codec) = codecs.get(&section.binding_id) else {
+            if section.required {
+                return Err(ActiveRunSnapshotError::MissingExtensionBinding(
+                    section.binding_id.clone(),
+                ));
+            }
+            continue;
+        };
+        if codec.revision() != section.revision {
+            return Err(ActiveRunSnapshotError::ExtensionRevisionMismatch {
+                id: section.binding_id.clone(),
+                expected: section.revision,
+                found: codec.revision(),
+            });
+        }
+        codec.validate(&section.payload).map_err(|message| {
+            ActiveRunSnapshotError::ExtensionCodec {
+                id: section.binding_id.clone(),
+                message,
+            }
+        })?;
     }
     let mut domain = collect_domain_refs(world);
     let mut run_ids = HashSet::new();

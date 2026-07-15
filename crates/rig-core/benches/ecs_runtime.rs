@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use rig_core::bevy_ecs::{prelude::Entity, relationship::Relationship};
 use rig_core::runtime::{
     Agent, AgentHandle, EffectCompletion, EffectDelta, EffectDeltaKind, EffectOutput,
-    ModelCapability, ModelEffectOutput, ModelToolCall, OperationOf, PauseMode, Policy, PolicyRule,
-    Runtime, RuntimeConfig, StableId, TenantId, ToolCapability, ToolEffectOutput, ToolGrant, Usage,
+    ModelCapability, ModelEffectOutput, ModelToolCall, OperationOf, PauseMode, Policy,
+    PolicyApprovalEffectOutput, PolicyPoint, PolicyRule, Runtime, RuntimeConfig, StableId,
+    TenantId, ToolCapability, ToolEffectOutput, ToolGrant, Usage,
 };
 
 const ITERATIONS: usize = 100;
@@ -26,6 +27,10 @@ fn setup() -> (Runtime, AgentHandle) {
         effect_capacity: 4096,
         completion_capacity: 4096,
         subscriber_capacity: 4096,
+        max_effect_dispatches_per_pass: 4096,
+        per_run_effect_limit: 4096,
+        per_agent_effect_limit: 4096,
+        per_tenant_effect_limit: 4096,
         ..RuntimeConfig::default()
     })
     .expect("runtime installs");
@@ -251,6 +256,115 @@ fn policy_heavy_run() -> Duration {
     started.elapsed()
 }
 
+fn one_policy_one_run() -> Duration {
+    let (mut runtime, agent) = setup();
+    runtime
+        .spawn_policy(
+            id("single-policy"),
+            TenantId::new("bench").expect("tenant"),
+            Policy {
+                order: 0,
+                revision: 1,
+                rule: PolicyRule::Allow,
+            },
+            agent,
+        )
+        .expect("policy");
+    let started = Instant::now();
+    runtime
+        .handle()
+        .prompt(agent, "one policy")
+        .expect("submit");
+    runtime.run_until_stalled().expect("evaluate");
+    let request = runtime
+        .effects()
+        .try_recv()
+        .expect("queue")
+        .expect("request");
+    complete_model(&runtime, &request);
+    runtime.run_until_stalled().expect("commit");
+    started.elapsed()
+}
+
+fn one_policy_many_runs() -> Duration {
+    const RUNS: usize = 1_000;
+    let (mut runtime, agent) = setup();
+    runtime
+        .spawn_policy(
+            id("shared-policy"),
+            TenantId::new("bench").expect("tenant"),
+            Policy {
+                order: 0,
+                revision: 1,
+                rule: PolicyRule::Allow,
+            },
+            agent,
+        )
+        .expect("policy");
+    for index in 0..RUNS {
+        runtime
+            .handle()
+            .prompt(agent, format!("shared {index}"))
+            .expect("submit");
+    }
+    let started = Instant::now();
+    runtime.run_until_stalled().expect("evaluate all");
+    let mut requests = Vec::with_capacity(RUNS);
+    while let Some(request) = runtime.effects().try_recv().expect("queue") {
+        requests.push(request);
+    }
+    assert_eq!(requests.len(), RUNS);
+    for request in &requests {
+        complete_model(&runtime, request);
+    }
+    runtime.run_until_stalled().expect("commit all");
+    started.elapsed()
+}
+
+fn asynchronous_approval() -> Duration {
+    let (mut runtime, agent) = setup();
+    runtime
+        .spawn_policy(
+            id("approval"),
+            TenantId::new("bench").expect("tenant"),
+            Policy {
+                order: 0,
+                revision: 1,
+                rule: PolicyRule::RequireApproval {
+                    point: PolicyPoint::Request,
+                    prompt: "approve".to_owned(),
+                },
+            },
+            agent,
+        )
+        .expect("policy");
+    let started = Instant::now();
+    runtime.handle().prompt(agent, "approval").expect("submit");
+    runtime.run_until_stalled().expect("approval dispatch");
+    let approval = runtime
+        .effects()
+        .try_recv()
+        .expect("queue")
+        .expect("approval");
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: approval.operation,
+            generation: approval.generation,
+            result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                approved: true,
+                reason: None,
+            })),
+        })
+        .expect("approval completion");
+    runtime.run_until_stalled().expect("model dispatch");
+    let model = runtime.effects().try_recv().expect("queue").expect("model");
+    complete_model(&runtime, &model);
+    runtime.run_until_stalled().expect("commit");
+    started.elapsed()
+}
+
 fn large_capability_set() -> Duration {
     let (mut runtime, agent) = setup();
     let tenant = TenantId::new("bench").expect("tenant");
@@ -332,6 +446,52 @@ fn streaming() -> Duration {
     started.elapsed()
 }
 
+fn streaming_with_policy() -> Duration {
+    let (mut runtime, agent) = setup();
+    runtime
+        .spawn_policy(
+            id("stream-policy"),
+            TenantId::new("bench").expect("tenant"),
+            Policy {
+                order: 0,
+                revision: 1,
+                rule: PolicyRule::StopTextDeltaContains {
+                    needle: "never".to_owned(),
+                    reason: "benchmark".to_owned(),
+                },
+            },
+            agent,
+        )
+        .expect("policy");
+    let (_, stream) = runtime
+        .handle()
+        .prompt_stream(agent, "stream policy")
+        .expect("submit");
+    runtime.run_until_stalled().expect("prepare");
+    let request = runtime
+        .effects()
+        .try_recv()
+        .expect("queue")
+        .expect("effect");
+    let started = Instant::now();
+    let deltas = runtime.effects().delta_sender();
+    for sequence in 0..100 {
+        deltas
+            .try_send(EffectDelta {
+                operation: request.operation,
+                generation: request.generation,
+                sequence,
+                provider_correlation: None,
+                kind: EffectDeltaKind::Text("x".to_owned()),
+            })
+            .expect("delta");
+    }
+    complete_model(&runtime, &request);
+    runtime.run_until_stalled().expect("apply stream");
+    while stream.try_recv().expect("stream").is_some() {}
+    started.elapsed()
+}
+
 fn parallel_tool_batch() -> Duration {
     let (mut runtime, agent) = setup();
     let tenant = TenantId::new("bench").expect("tenant");
@@ -363,6 +523,21 @@ fn parallel_tool_batch() -> Duration {
             )
             .expect("grant");
     }
+    runtime
+        .spawn_policy(
+            id("batch-policy"),
+            tenant,
+            Policy {
+                order: 0,
+                revision: 1,
+                rule: PolicyRule::RewriteToolArguments {
+                    tool: None,
+                    arguments: serde_json::json!({}),
+                },
+            },
+            agent,
+        )
+        .expect("batch policy");
     runtime.handle().prompt(agent, "batch").expect("submit");
     runtime.run_until_stalled().expect("prepare model");
     let model = runtime.effects().try_recv().expect("queue").expect("model");
@@ -441,7 +616,11 @@ fn main() {
     );
     report("dynamic-child-run", dynamic_child_run(), 2);
     report("policy-heavy-run", policy_heavy_run(), 100);
+    report("one-policy-one-run", one_policy_one_run(), 1);
+    report("one-policy-1000-runs", one_policy_many_runs(), 1_000);
+    report("asynchronous-approval", asynchronous_approval(), 1);
     report("large-capability-set", large_capability_set(), 1);
     report("streaming-deltas", streaming(), 100);
-    report("parallel-tool-batch", parallel_tool_batch(), 16);
+    report("streaming-deltas-with-policy", streaming_with_policy(), 100);
+    report("parallel-tool-batch-with-policy", parallel_tool_batch(), 16);
 }
