@@ -25,13 +25,13 @@ use crate::support::{assert_nonempty_response, install_policy};
 const CHAIN_PREAMBLE: &str = "You are a calculator assistant. You MUST use the provided tools for every arithmetic operation instead of computing results yourself. Perform the steps in order, using the result of each step as an input to the next. Once you have the final tool result, reply with the final numeric answer in plain text.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Breadcrumb {
-    tag: &'static str,
-    turn: usize,
+pub(super) struct Breadcrumb {
+    pub(super) tag: &'static str,
+    pub(super) turn: usize,
 }
 
 #[derive(Clone, Default)]
-struct EventTap {
+pub(super) struct EventTap {
     breadcrumbs: Arc<Mutex<Vec<Breadcrumb>>>,
     run_ids: Arc<Mutex<BTreeSet<u64>>>,
     streaming: Arc<Mutex<Option<bool>>>,
@@ -49,19 +49,23 @@ impl EventTap {
             .push(Breadcrumb { tag, turn });
     }
 
-    fn distinct_run_ids(&self) -> usize {
+    pub(super) fn breadcrumbs(&self) -> Vec<Breadcrumb> {
+        self.breadcrumbs.lock().expect("breadcrumbs").clone()
+    }
+
+    pub(super) fn distinct_run_ids(&self) -> usize {
         self.run_ids.lock().expect("run ids").len()
     }
 
-    fn is_streaming(&self) -> Option<bool> {
+    pub(super) fn is_streaming(&self) -> Option<bool> {
         *self.streaming.lock().expect("streaming")
     }
 
-    fn agent_name(&self) -> Option<String> {
+    pub(super) fn agent_name(&self) -> Option<String> {
         self.agent_name.lock().expect("agent name").clone()
     }
 
-    fn count(&self, tag: &str) -> usize {
+    pub(super) fn count(&self, tag: &str) -> usize {
         self.breadcrumbs
             .lock()
             .expect("breadcrumbs")
@@ -90,7 +94,7 @@ impl EventTap {
     }
 }
 
-fn install_tap(
+pub(super) fn install_tap(
     agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
     tap: EventTap,
     streaming: bool,
@@ -145,15 +149,15 @@ fn install_tap(
 struct ToolCallTally(usize);
 
 #[derive(Clone, Default)]
-struct TallyReader(Arc<Mutex<Vec<usize>>>);
+pub(super) struct TallyReader(Arc<Mutex<Vec<usize>>>);
 
 impl TallyReader {
-    fn tallies(&self) -> Vec<usize> {
+    pub(super) fn tallies(&self) -> Vec<usize> {
         self.0.lock().expect("tallies").clone()
     }
 }
 
-fn install_tally_observers(
+pub(super) fn install_tally_observers(
     agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
     tap: EventTap,
     reader: TallyReader,

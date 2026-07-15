@@ -13,6 +13,7 @@ mod cassette {
     mod generate_sessions;
     mod generate_tool_args;
     mod generate_tool_modes;
+    mod hook_stress;
     mod hook_stress_context;
     mod hook_stress_patch;
     mod hook_stress_streaming;

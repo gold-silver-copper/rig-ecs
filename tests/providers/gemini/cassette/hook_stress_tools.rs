@@ -17,7 +17,7 @@ use super::super::support::with_gemini_cassette;
 use super::super::tools_support::{CodewordLookup, CountingAdd, MottoTool, ToolEventRecorder};
 use crate::support::{assert_nonempty_response, install_policy};
 
-fn install_arg_patch(
+pub(super) fn install_arg_patch(
     agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
     id: &str,
     order: u32,
@@ -82,7 +82,7 @@ fn install_result_transform(
         .expect("result observer should install");
 }
 
-fn install_recorder(
+pub(super) fn install_recorder(
     agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
     recorder: ToolEventRecorder,
 ) {
@@ -117,7 +117,7 @@ fn install_recorder(
                         .push((
                             event.raw.name.clone(),
                             arguments,
-                            event.presentation.clone(),
+                            event.raw.presentation.clone(),
                         ));
                 });
         })
