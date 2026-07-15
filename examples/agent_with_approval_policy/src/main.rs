@@ -1,182 +1,186 @@
-//! Policy-based (non-interactive) human-in-the-loop: approval *rules* decided up
-//! front, evaluated per tool call by an `AgentHook` — no human prompt in the
-//! loop. This mirrors the OpenAI Agents SDK's `needs_approval(fn)`, Vercel AI
-//! SDK's `needsApproval(({input}) => ...)`, and LangGraph's `interrupt_on`
-//! predicates: a person encodes the policy once, and the agent runs within it.
+//! Policy-based, non-interactive tool approval with ECS-native state.
 //!
-//! The [`ApprovalPolicy`] hook fires on [`ToolCallEvent`] and returns:
-//! - [`ToolCallAction::run`] to allow a tool that is on the safe allow-list, or a
-//!   guarded tool whose arguments satisfy the rule;
-//! - [`ToolCallAction::skip`] to **deny** otherwise — the denial reason is fed back to the
-//!   model as the tool result, so it can adjust (e.g. transfer a smaller amount
-//!   or ask the user) rather than the run simply failing.
-//!
-//! The policy is **fail-closed**: any tool not explicitly allowed is denied. As
-//! always, this is guardrail/UX logic, not a security boundary — enforce real
-//! authorization inside the tool.
-//!
-//! Requires `OPENAI_API_KEY`. Run with: `cargo run -p agent_with_approval_policy`
+//! A typed component stores the operator's rules on an addressable policy
+//! entity. Its targeted responder runs once per call in deterministic policy
+//! order: read-only search is allowed, transfers up to a limit are allowed,
+//! and everything else fails closed as model-visible skipped-call feedback.
 
-use std::collections::HashSet;
+#[path = "../../ecs_demo.rs"]
+mod ecs_demo;
 
-use anyhow::Result;
-use rig::agent::{AgentHook, HookContext, ToolCall as ToolCallEvent, ToolCallAction};
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{CompletionModel, Prompt};
-use rig::providers::openai;
-use rig::tool::Tool;
-use serde::Deserialize;
-use serde_json::json;
+use std::collections::BTreeSet;
 
-#[derive(Debug, thiserror::Error)]
-#[error("tool failed: {0}")]
-struct ToolError(String);
+use anyhow::{Context, Result};
+use rig::bevy_ecs::prelude::{Component, In};
+use rig::runtime::{
+    EffectCompletion, EffectOutput, ModelEffectOutput, ModelToolCall, Policy, PolicyPoint,
+    PolicyResponderId, PolicyRule, RunState, ToolCallPolicyDecision, ToolCallPolicyInvocation,
+    ToolCapability, ToolGrant, Usage,
+};
 
-#[derive(Deserialize)]
-struct SearchArgs {
-    query: String,
-}
+const SEARCH_WEB: &str = "search_web";
+const TRANSFER_FUNDS: &str = "transfer_funds";
 
-struct SearchWeb;
-
-impl Tool for SearchWeb {
-    const NAME: &'static str = "search_web";
-    type Error = ToolError;
-    type Args = SearchArgs;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Search the web for a query (read-only).".to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": { "query": { "type": "string", "description": "Search query" } },
-            "required": ["query"]
-        })
-    }
-
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        println!("   🔎 [search_web] -> {}", args.query);
-        Ok(format!("top result for '{}': $1000 is plenty.", args.query))
-    }
-}
-
-#[derive(Deserialize)]
-struct TransferArgs {
-    to: String,
-    amount: u64,
-}
-
-struct TransferFunds;
-
-impl Tool for TransferFunds {
-    const NAME: &'static str = "transfer_funds";
-    type Error = ToolError;
-    type Args = TransferArgs;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Transfer funds to an account.".to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "to": { "type": "string", "description": "Destination account id" },
-                "amount": { "type": "integer", "description": "Amount in whole dollars" }
-            },
-            "required": ["to", "amount"]
-        })
-    }
-
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        println!("   🏦 [transfer_funds] -> ${} to {}", args.amount, args.to);
-        Ok(format!("transferred ${} to {}", args.amount, args.to))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The approval policy, evaluated on every tool call.
-// ---------------------------------------------------------------------------
-
-struct ApprovalPolicy {
-    /// Tools allowed to run unconditionally (read-only / low risk).
-    auto_approve: HashSet<&'static str>,
-    /// Transfers at or below this amount are auto-approved; above it they are
-    /// denied (a real app would route those to a human instead).
+#[derive(Component)]
+struct ApprovalRules {
+    auto_approve: BTreeSet<String>,
     max_auto_transfer: u64,
 }
 
-impl<M: CompletionModel> AgentHook<M> for ApprovalPolicy {
-    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCallEvent<'_>) -> ToolCallAction {
-        let tool_name = event.tool_name;
-        if self.auto_approve.contains(tool_name) {
-            println!("[policy] auto-approve `{tool_name}` (safe)");
-            return ToolCallAction::run();
+fn enforce_approval_rules(
+    In(event): In<ToolCallPolicyInvocation>,
+    rules: rig::bevy_ecs::prelude::Query<&ApprovalRules>,
+) -> Option<ToolCallPolicyDecision> {
+    let Ok(rules) = rules.get(event.policy) else {
+        return None;
+    };
+    let name = event.call.decision.name.as_str();
+    Some(if rules.auto_approve.contains(name) {
+        ToolCallPolicyDecision::Run
+    } else if name == TRANSFER_FUNDS {
+        match event
+            .call
+            .arguments
+            .get("amount")
+            .and_then(|value| value.as_u64())
+        {
+            Some(amount) if amount <= rules.max_auto_transfer => ToolCallPolicyDecision::Run,
+            Some(amount) => ToolCallPolicyDecision::Skip(format!(
+                "denied by policy: transfers over ${} require human approval; ${amount} exceeds the limit",
+                rules.max_auto_transfer
+            )),
+            None => ToolCallPolicyDecision::Skip(
+                "denied by policy: could not read the transfer amount".to_owned(),
+            ),
         }
-        if tool_name == TransferFunds::NAME {
-            let amount = serde_json::from_str::<serde_json::Value>(event.args)
-                .ok()
-                .and_then(|value| value.get("amount").and_then(|amount| amount.as_u64()));
-            return match amount {
-                Some(amount) if amount <= self.max_auto_transfer => {
-                    println!(
-                        "[policy] approve transfer ${amount} (<= ${})",
-                        self.max_auto_transfer
-                    );
-                    ToolCallAction::run()
-                }
-                Some(amount) => ToolCallAction::skip(format!(
-                    "denied by policy: transfers over ${} require human approval; ${amount} exceeds the limit",
-                    self.max_auto_transfer
-                )),
-                None => {
-                    ToolCallAction::skip("denied by policy: could not read the transfer amount")
-                }
-            };
-        }
-        ToolCallAction::skip(format!(
-            "denied by policy: `{tool_name}` is not on the approved tool list"
+    } else {
+        ToolCallPolicyDecision::Skip(format!(
+            "denied by policy: `{name}` is not on the approved tool list"
         ))
-    }
+    })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let agent = openai::Client::from_env()?
-        .agent(openai::GPT_4O)
-        .preamble(
-            "You are a banking assistant. Use the tools to carry out the user's request. \
-             If a tool is denied by policy, explain the limit to the user instead of retrying.",
-        )
-        .tool(SearchWeb)
-        .tool(TransferFunds)
-        .build();
+fn install_tool(
+    runtime: &mut rig::runtime::Runtime,
+    agent: rig::runtime::AgentHandle,
+    id: &str,
+    name: &str,
+    order: u32,
+) -> Result<()> {
+    let tool = runtime.spawn_tool(
+        ecs_demo::id(id)?,
+        ecs_demo::tenant()?,
+        ToolCapability {
+            name: name.to_owned(),
+            description: format!("Example {name} capability"),
+            parameters: serde_json::json!({"type": "object"}),
+            order,
+            revision: 1,
+            retired: false,
+        },
+    )?;
+    runtime.grant_tool(
+        ecs_demo::id(&format!("{id}-grant"))?,
+        ecs_demo::tenant()?,
+        ToolGrant {
+            order,
+            enabled: true,
+        },
+        agent,
+        tool,
+    )?;
+    Ok(())
+}
 
-    let policy = ApprovalPolicy {
-        auto_approve: HashSet::from([SearchWeb::NAME]),
-        max_auto_transfer: 1000,
-    };
+fn main() -> Result<()> {
+    let (mut runtime, agent) = ecs_demo::runtime(false)?;
+    install_tool(&mut runtime, agent, "search-tool", SEARCH_WEB, 0)?;
+    install_tool(&mut runtime, agent, "transfer-tool", TRANSFER_FUNDS, 1)?;
+    let policy = runtime.spawn_policy(
+        ecs_demo::id("approval-rules")?,
+        ecs_demo::tenant()?,
+        Policy {
+            order: 0,
+            revision: 1,
+            rule: PolicyRule::Custom(PolicyPoint::ToolCall),
+        },
+        agent,
+    )?;
+    runtime
+        .world_mut()
+        .entity_mut(policy)
+        .insert(ApprovalRules {
+            auto_approve: BTreeSet::from([SEARCH_WEB.to_owned()]),
+            max_auto_transfer: 1_000,
+        });
+    runtime.register_tool_call_policy_responder(
+        policy,
+        PolicyResponderId::new("approval-rules")?,
+        enforce_approval_rules,
+    )?;
 
-    let prompt = "Look up how much I should send, then transfer $5000 to account B-2.";
-    println!("User: {prompt}\n");
+    let pending = runtime
+        .handle()
+        .prompt(agent, "Research an amount, then transfer $5000")?;
+    let model = ecs_demo::next_effect(&mut runtime)?;
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: model.operation,
+            generation: model.generation,
+            result: Ok(EffectOutput::Model(ModelEffectOutput {
+                assistant_message: None,
+                text: String::new(),
+                usage: Usage::default(),
+                tool_calls: vec![
+                    ModelToolCall {
+                        id: "search-call".to_owned(),
+                        provider_result_id: "search-call".to_owned(),
+                        provider_call_id: None,
+                        name: SEARCH_WEB.to_owned(),
+                        arguments: serde_json::json!({"query": "recommended amount"}),
+                    },
+                    ModelToolCall {
+                        id: "transfer-call".to_owned(),
+                        provider_result_id: "transfer-call".to_owned(),
+                        provider_call_id: None,
+                        name: TRANSFER_FUNDS.to_owned(),
+                        arguments: serde_json::json!({"to": "B-2", "amount": 5_000}),
+                    },
+                ],
+            })),
+        })?;
 
-    // The transfer of $5000 exceeds the $1000 policy limit, so it is denied and
-    // the reason is handed to the model, which should explain rather than retry.
-    let response = agent.prompt(prompt).max_turns(10).add_hook(policy).await?;
+    // Only the approved search call crosses the external effect boundary.
+    let search = ecs_demo::next_effect(&mut runtime)?;
+    let search_input = search
+        .tool_input()
+        .context("expected the approved search effect")?;
+    println!("dispatched approved tool: {}", search_input.decision.name);
+    ecs_demo::complete_tool(&runtime, &search, "recommended amount: $1000")?;
 
-    println!("\nFinal response:\n{response}");
-
+    let follow_up = ecs_demo::next_effect(&mut runtime)?;
+    let results = &follow_up
+        .model_input()
+        .context("expected a follow-up model request")?
+        .tool_results;
+    let search_result = results.first().context("missing search result")?;
+    let transfer_result = results.get(1).context("missing skipped transfer result")?;
+    println!("{}: {}", search_result.name, search_result.presentation);
+    println!("{}: {}", transfer_result.name, transfer_result.presentation);
+    ecs_demo::complete_text(
+        &runtime,
+        &follow_up,
+        "The transfer was not executed because it exceeded the policy limit.",
+    )?;
+    runtime.run_until_stalled()?;
+    let run = runtime
+        .resolve_run(&pending)
+        .context("the prompt should resolve to a run")?;
+    match runtime.observe_run(run)? {
+        Some(RunState::Completed(output)) => println!("final response: {}", output.text),
+        state => anyhow::bail!("unexpected run outcome: {state:?}"),
+    }
     Ok(())
 }

@@ -30,7 +30,7 @@ then:
   header:
   - name: content-type
     value: application/json
-  body: '{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"{\"project\": \"rig-mistral\", \"flags\": {\"critical\": true, \"retries\": 2}, \"steps\": [{\"name\": \"plan\", \"weight\": 1}, {\"name\": \"verify\", \"weight\": 2}], \"note\": \"line one; line two says \\\"hello\\\" and path C:\\\\rig\\\\mistral\"}","name":"inspect_manifest"},"id":"call_REDACTED_2","index":0,"type":"function"}]}}],"created":0,"id":"chatcmpl-REDACTED_2","model":"mistral-small-latest","object":"chat.completion","usage":{"completion_tokens":82,"prompt_tokens":734,"prompt_tokens_details":{"cached_tokens":704},"total_tokens":816}}'
+  body: '{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"{\"project\": \"rig-mistral\", \"flags\": {\"critical\": true, \"retries\": 2}, \"steps\": [{\"name\": \"plan\", \"weight\": 1}, {\"name\": \"verify\", \"weight\": 2}], \"note\": \"line one; line two says \\\"hello\\\" and path C:\\\\rig\\\\mistral\"}","name":"inspect_manifest"},"id":"call_REDACTED_2","index":0,"type":"function"}]}}],"created":0,"id":"chatcmpl-REDACTED_2","model":"mistral-small-latest","object":"chat.completion","usage":{"completion_tokens":82,"prompt_tokens":734,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":816}}'
 ---
 when:
   path: /v1/chat/completions
@@ -64,7 +64,7 @@ then:
   header:
   - name: content-type
     value: application/json
-  body: '{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"{\"name\": \"sentinel\", \"nullable_code\": null}","name":"optional_nullable_probe"},"id":"call_REDACTED_4","index":0,"type":"function"}]}}],"created":0,"id":"chatcmpl-REDACTED_4","model":"mistral-small-latest","object":"chat.completion","usage":{"completion_tokens":21,"prompt_tokens":891,"prompt_tokens_details":{"cached_tokens":864},"total_tokens":912}}'
+  body: '{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"content":"","role":"assistant","tool_calls":[{"function":{"arguments":"{\"name\": \"sentinel\", \"nullable_code\": null}","name":"optional_nullable_probe"},"id":"call_REDACTED_4","index":0,"type":"function"}]}}],"created":0,"id":"chatcmpl-REDACTED_4","model":"mistral-small-latest","object":"chat.completion","usage":{"completion_tokens":21,"prompt_tokens":891,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":912}}'
 ---
 when:
   path: /v1/chat/completions

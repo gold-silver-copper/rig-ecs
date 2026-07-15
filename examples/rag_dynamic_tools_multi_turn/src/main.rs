@@ -1,10 +1,9 @@
 use anyhow::Result;
 use rig::{
-    completion::Prompt,
-    embeddings::EmbeddingsBuilder,
+    embeddings::{EmbeddingsBuilder, ToolSchema},
     prelude::*,
     providers::openai::{self, Client},
-    tool::{Tool, ToolEmbedding, ToolSet},
+    tool::{Tool, ToolEmbedding},
     vector_store::in_memory_store::InMemoryVectorStore,
 };
 use serde::{Deserialize, Serialize};
@@ -53,11 +52,7 @@ impl Tool for Add {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x + args.y;
         Ok(result)
     }
@@ -108,11 +103,7 @@ impl Tool for Subtract {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x - args.y;
         Ok(result)
     }
@@ -147,34 +138,31 @@ async fn main() -> Result<(), anyhow::Error> {
     let openai_client = Client::from_env()?;
 
     let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
-
-    let toolset = ToolSet::builder()
-        .retrieved_tool(Add)
-        .retrieved_tool(Subtract)
-        .build();
-
+    let add = Add;
+    let subtract = Subtract;
+    let schemas = vec![
+        ToolSchema::try_from(&add)?,
+        ToolSchema::try_from(&subtract)?,
+    ];
     let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
-        .documents(toolset.schemas()?)?
+        .documents(schemas)?
         .build()
         .await?;
-
-    // Create vector store with the embeddings
     let vector_store =
         InMemoryVectorStore::from_documents_with_id_f(embeddings, |tool| tool.name.clone());
-
-    // Create vector store index
     let index = vector_store.index(embedding_model);
 
-    // Create RAG agent with a single context prompt and a dynamic tool source
+    // Re-run semantic selection before every model operation so later turns
+    // receive a fresh immutable tool snapshot from the same ECS store path.
     let calculator_rag = openai_client
         .agent(openai::GPT_4)
         .preamble(
             "You are a calculator here to help the user perform arithmetic operations.
             Use the tools provided to answer the user's question and do not do any math on your own.",
         )
-        // Add a dynamic tool source with a sample rate of 2 (i.e.: only
-        // 2 additional tool will be added to prompts)
-        .retrieved_tools(2, index, toolset)
+        .retrieved_tool(add)
+        .retrieved_tool(subtract)
+        .retrieved_tools(2, index)
         .build();
 
     // Prompt the agent and print the response

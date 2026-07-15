@@ -15,4 +15,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The passphrase is OMEGA-7. I have acknowledged and remembered it."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":15,"promptTokenCount":41,"promptTokensDetails":[{"modality":"TEXT","tokenCount":41}],"serviceTier":"standard","thoughtsTokenCount":36,"totalTokenCount":92}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"The passphrase is OMEGA-7. I acknowledge and remember it."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":14,"promptTokenCount":41,"promptTokensDetails":[{"modality":"TEXT","tokenCount":41}],"serviceTier":"standard","thoughtsTokenCount":34,"totalTokenCount":89}}'

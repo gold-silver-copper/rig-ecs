@@ -4,7 +4,7 @@
 //! pipeline ahead of the rmcp migration.
 
 use rig::client::CompletionClient;
-use rig::completion::{Chat, Message, Prompt};
+use rig::completion::{Chat, Message};
 use rig::providers::gemini;
 use rig::streaming::StreamingPrompt;
 
@@ -101,7 +101,6 @@ async fn nonstreaming_multi_turn_executes_tools_and_reports_usage() {
     )
     .await;
 }
-
 #[tokio::test]
 async fn streaming_multi_turn_executes_tools_via_builtin_driver() {
     let add = CountingAdd::default();

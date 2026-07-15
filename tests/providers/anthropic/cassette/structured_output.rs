@@ -1,7 +1,6 @@
 //! Anthropic structured output smoke test.
 
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::providers::anthropic::completion::CLAUDE_SONNET_4_6;
 
 use super::super::support::with_anthropic_cassette;

@@ -14,6 +14,8 @@ then:
   - name: content-type
     value: text/event-stream
   body: |+
+    : OPENROUTER PROCESSING
+
     data: {"choices":[{"delta":{"content":null,"role":"assistant","tool_calls":[{"function":{"arguments":"","name":"inspect_manifest"},"id":"call_REDACTED_1","index":0,"type":"function"}]},"finish_reason":null,"index":0,"native_finish_reason":null}],"created":0,"id":"chatcmpl-REDACTED_1","model":"openai/gpt-4o","object":"chat.completion.chunk","provider":"OpenAI","system_fingerprint":"fp_REDACTED_1"}
 
     data: {"choices":[{"delta":{"content":null,"role":"assistant","tool_calls":[{"function":{"arguments":""},"index":0}]},"finish_reason":null,"index":0,"native_finish_reason":null}],"created":0,"id":"chatcmpl-REDACTED_1","model":"openai/gpt-4o","object":"chat.completion.chunk","provider":"OpenAI","system_fingerprint":"fp_REDACTED_1"}

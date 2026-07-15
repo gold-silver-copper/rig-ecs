@@ -2,7 +2,6 @@ use anyhow::Result;
 use rig::prelude::*;
 use rig::{
     agent::Agent,
-    completion::Prompt,
     message::Message,
     providers::{cohere, openai},
 };

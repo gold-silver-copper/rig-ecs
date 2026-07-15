@@ -7,12 +7,13 @@ on:
   workflow_dispatch:
 
 env:
-  RUST_VERSION: 1.94.0
+  RUST_VERSION: 1.95.0
 
 jobs:
   run-ci:
     permissions:
       checks: write
+      contents: read
     uses: ./.github/workflows/ci.yaml
     secrets: inherit
 

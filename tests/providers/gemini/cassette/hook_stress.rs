@@ -1,262 +1,26 @@
-//! Long, multi-turn hook-system stress workflows recorded against real Gemini.
+//! Long, multi-turn ECS policy and observer stress workflows recorded against Gemini.
 //!
-//! Where the small `tool_hooks` suite pins one hook decision each, these tests
-//! drive rich multi-turn workflows and assert *structural invariants* of the
-//! merged hook system: `HookContext` identity/turn/streaming, a shared
-//! `Scratchpad` threaded across hooks and turns, `RequestPatch` context
-//! injection + `active_tools` narrowing, chained `ToolCallAction::Rewrite` -> observe ->
-//! `ToolResultAction::Rewrite` redaction, and streaming lifecycle ordering / blocking-vs-
-//! streaming parity.
-//!
-//! ## On loose assertions
-//!
-//! Following `tools_support`'s convention: only values Rig synthesizes with **no
-//! model input** (a hook-rewritten arg, a verbatim redaction marker, a
-//! `HookContext` field, a scratchpad tally, an event *shape*) are pinned to exact
-//! equality. Everything shaped by Gemini's generated text or its chosen call
-//! count/ordering uses loose assertions (`contains`, `>=`, "mentions"), so these
-//! cassettes survive re-recording. Deterministic hooks (no clocks/RNG) keep the
-//! outbound requests byte-identical for replay.
+//! These regressions preserve the former hook suite's externally observable behavior while
+//! exercising ordered policy entities, immediate lifecycle observers, and extension-owned typed
+//! components instead of a hook stack or untyped scratchpad.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::collections::BTreeMap;
 
 use futures::StreamExt;
-use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent, HookContext,
-    ModelTurnFinished, MultiTurnStreamItem, ObservationAction, RequestPatch, StreamingError,
-    ToolCall as ToolCallEvent, ToolCallAction, ToolResultAction, ToolResultEvent,
-};
 use rig::client::CompletionClient;
-use rig::completion::{Document, Prompt};
 use rig::providers::gemini;
+use rig::runtime::{PolicyRule, RequestPatch, RetrievedDocument};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
 use rig::tool::Tool;
+use rig::{agent::MultiTurnStreamItem, agent::StreamingError};
 
 use super::super::support::with_gemini_cassette;
-use super::super::tools_support::{CountingAdd, CountingSubtract, SkipToolHook, ToolEventRecorder};
-use crate::support::assert_nonempty_response;
+use super::super::tools_support::{CountingAdd, CountingSubtract, ToolEventRecorder};
+use super::hook_stress_context::{EventTap, TallyReader, install_tally_observers, install_tap};
+use super::hook_stress_tools::{install_arg_patch, install_recorder};
+use crate::support::{assert_nonempty_response, install_policy};
 
-type GeminiModel = gemini::completion::CompletionModel;
-
-/// Preamble that forces tool use and a dependent two-step chain so the model
-/// takes at least two turns (compute A, then use A to compute B).
-const CHAIN_PREAMBLE: &str = "You are a calculator assistant. You MUST use the provided tools for \
-     every arithmetic operation instead of computing results yourself. Perform the steps in order, \
-     using the result of each step as an input to the next. Once you have the final tool result, \
-     reply with the final numeric answer in plain text.";
-
-// ---------------------------------------------------------------------------
-// Fixtures: hooks that observe HookContext identity, thread the Scratchpad, and
-// steer requests/tools. All deterministic.
-// ---------------------------------------------------------------------------
-
-/// One observed hook event: its variant tag and the one-based turn it fired on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Breadcrumb {
-    tag: &'static str,
-    turn: usize,
-}
-
-/// Cross-hook, cross-turn scratchpad value: how many `ToolCall`s the writer hook
-/// has seen so far this run.
-#[derive(Clone, Default)]
-struct ToolCallTally(usize);
-
-/// Records, for the whole run: the ordered lifecycle breadcrumb, the set of
-/// `run_id`s seen, the `is_streaming` flag, and the `agent_name` — proving
-/// `HookContext` identity is stable and correct. Also bumps a shared
-/// `Scratchpad` tally on each `ToolCall`.
-#[derive(Clone, Default)]
-struct LifecycleRecorder {
-    breadcrumbs: Arc<Mutex<Vec<Breadcrumb>>>,
-    run_ids: Arc<Mutex<BTreeSet<String>>>,
-    streaming: Arc<Mutex<Option<bool>>>,
-    agent_name: Arc<Mutex<Option<String>>>,
-}
-
-impl LifecycleRecorder {
-    fn breadcrumbs(&self) -> Vec<Breadcrumb> {
-        self.breadcrumbs.lock().expect("breadcrumbs").clone()
-    }
-    fn distinct_run_ids(&self) -> usize {
-        self.run_ids.lock().expect("run_ids").len()
-    }
-    fn is_streaming(&self) -> Option<bool> {
-        *self.streaming.lock().expect("streaming")
-    }
-    fn agent_name(&self) -> Option<String> {
-        self.agent_name.lock().expect("agent_name").clone()
-    }
-    fn count(&self, tag: &str) -> usize {
-        self.breadcrumbs()
-            .iter()
-            .filter(|crumb| crumb.tag == tag)
-            .count()
-    }
-}
-
-impl LifecycleRecorder {
-    fn record(&self, ctx: &HookContext, tag: &'static str) {
-        self.run_ids
-            .lock()
-            .expect("run_ids")
-            .insert(ctx.run_id().as_str().to_string());
-        *self.streaming.lock().expect("streaming") = Some(ctx.is_streaming());
-        *self.agent_name.lock().expect("agent_name") = ctx.agent_name().map(str::to_string);
-        self.breadcrumbs
-            .lock()
-            .expect("breadcrumbs")
-            .push(Breadcrumb {
-                tag,
-                turn: ctx.turn(),
-            });
-    }
-}
-impl AgentHook<GeminiModel> for LifecycleRecorder {
-    async fn on_completion_call(
-        &self,
-        ctx: &HookContext,
-        _event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        self.record(ctx, "CompletionCall");
-        CompletionCallAction::continue_run()
-    }
-    async fn on_completion_response(
-        &self,
-        ctx: &HookContext,
-        _event: CompletionResponseEvent<'_, GeminiModel>,
-    ) -> ObservationAction {
-        self.record(ctx, "CompletionResponse");
-        ObservationAction::continue_run()
-    }
-    async fn on_model_turn_finished(
-        &self,
-        ctx: &HookContext,
-        _event: ModelTurnFinished<'_>,
-    ) -> ObservationAction {
-        self.record(ctx, "ModelTurnFinished");
-        ObservationAction::continue_run()
-    }
-    async fn on_tool_call(&self, ctx: &HookContext, _event: ToolCallEvent<'_>) -> ToolCallAction {
-        self.record(ctx, "ToolCall");
-        ctx.scratchpad()
-            .update(|tally: &mut ToolCallTally| tally.0 += 1);
-        ToolCallAction::run()
-    }
-    async fn on_tool_result(
-        &self,
-        ctx: &HookContext,
-        _event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        self.record(ctx, "ToolResult");
-        ToolResultAction::keep()
-    }
-}
-
-/// Registered *after* [`LifecycleRecorder`]: on each `ModelTurnFinished` it reads
-/// the shared `Scratchpad` tally the recorder wrote and appends it to an external
-/// log — proving the two hooks share run-scoped state that accumulates across
-/// turns.
-#[derive(Clone, Default)]
-struct ScratchpadReader {
-    tallies: Arc<Mutex<Vec<usize>>>,
-}
-
-impl ScratchpadReader {
-    fn tallies(&self) -> Vec<usize> {
-        self.tallies.lock().expect("tallies").clone()
-    }
-}
-
-impl AgentHook<GeminiModel> for ScratchpadReader {
-    async fn on_model_turn_finished(
-        &self,
-        ctx: &HookContext,
-        _event: ModelTurnFinished<'_>,
-    ) -> ObservationAction {
-        let tally = ctx
-            .scratchpad()
-            .get::<ToolCallTally>()
-            .map(|t| t.0)
-            .unwrap_or(0);
-        self.tallies.lock().expect("tallies").push(tally);
-        ObservationAction::continue_run()
-    }
-}
-
-/// `CompletionCall` hook that injects a run-state fact via `extra_context`,
-/// narrows `active_tools`, and pins temperature — one merged `RequestPatch`.
-#[derive(Clone)]
-struct InjectContextAndNarrowTools {
-    fact_id: &'static str,
-    fact_text: &'static str,
-    allow: &'static [&'static str],
-}
-
-impl AgentHook<GeminiModel> for InjectContextAndNarrowTools {
-    async fn on_completion_call(
-        &self,
-        _ctx: &HookContext,
-        _event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        let doc = Document {
-            id: self.fact_id.to_string(),
-            text: self.fact_text.to_string(),
-            additional_props: Default::default(),
-        };
-        CompletionCallAction::patch(
-            RequestPatch::new()
-                .context(doc)
-                .active_tools(self.allow.iter().copied())
-                .temperature(0.0),
-        )
-    }
-}
-
-/// `ToolCall` hook that rewrites a named tool's arguments to a fixed object,
-/// regardless of what the model emitted (execution-args rewrite).
-#[derive(Clone)]
-struct ForceArgs {
-    tool_name: &'static str,
-    args: serde_json::Value,
-}
-
-impl AgentHook<GeminiModel> for ForceArgs {
-    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCallEvent<'_>) -> ToolCallAction {
-        if event.tool_name == self.tool_name {
-            ToolCallAction::rewrite(self.args.clone())
-        } else {
-            ToolCallAction::run()
-        }
-    }
-}
-
-/// `ToolResult` hook that redacts a named tool's output with a fixed marker.
-#[derive(Clone)]
-struct RedactResult {
-    tool_name: &'static str,
-    marker: &'static str,
-}
-
-impl AgentHook<GeminiModel> for RedactResult {
-    async fn on_tool_result(
-        &self,
-        _ctx: &HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        if event.tool_name == self.tool_name {
-            ToolResultAction::rewrite(self.marker)
-        } else {
-            ToolResultAction::keep()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 1. HookContext identity + Scratchpad threaded across a long multi-turn run.
-// ---------------------------------------------------------------------------
+const CHAIN_PREAMBLE: &str = "You are a calculator assistant. You MUST use the provided tools for every arithmetic operation instead of computing results yourself. Perform the steps in order, using the result of each step as an input to the next. Once you have the final tool result, reply with the final numeric answer in plain text.";
 
 #[tokio::test]
 async fn lifecycle_and_scratchpad_thread_across_multi_turn_blocking() {
@@ -264,8 +28,8 @@ async fn lifecycle_and_scratchpad_thread_across_multi_turn_blocking() {
     let subtract = CountingSubtract::default();
     let add_calls = add.counter.clone();
     let subtract_calls = subtract.counter.clone();
-    let recorder = LifecycleRecorder::default();
-    let reader = ScratchpadReader::default();
+    let recorder = EventTap::default();
+    let reader = TallyReader::default();
     let recorder_probe = recorder.clone();
     let reader_probe = reader.clone();
 
@@ -281,95 +45,46 @@ async fn lifecycle_and_scratchpad_thread_across_multi_turn_blocking() {
                 .tool(subtract)
                 .build();
 
+            install_tap(&agent, recorder, false);
+            install_tally_observers(&agent, EventTap::default(), reader);
+
             let response = agent
                 .prompt(
                     "First add 10 and 5 with the add tool. Then subtract 3 from that sum with the \
                      subtract tool. Report the final number.",
                 )
                 .max_turns(6)
-                .add_hook(recorder)
-                .add_hook(reader)
                 .await
                 .expect("dependent multi-turn tool run should succeed");
 
             assert_nonempty_response(&response);
+            assert_eq!(recorder_probe.distinct_run_ids(), 1);
+            assert_eq!(recorder_probe.is_streaming(), Some(false));
+            assert_eq!(recorder_probe.agent_name().as_deref(), Some("stress-agent"));
 
-            // --- HookContext identity is stable and correct across the run ---
-            assert_eq!(
-                recorder_probe.distinct_run_ids(),
-                1,
-                "run_id must be stable across every event of one run"
-            );
-            assert_eq!(
-                recorder_probe.is_streaming(),
-                Some(false),
-                "blocking surface must report is_streaming() == false"
-            );
-            assert_eq!(
-                recorder_probe.agent_name().as_deref(),
-                Some("stress-agent"),
-                "the configured agent name must reach the hook"
-            );
+            let max_turn = recorder_probe
+                .breadcrumbs()
+                .iter()
+                .map(|breadcrumb| breadcrumb.turn)
+                .max()
+                .unwrap_or_default();
+            assert!(max_turn >= 2, "the workflow should span multiple turns");
 
-            // --- turn() advances; the workflow really is multi-turn ---
-            let crumbs = recorder_probe.breadcrumbs();
-            let max_turn = crumbs.iter().map(|c| c.turn).max().unwrap_or(0);
-            assert!(
-                max_turn >= 2,
-                "a dependent add-then-subtract chain must span >= 2 model turns, saw {crumbs:?}"
-            );
-            let turns: Vec<usize> = crumbs.iter().map(|c| c.turn).collect();
-            assert!(
-                turns.windows(2).all(|w| w[0] <= w[1]),
-                "turn() must be non-decreasing across the run, saw {turns:?}"
-            );
-
-            // --- each tool call is paired with a result, and the shared
-            //     Scratchpad tally tracks them across hooks and turns ---
             let tool_calls = recorder_probe.count("ToolCall");
-            let tool_results = recorder_probe.count("ToolResult");
-            assert_eq!(
-                tool_calls, tool_results,
-                "every observed ToolCall must have a paired ToolResult"
-            );
-            assert_eq!(
-                add_calls.count() + subtract_calls.count(),
-                tool_calls,
-                "observed ToolCall events must equal real tool executions"
-            );
-            assert!(
-                add_calls.count() >= 1 && subtract_calls.count() >= 1,
-                "the chain must exercise both add and subtract"
-            );
+            assert_eq!(tool_calls, recorder_probe.count("ToolResult"));
+            assert_eq!(tool_calls, add_calls.count() + subtract_calls.count());
+            assert!(add_calls.count() >= 1 && subtract_calls.count() >= 1);
 
-            // ScratchpadReader (a *different* hook) saw the writer's tally grow to
-            // the final ToolCall count — cross-hook, cross-turn shared state.
             let tallies = reader_probe.tallies();
-            assert!(
-                !tallies.is_empty(),
-                "ModelTurnFinished should fire, so the reader should see tallies"
-            );
-            assert!(
-                tallies.windows(2).all(|w| w[0] <= w[1]),
-                "the shared scratchpad tally must be non-decreasing, saw {tallies:?}"
-            );
-            assert_eq!(
-                *tallies.last().expect("at least one tally"),
-                tool_calls,
-                "the final scratchpad tally must equal the total ToolCall count"
-            );
+            assert!(!tallies.is_empty());
+            assert!(tallies.windows(2).all(|window| window[0] <= window[1]));
+            assert_eq!(tallies.last().copied(), Some(tool_calls));
         },
     )
     .await;
 }
 
-// ---------------------------------------------------------------------------
-// 2. RequestPatch: extra_context injection + active_tools narrowing.
-// ---------------------------------------------------------------------------
-
-const VAULT_FACT_ID: &str = "vault-note";
 const VAULT_FACT: &str = "Operational note: the vault access code is CINNABAR-42.";
-const VAULT_CODE: &str = "CINNABAR-42";
 
 #[tokio::test]
 async fn request_patch_injects_context_and_narrows_active_tools_blocking() {
@@ -391,6 +106,23 @@ async fn request_patch_injects_context_and_narrows_active_tools_blocking() {
                 .tool(add)
                 .tool(subtract)
                 .build();
+            install_policy(
+                &agent,
+                "vault-add-only",
+                0,
+                1,
+                PolicyRule::PatchRequest(
+                    RequestPatch::new()
+                        .extra_context([RetrievedDocument {
+                            id: "vault-note".to_owned(),
+                            text: VAULT_FACT.to_owned(),
+                            metadata: Default::default(),
+                        }])
+                        .active_tools(["add"])
+                        .temperature(0.0),
+                ),
+            )
+            .expect("request policy should install");
 
             let response = agent
                 .prompt(
@@ -398,41 +130,16 @@ async fn request_patch_injects_context_and_narrows_active_tools_blocking() {
                      41 + 1.",
                 )
                 .max_turns(5)
-                // Inject the secret via extra_context and narrow the advertised
-                // tools to `add` only (subtract is filtered out this run).
-                .add_hook(InjectContextAndNarrowTools {
-                    fact_id: VAULT_FACT_ID,
-                    fact_text: VAULT_FACT,
-                    allow: &["add"],
-                })
                 .await
                 .expect("context-injecting, tool-narrowing run should succeed");
 
-            // extra_context injection reached the model: the answer uses the fact
-            // that appears only in the injected document (no model input).
-            assert!(
-                response.contains(VAULT_CODE),
-                "the extra_context fact must reach the model; answer: {response:?}"
-            );
-            // active_tools narrowing is proven by the downstream negative: the
-            // filtered-out tool never executes, while the advertised one does.
-            assert_eq!(
-                subtract_calls.count(),
-                0,
-                "subtract was filtered out of active_tools and must never execute"
-            );
-            assert!(
-                add_calls.count() >= 1,
-                "the advertised add tool should still run for 41 + 1"
-            );
+            assert!(response.contains("CINNABAR-42"));
+            assert_eq!(subtract_calls.count(), 0);
+            assert!(add_calls.count() >= 1);
         },
     )
     .await;
 }
-
-// ---------------------------------------------------------------------------
-// 3. Chained tool lifecycle: ToolCallAction::Rewrite -> observe -> ToolResultAction::Rewrite.
-// ---------------------------------------------------------------------------
 
 const REDACTION_MARKER: &str = "REDACTED-SUM-ZK7";
 
@@ -457,61 +164,45 @@ async fn chained_arg_rewrite_then_result_redaction_blocking() {
                 .tool(add)
                 .build();
 
+            install_arg_patch(&agent, "force-seven", 0, "x", serde_json::json!(7));
+            install_arg_patch(&agent, "force-eight", 1, "y", serde_json::json!(8));
+            install_recorder(&agent, recorder);
+            install_policy(
+                &agent,
+                "redact-sum",
+                2,
+                1,
+                PolicyRule::RewriteToolResult {
+                    tool: Some(CountingAdd::NAME.to_owned()),
+                    presentation: REDACTION_MARKER.into(),
+                },
+            )
+            .expect("redaction policy should install");
+
             let response = agent
                 .prompt("Use the add tool to add 2 and 2, then report the exact tool result.")
                 .max_turns(4)
-                // Hook order matters: rewrite args -> observe -> redact result.
-                .add_hook(ForceArgs {
-                    tool_name: CountingAdd::NAME,
-                    args: serde_json::json!({ "x": 7, "y": 8 }),
-                })
-                .add_hook(recorder)
-                .add_hook(RedactResult {
-                    tool_name: CountingAdd::NAME,
-                    marker: REDACTION_MARKER,
-                })
                 .await
-                .expect("chained rewrite + redaction run should succeed");
+                .expect("chained rewrite and redaction should succeed");
 
-            // The observer (registered after the rewriter) saw the *rewritten*
-            // args — the tool executed against them, not the model's `2 + 2`.
             let calls = recorder_probe.recorded_calls();
-            assert_eq!(calls.len(), 1, "exactly one add call, saw {calls:?}");
-            let observed_args: serde_json::Value =
-                serde_json::from_str(&calls[0].1).expect("observed args are JSON");
+            assert_eq!(calls.len(), 1);
             assert_eq!(
-                observed_args,
-                serde_json::json!({ "x": 7, "y": 8 }),
-                "the observer must see the hook-rewritten args"
+                serde_json::from_str::<serde_json::Value>(&calls[0].1).expect("JSON arguments"),
+                serde_json::json!({"x": 7, "y": 8})
             );
-
-            // The observer saw the raw tool output (7 + 8 = 15), *before* the
-            // downstream redaction hook replaced it.
             let results = recorder_probe.recorded_results();
-            assert_eq!(results.len(), 1, "exactly one add result");
+            assert_eq!(results.len(), 1);
             assert_eq!(
-                results[0].2, "15",
-                "the observer must see the raw tool output before redaction"
+                results[0].2, REDACTION_MARKER,
+                "finalized observers must receive only policy-approved presentation"
             );
-
-            // Paired positive + negative: the redacted marker reached the model,
-            // and the raw executed result (15) did not.
-            assert!(
-                response.contains(REDACTION_MARKER),
-                "the redaction marker must reach the model; answer: {response:?}"
-            );
-            assert!(
-                !response.contains("15"),
-                "the raw tool result must not reach the model; answer: {response:?}"
-            );
+            assert!(response.contains(REDACTION_MARKER));
+            assert!(!response.contains("15"));
         },
     )
     .await;
 }
-
-// ---------------------------------------------------------------------------
-// 4. Streaming lifecycle ordering + is_streaming parity vs the blocking surface.
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn streaming_lifecycle_ordering_and_context_streaming_flag() {
@@ -519,7 +210,7 @@ async fn streaming_lifecycle_ordering_and_context_streaming_flag() {
     let subtract = CountingSubtract::default();
     let add_calls = add.counter.clone();
     let subtract_calls = subtract.counter.clone();
-    let recorder = LifecycleRecorder::default();
+    let recorder = EventTap::default();
     let recorder_probe = recorder.clone();
 
     with_gemini_cassette(
@@ -533,100 +224,51 @@ async fn streaming_lifecycle_ordering_and_context_streaming_flag() {
                 .tool(add)
                 .tool(subtract)
                 .build();
+            install_tap(&agent, recorder, true);
 
             let mut stream = agent
                 .stream_prompt(
                     "First add 20 and 5 with the add tool. Then subtract 4 from that sum with the \
                      subtract tool. Report the final number.",
                 )
-                .add_hook(recorder)
                 .max_turns(6)
                 .await;
-
-            // Ordered stream-item taxonomy tags, so we can assert lifecycle order.
-            let mut events: Vec<&'static str> = Vec::new();
-            let mut saw_final = false;
-            let mut final_text = String::new();
+            let mut events = Vec::new();
+            let mut final_text = None;
             while let Some(item) = stream.next().await {
                 match item {
-                    Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
-                        StreamedAssistantContent::Text(_) => events.push("text"),
-                        StreamedAssistantContent::ToolCall { .. } => events.push("tool_call"),
-                        StreamedAssistantContent::ToolCallDelta { .. } => {
-                            events.push("tool_call_delta")
-                        }
-                        _ => {}
-                    },
+                    Ok(MultiTurnStreamItem::StreamAssistantItem(
+                        StreamedAssistantContent::ToolCall { .. },
+                    )) => events.push("tool_call"),
                     Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. }) => {
-                        events.push("tool_execution_committed")
+                        events.push("tool_execution_committed");
                     }
                     Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
                         ..
                     })) => events.push("tool_result"),
                     Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-                        saw_final = true;
-                        final_text = response.output().to_owned();
                         events.push("final_response");
+                        final_text = Some(response.output().to_owned());
                     }
                     Ok(_) => {}
                     Err(StreamingError::Prompt(error)) => panic!("stream errored: {error:?}"),
-                    Err(other) => panic!("stream errored: {other:?}"),
+                    Err(error) => panic!("stream errored: {error:?}"),
                 }
             }
-
-            assert!(saw_final, "the stream must yield a FinalResponse");
-            assert_nonempty_response(&final_text);
-
-            // Lifecycle ordering: a tool call precedes its execution commit, which
-            // precedes its result, which precedes the final response.
-            let first = |tag: &str| events.iter().position(|e| *e == tag);
-            let tool_call_at = first("tool_call").expect("a complete tool call is surfaced");
-            let exec_commit_at =
-                first("tool_execution_committed").expect("execution commit is surfaced");
-            let tool_result_at = first("tool_result").expect("a tool result is surfaced");
-            let final_at = first("final_response").expect("a final response is surfaced");
-            assert!(
-                tool_call_at < exec_commit_at,
-                "the model-emitted tool call must precede its execution commit: {events:?}"
-            );
-            assert!(
-                exec_commit_at <= tool_result_at,
-                "execution commit must precede its tool result: {events:?}"
-            );
-            assert!(
-                tool_result_at < final_at,
-                "tool results must precede the final response: {events:?}"
-            );
-
-            // Same medium-independent lifecycle as the blocking run, plus the
-            // streaming flag flips.
-            assert_eq!(
-                recorder_probe.is_streaming(),
-                Some(true),
-                "the streaming surface must report is_streaming() == true"
-            );
-            assert_eq!(
-                recorder_probe.distinct_run_ids(),
-                1,
-                "run_id must be stable across the streamed run too"
-            );
+            assert_nonempty_response(final_text.as_deref().expect("final response"));
+            let position = |tag| events.iter().position(|event| *event == tag).expect(tag);
+            assert!(position("tool_call") < position("tool_execution_committed"));
+            assert!(position("tool_execution_committed") <= position("tool_result"));
+            assert!(position("tool_result") < position("final_response"));
+            assert_eq!(recorder_probe.is_streaming(), Some(true));
+            assert_eq!(recorder_probe.distinct_run_ids(), 1);
             assert_eq!(recorder_probe.agent_name().as_deref(), Some("stress-agent"));
-            assert!(
-                recorder_probe.count("ModelTurnFinished") >= 2,
-                "ModelTurnFinished must fire per accepted turn on the streaming surface"
-            );
-            assert!(
-                add_calls.count() >= 1 && subtract_calls.count() >= 1,
-                "the streamed chain must exercise both tools"
-            );
+            assert!(recorder_probe.count("ModelTurnFinished") >= 2);
+            assert!(add_calls.count() >= 1 && subtract_calls.count() >= 1);
         },
     )
     .await;
 }
-
-// ---------------------------------------------------------------------------
-// 5. Multi-tool workflow: per-turn atomic call/result pairing (batch surfacing).
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn multi_tool_workflow_pairs_calls_and_results_per_turn_blocking() {
@@ -634,7 +276,7 @@ async fn multi_tool_workflow_pairs_calls_and_results_per_turn_blocking() {
     let subtract = CountingSubtract::default();
     let add_calls = add.counter.clone();
     let subtract_calls = subtract.counter.clone();
-    let recorder = LifecycleRecorder::default();
+    let recorder = EventTap::default();
     let recorder_probe = recorder.clone();
 
     with_gemini_cassette(
@@ -652,6 +294,7 @@ async fn multi_tool_workflow_pairs_calls_and_results_per_turn_blocking() {
                 .tool(add)
                 .tool(subtract)
                 .build();
+            install_tap(&agent, recorder, false);
 
             let response = agent
                 .prompt(
@@ -659,48 +302,29 @@ async fn multi_tool_workflow_pairs_calls_and_results_per_turn_blocking() {
                      tool, then report both results.",
                 )
                 .max_turns(5)
-                .add_hook(recorder)
                 .await
                 .expect("independent multi-tool run should succeed");
-
             assert_nonempty_response(&response);
-            assert!(
-                add_calls.count() >= 1 && subtract_calls.count() >= 1,
-                "both independent tools should run"
-            );
+            assert!(add_calls.count() >= 1 && subtract_calls.count() >= 1);
 
-            // Whether Gemini batches the two calls into one turn or splits them,
-            // the atomic tool batch must pair every ToolCall with a ToolResult
-            // *within the same turn* — no orphan call, no orphan result.
             let mut per_turn: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
-            for crumb in recorder_probe.breadcrumbs() {
-                let entry = per_turn.entry(crumb.turn).or_default();
-                match crumb.tag {
-                    "ToolCall" => entry.0 += 1,
-                    "ToolResult" => entry.1 += 1,
+            for breadcrumb in recorder_probe.breadcrumbs() {
+                let counts = per_turn.entry(breadcrumb.turn).or_default();
+                match breadcrumb.tag {
+                    "ToolCall" => counts.0 += 1,
+                    "ToolResult" => counts.1 += 1,
                     _ => {}
                 }
             }
-            for (turn, (calls, results)) in &per_turn {
-                assert_eq!(
-                    calls, results,
-                    "turn {turn} must pair every ToolCall with a ToolResult (atomic batch)"
-                );
-            }
+            assert!(per_turn.values().all(|(calls, results)| calls == results));
             assert_eq!(
                 recorder_probe.count("ToolCall"),
-                add_calls.count() + subtract_calls.count(),
-                "observed ToolCall events must equal real tool executions"
+                add_calls.count() + subtract_calls.count()
             );
         },
     )
     .await;
 }
-
-// ---------------------------------------------------------------------------
-// 6. Hook Skip in a multi-tool workflow: the skipped tool never executes, yet
-//    the run continues to a real answer (skip's zero-execution invariant).
-// ---------------------------------------------------------------------------
 
 const SUBTRACT_SKIP_REASON: &str =
     "the subtract tool is offline; treat its result as unavailable and continue";
@@ -727,6 +351,17 @@ async fn skip_in_multi_tool_workflow_leaves_tool_unexecuted_blocking() {
                 .tool(add)
                 .tool(subtract)
                 .build();
+            install_policy(
+                &agent,
+                "skip-subtract",
+                0,
+                1,
+                PolicyRule::SkipToolCall {
+                    tool: Some(CountingSubtract::NAME.to_owned()),
+                    reason: SUBTRACT_SKIP_REASON.to_owned(),
+                },
+            )
+            .expect("skip policy should install");
 
             let response = agent
                 .prompt(
@@ -734,49 +369,12 @@ async fn skip_in_multi_tool_workflow_leaves_tool_unexecuted_blocking() {
                      40 - 9. Report what you can.",
                 )
                 .max_turns(5)
-                // Skip every `subtract` call: its body must never run, but the run
-                // continues with the skip reason surfaced as that tool's result.
-                .add_hook(SkipToolHook {
-                    tool_name: CountingSubtract::NAME,
-                    reason: SUBTRACT_SKIP_REASON,
-                })
                 .await
                 .expect("a skipped tool must not fail the run");
-
             assert_nonempty_response(&response);
-            // Zero-execution invariant: the skipped tool's body never ran.
-            assert_eq!(
-                subtract_calls.count(),
-                0,
-                "the skipped subtract tool must never execute"
-            );
-            // The other tool still ran, so the run made real progress.
-            assert!(
-                add_calls.count() >= 1,
-                "the non-skipped add tool should still execute"
-            );
+            assert_eq!(subtract_calls.count(), 0);
+            assert!(add_calls.count() >= 1);
         },
     )
     .await;
-}
-
-// Compile-time proof the fixtures implement the hook trait for the Gemini model.
-#[allow(unused)]
-fn assert_hook_impls() {
-    fn requires_hook<H: AgentHook<GeminiModel>>(_hook: H) {}
-    requires_hook(LifecycleRecorder::default());
-    requires_hook(ScratchpadReader::default());
-    requires_hook(InjectContextAndNarrowTools {
-        fact_id: "",
-        fact_text: "",
-        allow: &[],
-    });
-    requires_hook(ForceArgs {
-        tool_name: "add",
-        args: serde_json::Value::Null,
-    });
-    requires_hook(RedactResult {
-        tool_name: "add",
-        marker: "",
-    });
 }

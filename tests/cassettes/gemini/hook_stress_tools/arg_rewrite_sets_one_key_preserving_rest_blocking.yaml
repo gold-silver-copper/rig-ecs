@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The result of adding 3 and 4 is 104."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":15,"promptTokenCount":119,"promptTokensDetails":[{"modality":"TEXT","tokenCount":119}],"serviceTier":"standard","totalTokenCount":134}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"The result of adding 3 and 4 is 104.","thoughtSignature":"signature_REDACTED_2"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":15,"promptTokenCount":119,"promptTokensDetails":[{"modality":"TEXT","tokenCount":119}],"serviceTier":"standard","thoughtsTokenCount":53,"totalTokenCount":187}}'

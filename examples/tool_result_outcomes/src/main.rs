@@ -1,299 +1,29 @@
-//! Classifying tool failures as structured facts and applying policy in hooks.
+//! Classify tool failures as immutable facts and apply ordered ECS policy.
 //!
-//! `SystemProbe` simulates Erik Tews's two failure cases: disk I/O (`EIO`) and
-//! network unreachable (`ENETUNREACH`). The tool classifies each error and adds
-//! typed operation metadata; it does not decide whether the agent may continue.
-//!
-//! A narrow completion-call hook reliably invokes `system_probe` on turn 1,
-//! while the prompt requests the desired operation. It does nothing on later
-//! turns, leaving the recoverable run free to produce a final answer. Two tool-result
-//! hooks then run in registration order:
-//!
-//! 1. `FailureRecorder` copies the event's call ID, structured error, and typed
-//!    result metadata into a run-scoped scratchpad ledger.
-//! 2. `FatalFailurePolicy` looks up that same call ID, terminating on `Other`/`EIO`
-//!    while allowing `Network`/`ENETUNREACH` feedback to reach the model. Correlation
-//!    matters because results from concurrent tool calls can interleave.
-//!
-//! `ToolResultEvent` carries facts about one execution: `raw_result` contains the
-//! standard classification and `tool_context` holds tool/application-specific typed
-//! metadata that is never sent to the model. The scratchpad is different: it is
-//! shared, run-scoped hook state. Here it lets one hook record facts for the next
-//! hook without coupling either hook to model-visible result text.
-//!
-//! Live commands (require `OPENAI_API_KEY`):
-//!
-//! ```text
-//! cargo run -p tool_result_outcomes -- fatal
-//! cargo run -p tool_result_outcomes -- recoverable
-//! ```
-//!
-//! The fatal command terminates after the disk failure. The recoverable command
-//! lets the network failure return to the model. `--help` requires no credentials.
+//! The first targeted result policy records failure metadata in a typed
+//! run-scoped component. The second policy reads the record for the same call
+//! ID: disk `EIO` is fatal, while `ENETUNREACH` remains model-visible,
+//! retryable feedback. Raw data, operator diagnostics, and presentation stay
+//! separate throughout.
 
-use anyhow::{Result, bail};
-use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, RequestPatch,
-    ToolResultAction, ToolResultEvent,
+#[path = "../../ecs_demo.rs"]
+mod ecs_demo;
+
+use anyhow::{Context, Result};
+use rig::bevy_ecs::{
+    lifecycle::Add,
+    observer::On,
+    prelude::{Commands, Component, In, Query},
 };
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{CompletionModel, Prompt};
-use rig::message::ToolChoice;
-use rig::providers::openai;
-use rig::tool::{Tool, ToolContext, ToolErrorKind, ToolExecutionError, ToolResult};
+use rig::runtime::{
+    CanonicalError, EffectCompletion, EffectOutput, ModelEffectOutput, ModelToolCall, Policy,
+    PolicyPoint, PolicyResponderId, PolicyRule, RunRecord, RunState, ToolCapability,
+    ToolEffectFailure, ToolEffectOutput, ToolGrant, ToolResultPolicyDecision,
+    ToolResultPolicyInvocation, Usage,
+};
+use rig::tool::ToolErrorKind;
 
-#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Operation {
-    ReadDisk,
-    ConnectNetwork,
-}
-
-impl Operation {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadDisk => "read_disk",
-            Self::ConnectNetwork => "connect_network",
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct ProbeArgs {
-    operation: Operation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FailureSite {
-    operation: Operation,
-    resource: &'static str,
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ProbeError {
-    #[error("disk read failed for /data/archive.bin")]
-    DiskIo,
-    #[error("network is unreachable for backup.example.net")]
-    NetworkUnreachable,
-}
-
-struct SystemProbe;
-
-impl Tool for SystemProbe {
-    const NAME: &'static str = "system_probe";
-    type Error = ProbeError;
-    type Args = ProbeArgs;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Run a simulated system operation. Use read_disk for disk access or connect_network for remote access."
-            .to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": ["read_disk", "connect_network"]
-                }
-            },
-            "required": ["operation"]
-        })
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        match error {
-            error @ ProbeError::DiskIo => ToolExecutionError::other(error.to_string())
-                .with_model_feedback("the requested disk operation failed")
-                .with_code("EIO")
-                .with_retryable(false)
-                .with_source(error),
-            error @ ProbeError::NetworkUnreachable => {
-                ToolExecutionError::network(error.to_string())
-                    .with_model_feedback("the backup service is unreachable; try again later")
-                    .with_code("ENETUNREACH")
-                    .with_source(error)
-            }
-        }
-    }
-
-    async fn call(
-        &self,
-        context: &mut ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        let (error, site) = match args.operation {
-            Operation::ReadDisk => (
-                ProbeError::DiskIo,
-                FailureSite {
-                    operation: args.operation,
-                    resource: "/data/archive.bin",
-                },
-            ),
-            Operation::ConnectNetwork => (
-                ProbeError::NetworkUnreachable,
-                FailureSite {
-                    operation: args.operation,
-                    resource: "backup.example.net",
-                },
-            ),
-        };
-        context.insert_result(site);
-        Err(error)
-    }
-}
-
-struct ForceSystemProbeOnFirstTurn;
-
-fn system_probe_patch(turn: usize) -> Option<RequestPatch> {
-    (turn == 1).then(|| {
-        RequestPatch::new().tool_choice(ToolChoice::Specific {
-            function_names: vec![SystemProbe::NAME.to_string()],
-        })
-    })
-}
-
-impl<M> AgentHook<M> for ForceSystemProbeOnFirstTurn
-where
-    M: CompletionModel,
-{
-    async fn on_completion_call(
-        &self,
-        _ctx: &HookContext,
-        event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        match system_probe_patch(event.turn) {
-            Some(patch) => CompletionCallAction::patch(patch),
-            None => CompletionCallAction::continue_run(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FailureRecord {
-    internal_call_id: String,
-    tool_name: String,
-    kind: ToolErrorKind,
-    code: Option<String>,
-    operation: Operation,
-    resource: &'static str,
-}
-
-#[derive(Clone, Default)]
-struct FailureLedger(Vec<FailureRecord>);
-
-struct FailureRecorder;
-
-fn failure_record(
-    internal_call_id: &str,
-    tool_name: &str,
-    result: &ToolResult,
-    tool_context: &ToolContext,
-) -> Option<FailureRecord> {
-    let (Some(error), Some(site)) = (result.error(), tool_context.result::<FailureSite>()) else {
-        return None;
-    };
-
-    Some(FailureRecord {
-        internal_call_id: internal_call_id.to_string(),
-        tool_name: tool_name.to_string(),
-        kind: error.kind(),
-        code: error.code().map(str::to_string),
-        operation: site.operation,
-        resource: site.resource,
-    })
-}
-
-impl<M> AgentHook<M> for FailureRecorder
-where
-    M: CompletionModel,
-{
-    async fn on_tool_result(
-        &self,
-        ctx: &HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        let Some(record) = failure_record(
-            event.internal_call_id,
-            event.tool_name,
-            event.raw_result,
-            event.tool_context,
-        ) else {
-            return ToolResultAction::keep();
-        };
-        println!(
-            "[recorder] {} {} failed: kind={}, code={}, resource={}",
-            record.tool_name,
-            record.operation.as_str(),
-            record.kind,
-            record.code.as_deref().unwrap_or("none"),
-            record.resource
-        );
-        ctx.scratchpad()
-            .update(|ledger: &mut FailureLedger| ledger.0.push(record));
-        ToolResultAction::keep()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PolicyDecision {
-    Fatal(String),
-    Recoverable,
-}
-
-fn decide(record: &FailureRecord) -> PolicyDecision {
-    if record.kind == ToolErrorKind::Other && record.code.as_deref() == Some("EIO") {
-        PolicyDecision::Fatal(format!(
-            "fatal disk I/O failure from {} ({})",
-            record.tool_name, record.resource
-        ))
-    } else {
-        PolicyDecision::Recoverable
-    }
-}
-
-fn policy_action(ledger: Option<&FailureLedger>, internal_call_id: &str) -> ToolResultAction {
-    let decision = ledger
-        .and_then(|ledger| {
-            ledger
-                .0
-                .iter()
-                .rev()
-                .find(|record| record.internal_call_id == internal_call_id)
-        })
-        .map(decide);
-
-    match decision {
-        Some(PolicyDecision::Fatal(reason)) => ToolResultAction::stop(reason),
-        Some(PolicyDecision::Recoverable) => {
-            println!("[policy] recoverable failure; returning feedback to the model");
-            ToolResultAction::keep()
-        }
-        None => ToolResultAction::keep(),
-    }
-}
-
-struct FatalFailurePolicy;
-
-impl<M> AgentHook<M> for FatalFailurePolicy
-where
-    M: CompletionModel,
-{
-    async fn on_tool_result(
-        &self,
-        ctx: &HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        if event.raw_result.error().is_none() {
-            return ToolResultAction::keep();
-        }
-
-        let ledger = ctx.scratchpad().get::<FailureLedger>();
-        policy_action(ledger.as_ref(), event.internal_call_id)
-    }
-}
+const TOOL_NAME: &str = "system_probe";
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -301,173 +31,266 @@ enum Mode {
     Recoverable,
 }
 
-fn usage() {
-    println!(
-        "Usage: tool_result_outcomes <fatal|recoverable>\n\n\
-         fatal       simulate disk EIO; policy terminates the run\n\
-         recoverable simulate ENETUNREACH; model receives tool feedback"
-    );
+#[derive(Clone)]
+struct FailureRecord {
+    call_id: String,
+    kind: ToolErrorKind,
+    retryable: Option<bool>,
+    refusal: bool,
+    message: String,
 }
 
-fn parse_mode() -> Result<Option<Mode>> {
+#[derive(Component, Default)]
+struct FailureLedger(Vec<FailureRecord>);
+
+fn initialize_ledger(event: On<Add, RunRecord>, mut commands: Commands) {
+    commands
+        .entity(event.entity)
+        .insert(FailureLedger::default());
+}
+
+fn record_failure(
+    In(event): In<ToolResultPolicyInvocation>,
+    mut ledgers: Query<&mut FailureLedger>,
+) -> Option<ToolResultPolicyDecision> {
+    if let Some(failure) = &event.result.failure
+        && let Ok(mut ledger) = ledgers.get_mut(event.run)
+    {
+        ledger.0.push(FailureRecord {
+            call_id: event.result.call_id.clone(),
+            kind: failure.kind,
+            retryable: failure.retryable,
+            refusal: failure.refusal,
+            message: failure.message.clone(),
+        });
+    }
+    Some(ToolResultPolicyDecision::Keep)
+}
+
+fn redact_model_presentation(
+    In(event): In<ToolResultPolicyInvocation>,
+) -> Option<ToolResultPolicyDecision> {
+    Some(if event.result.failure.is_some() {
+        ToolResultPolicyDecision::Rewrite("system probe unavailable".into())
+    } else {
+        ToolResultPolicyDecision::Keep
+    })
+}
+
+fn stop_fatal_failure(
+    In(event): In<ToolResultPolicyInvocation>,
+    ledgers: Query<&FailureLedger>,
+) -> Option<ToolResultPolicyDecision> {
+    let record = ledgers.get(event.run).ok().and_then(|ledger| {
+        ledger
+            .0
+            .iter()
+            .find(|record| record.call_id == event.result.call_id)
+    });
+    Some(match record {
+        Some(record) if record.kind == ToolErrorKind::Other => {
+            ToolResultPolicyDecision::Stop(format!("fatal disk I/O failure ({})", record.message))
+        }
+        Some(record) => {
+            println!(
+                "recorded call={} kind={} retryable={:?} refusal={}",
+                record.call_id, record.kind, record.retryable, record.refusal
+            );
+            ToolResultPolicyDecision::Keep
+        }
+        None => ToolResultPolicyDecision::Keep,
+    })
+}
+
+fn parse_mode() -> Option<Mode> {
     match std::env::args().nth(1).as_deref() {
-        Some("fatal") => Ok(Some(Mode::Fatal)),
-        Some("recoverable") => Ok(Some(Mode::Recoverable)),
-        Some("-h" | "--help") | None => Ok(None),
-        Some(other) => bail!("unknown mode `{other}`; use --help"),
+        Some("fatal") => Some(Mode::Fatal),
+        Some("recoverable") => Some(Mode::Recoverable),
+        _ => None,
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let Some(mode) = parse_mode()? else {
-        usage();
-        return Ok(());
-    };
-
-    let (operation, prompt) = match mode {
-        Mode::Fatal => (
-            "read_disk",
-            "Use system_probe with read_disk exactly once, then report the result.",
-        ),
-        Mode::Recoverable => (
-            "connect_network",
-            "Use system_probe with connect_network exactly once, then explain the failure without retrying.",
-        ),
-    };
-    println!("Running simulated {operation} path");
-
-    let agent = openai::Client::from_env()?
-        .agent(openai::GPT_4O)
-        .preamble("Follow the user's requested system_probe operation exactly.")
-        .tool(SystemProbe)
-        .build();
-
-    let response = agent
-        .prompt(prompt)
-        .max_turns(2)
-        .add_hook(ForceSystemProbeOnFirstTurn)
-        .add_hook(FailureRecorder)
-        .add_hook(FatalFailurePolicy)
-        .await?;
-    println!("\nFinal response:\n{response}");
+fn install_probe(
+    runtime: &mut rig::runtime::Runtime,
+    agent: rig::runtime::AgentHandle,
+) -> Result<()> {
+    let tool = runtime.spawn_tool(
+        ecs_demo::id("system-probe-tool")?,
+        ecs_demo::tenant()?,
+        ToolCapability {
+            name: TOOL_NAME.to_owned(),
+            description: "Probe a disk or network operation".to_owned(),
+            parameters: serde_json::json!({"type":"object"}),
+            order: 0,
+            revision: 1,
+            retired: false,
+        },
+    )?;
+    runtime.grant_tool(
+        ecs_demo::id("system-probe-grant")?,
+        ecs_demo::tenant()?,
+        ToolGrant {
+            order: 0,
+            enabled: true,
+        },
+        agent,
+        tool,
+    )?;
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rig::tool::ToolSet;
+fn install_policies(
+    runtime: &mut rig::runtime::Runtime,
+    agent: rig::runtime::AgentHandle,
+) -> Result<()> {
+    runtime.world_mut().add_observer(initialize_ledger);
+    let recorder = runtime.spawn_policy(
+        ecs_demo::id("record-failure")?,
+        ecs_demo::tenant()?,
+        Policy {
+            order: 0,
+            revision: 1,
+            rule: PolicyRule::Custom(PolicyPoint::ToolResult),
+        },
+        agent,
+    )?;
+    runtime.register_tool_result_policy_responder(
+        recorder,
+        PolicyResponderId::new("record-failure")?,
+        record_failure,
+    )?;
+    let redaction = runtime.spawn_policy(
+        ecs_demo::id("redact-failure")?,
+        ecs_demo::tenant()?,
+        Policy {
+            order: 1,
+            revision: 1,
+            rule: PolicyRule::Custom(PolicyPoint::ToolResult),
+        },
+        agent,
+    )?;
+    runtime.register_tool_result_policy_responder(
+        redaction,
+        PolicyResponderId::new("redact-failure")?,
+        redact_model_presentation,
+    )?;
+    let fatal = runtime.spawn_policy(
+        ecs_demo::id("stop-fatal-failure")?,
+        ecs_demo::tenant()?,
+        Policy {
+            order: 2,
+            revision: 1,
+            rule: PolicyRule::Custom(PolicyPoint::ToolResult),
+        },
+        agent,
+    )?;
+    runtime.register_tool_result_policy_responder(
+        fatal,
+        PolicyResponderId::new("stop-fatal-failure")?,
+        stop_fatal_failure,
+    )?;
+    Ok(())
+}
 
-    async fn structured_failure(operation: Operation) -> (ToolResult, ToolContext) {
-        let tools = ToolSet::from_tools(vec![SystemProbe]);
-        let mut context = ToolContext::new();
-        let args = serde_json::json!({ "operation": operation }).to_string();
-        let result = tools.execute(SystemProbe::NAME, args, &mut context).await;
-        (result, context)
-    }
-
-    #[test]
-    fn system_probe_is_forced_on_first_turn_only() {
-        assert!(system_probe_patch(0).is_none());
-        let first_turn = system_probe_patch(1);
-        assert_eq!(
-            first_turn.and_then(|patch| patch.tool_choice),
-            Some(ToolChoice::Specific {
-                function_names: vec![SystemProbe::NAME.to_string()],
-            })
-        );
-        assert!(system_probe_patch(2).is_none());
-        assert!(system_probe_patch(3).is_none());
-    }
-
-    #[tokio::test]
-    async fn connect_network_preserves_classification_and_typed_metadata() {
-        let (result, context) = structured_failure(Operation::ConnectNetwork).await;
-        assert!(result.error().is_some(), "probe should fail");
-        let Some(error) = result.error() else {
-            return;
-        };
-        assert_eq!(error.kind(), ToolErrorKind::Network);
-        assert_eq!(error.code(), Some("ENETUNREACH"));
-        assert_eq!(result.output().as_text(), error.model_feedback());
-        assert_eq!(
-            context.result::<FailureSite>(),
-            Some(&FailureSite {
-                operation: Operation::ConnectNetwork,
-                resource: "backup.example.net",
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn recorder_data_drives_fatal_and_recoverable_actions_by_call_id() {
-        let (fatal_result, fatal_context) = structured_failure(Operation::ReadDisk).await;
-        let (recoverable_result, recoverable_context) =
-            structured_failure(Operation::ConnectNetwork).await;
-
-        let mut ledger = FailureLedger::default();
-        let fatal_record = failure_record(
-            "fatal-call",
-            SystemProbe::NAME,
-            &fatal_result,
-            &fatal_context,
-        );
-        let recoverable_record = failure_record(
-            "recoverable-call",
-            SystemProbe::NAME,
-            &recoverable_result,
-            &recoverable_context,
-        );
-        assert!(fatal_record.is_some(), "fatal failure record");
-        assert!(recoverable_record.is_some(), "recoverable failure record");
-        let (Some(fatal_record), Some(recoverable_record)) = (fatal_record, recoverable_record)
-        else {
-            return;
-        };
-        ledger.0.push(fatal_record);
-        // Interleave a later recoverable record: policy must not use `last()`.
-        ledger.0.push(recoverable_record);
-
-        assert!(matches!(
-            policy_action(Some(&ledger), "fatal-call"),
-            ToolResultAction::Stop(_)
-        ));
-        assert_eq!(
-            policy_action(Some(&ledger), "recoverable-call"),
-            ToolResultAction::Keep
-        );
-        assert_eq!(
-            policy_action(Some(&ledger), "missing-call"),
-            ToolResultAction::Keep
-        );
-        assert_eq!(policy_action(None, "fatal-call"), ToolResultAction::Keep);
-    }
-
-    #[tokio::test]
-    async fn missing_metadata_cannot_create_a_record_or_reuse_stale_state() {
-        let (result, _context) = structured_failure(Operation::ReadDisk).await;
-        assert!(
-            failure_record(
-                "current-call",
-                SystemProbe::NAME,
-                &result,
-                &ToolContext::new(),
-            )
-            .is_none()
-        );
-
-        let stale = FailureLedger(vec![FailureRecord {
-            internal_call_id: "stale-call".to_string(),
-            tool_name: SystemProbe::NAME.to_string(),
+fn main() -> Result<()> {
+    let Some(mode) = parse_mode() else {
+        println!("Usage: tool_result_outcomes <fatal|recoverable>");
+        return Ok(());
+    };
+    let (mut runtime, agent) = ecs_demo::runtime(false)?;
+    install_probe(&mut runtime, agent)?;
+    install_policies(&mut runtime, agent)?;
+    let pending = runtime.handle().prompt(agent, "Run the system probe")?;
+    let model = ecs_demo::next_effect(&mut runtime)?;
+    let operation = match mode {
+        Mode::Fatal => "read_disk",
+        Mode::Recoverable => "connect_network",
+    };
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: model.operation,
+            generation: model.generation,
+            result: Ok(EffectOutput::Model(ModelEffectOutput {
+                assistant_message: None,
+                text: String::new(),
+                usage: Usage::default(),
+                tool_calls: vec![ModelToolCall {
+                    id: "probe-call".to_owned(),
+                    provider_result_id: "probe-call".to_owned(),
+                    provider_call_id: None,
+                    name: TOOL_NAME.to_owned(),
+                    arguments: serde_json::json!({"operation": operation}),
+                }],
+            })),
+        })?;
+    let tool = ecs_demo::next_effect(&mut runtime)?;
+    let input = tool
+        .tool_input()
+        .context("expected the probe tool effect")?;
+    let failure = match mode {
+        Mode::Fatal => ToolEffectFailure {
+            message: "EIO while reading /var/data".to_owned(),
+            retryable: Some(false),
             kind: ToolErrorKind::Other,
-            code: Some("EIO".to_string()),
-            operation: Operation::ReadDisk,
-            resource: "/stale",
-        }]);
-        assert_eq!(
-            policy_action(Some(&stale), "current-call"),
-            ToolResultAction::Keep
-        );
+            refusal: false,
+        },
+        Mode::Recoverable => ToolEffectFailure {
+            message: "ENETUNREACH while connecting".to_owned(),
+            retryable: Some(true),
+            kind: ToolErrorKind::Network,
+            refusal: false,
+        },
+    };
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: tool.operation,
+            generation: tool.generation,
+            result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                call_id: input.call_id.clone(),
+                provider_result_id: input.provider_result_id.clone(),
+                provider_call_id: input.provider_call_id.clone(),
+                name: input.decision.name.clone(),
+                raw: serde_json::json!({"error": failure.kind.as_str()}).into(),
+                presentation: format!("probe failed: {}", failure.kind).into(),
+                failure: Some(failure),
+            })),
+        })?;
+    runtime.run_until_stalled()?;
+    let run = runtime
+        .resolve_run(&pending)
+        .context("the prompt should resolve to a run")?;
+
+    match mode {
+        Mode::Fatal => match runtime.observe_run(run)? {
+            Some(RunState::Failed(CanonicalError::PolicyTerminated { termination })) => {
+                println!("fatal result stopped by {termination}");
+            }
+            state => anyhow::bail!("unexpected fatal outcome: {state:?}"),
+        },
+        Mode::Recoverable => {
+            let follow_up = runtime
+                .effects()
+                .try_recv()?
+                .context("recoverable feedback should reach the model")?;
+            let result = follow_up
+                .model_input()
+                .and_then(|input| input.tool_results.first())
+                .context("follow-up request should retain the tool result")?;
+            println!(
+                "model sees `{}` while raw audit data remains {}",
+                result.presentation, result.raw
+            );
+            ecs_demo::complete_text(&runtime, &follow_up, "reported recoverable failure")?;
+            runtime.run_until_stalled()?;
+            match runtime.observe_run(run)? {
+                Some(RunState::Completed(output)) => println!("completed: {}", output.text),
+                state => anyhow::bail!("unexpected recoverable outcome: {state:?}"),
+            }
+        }
     }
+    Ok(())
 }

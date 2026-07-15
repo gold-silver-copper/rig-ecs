@@ -2,20 +2,14 @@
 //!
 //! Primarily intended for internal usage. However if you also wish to implement generic HTTP streaming for your custom completion model,
 //! you may find this helpful.
-use crate::{
-    http_client::{
-        HttpClientExt, Result as StreamResult,
-        retry::{DEFAULT_RETRY, ExponentialBackoff, RetryPolicy},
-    },
-    wasm_compat::{WasmCompatSend, WasmCompatSendStream},
+use crate::http_client::{
+    HttpClientExt, Result as StreamResult,
+    retry::{DEFAULT_RETRY, ExponentialBackoff, RetryPolicy},
 };
 use bytes::Bytes;
 use eventsource_stream::{Event as MessageEvent, EventStreamError, Eventsource};
 use futures::Stream;
-#[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
 use futures::{future::BoxFuture, stream::BoxStream};
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-use futures::{future::LocalBoxFuture, stream::LocalBoxStream};
 use futures_timer::Delay;
 use http::Response;
 use http::{HeaderName, HeaderValue, Request, StatusCode};
@@ -27,17 +21,11 @@ use std::{
     time::Duration,
 };
 
-pub type BoxedStream = Pin<Box<dyn WasmCompatSendStream<InnerItem = StreamResult<Bytes>>>>;
+pub type BoxedStream = Pin<Box<dyn Stream<Item = StreamResult<Bytes>> + Send>>;
 
-#[cfg(not(target_arch = "wasm32"))]
 type ResponseFuture = BoxFuture<'static, Result<Response<BoxedStream>, super::Error>>;
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-type ResponseFuture = LocalBoxFuture<'static, Result<Response<BoxedStream>, super::Error>>;
 
-#[cfg(not(target_arch = "wasm32"))]
 type EventStream = BoxStream<'static, Result<MessageEvent, EventStreamError<super::Error>>>;
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-type EventStream = LocalBoxStream<'static, Result<MessageEvent, EventStreamError<super::Error>>>;
 
 pin_project! {
     /// Internal state variants for the SSE state machine.
@@ -87,7 +75,7 @@ pin_project! {
 impl<HttpClient, RequestBody> GenericEventSource<HttpClient, RequestBody>
 where
     HttpClient: HttpClientExt + Clone + 'static,
-    RequestBody: Into<Bytes> + Clone + WasmCompatSend + 'static,
+    RequestBody: Into<Bytes> + Clone + Send + 'static,
 {
     /// Create a new event source that will connect to the given request.
     pub fn new(client: HttpClient, req: Request<RequestBody>) -> Self {
@@ -163,7 +151,7 @@ impl From<MessageEvent> for Event {
 impl<HttpClient, RequestBody> Stream for GenericEventSource<HttpClient, RequestBody>
 where
     HttpClient: HttpClientExt + Clone + 'static,
-    RequestBody: Into<Bytes> + Clone + WasmCompatSend + 'static,
+    RequestBody: Into<Bytes> + Clone + Send + 'static,
 {
     type Item = Result<Event, super::Error>;
 

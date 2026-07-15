@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":12,"y":30},"name":"add"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":20,"promptTokenCount":77,"promptTokensDetails":[{"modality":"TEXT","tokenCount":77}],"serviceTier":"standard","thoughtsTokenCount":66,"totalTokenCount":163}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":12,"y":30},"name":"add"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":20,"promptTokenCount":77,"promptTokensDetails":[{"modality":"TEXT","tokenCount":77}],"serviceTier":"standard","thoughtsTokenCount":57,"totalTokenCount":154}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The sum is 42."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":7,"promptTokenCount":111,"promptTokensDetails":[{"modality":"TEXT","tokenCount":111}],"serviceTier":"standard","totalTokenCount":118}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"The sum of 12 and 30 is 42."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":15,"promptTokenCount":111,"promptTokensDetails":[{"modality":"TEXT","tokenCount":111}],"serviceTier":"standard","totalTokenCount":126}}'

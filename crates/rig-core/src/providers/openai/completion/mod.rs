@@ -12,7 +12,6 @@ use crate::one_or_many::string_or_one_or_many;
 use crate::telemetry::{
     CompletionOperation, CompletionSpanBuilder, ProviderResponseExt, SpanCombinator,
 };
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use crate::{OneOrMany, completion, json_utils, message};
 use serde::{Deserialize, Serialize, Serializer};
 use std::convert::Infallible;
@@ -1441,8 +1440,8 @@ pub trait OpenAICompatibleProvider: crate::client::Provider {
         + Serialize
         + serde::de::DeserializeOwned
         + Unpin
-        + WasmCompatSend
-        + WasmCompatSync
+        + Send
+        + Sync
         + 'static;
 
     /// The chat-completions payload this provider returns.
@@ -1450,8 +1449,8 @@ pub trait OpenAICompatibleProvider: crate::client::Provider {
         + Serialize
         + crate::telemetry::ProviderResponseExt<Usage: GetTokenUsage>
         + TryInto<completion::CompletionResponse<Self::Response>, Error = CompletionError>
-        + WasmCompatSend
-        + WasmCompatSync;
+        + Send
+        + Sync;
 
     /// The request path for chat completions, resolved against the client
     /// base URL by [`Provider::build_uri`](crate::client::Provider::build_uri).
@@ -1903,16 +1902,15 @@ impl GenericCompletionModel<super::OpenAICompletionsExt, reqwest::Client> {
 
 impl<Ext, H> completion::CompletionModel for GenericCompletionModel<Ext, H>
 where
-    crate::client::Client<Ext, H>:
-        HttpClientExt + Clone + WasmCompatSend + WasmCompatSync + 'static,
+    crate::client::Client<Ext, H>: HttpClientExt + Clone + Send + Sync + 'static,
     Ext: crate::client::Provider
         + OpenAICompatibleProvider
         + crate::client::DebugExt
         + Clone
-        + WasmCompatSend
-        + WasmCompatSync
+        + Send
+        + Sync
         + 'static,
-    H: Clone + Default + std::fmt::Debug + WasmCompatSend + WasmCompatSync + 'static,
+    H: Clone + Default + std::fmt::Debug + Send + Sync + 'static,
 {
     type Response = Ext::Response;
     type StreamingResponse = StreamingCompletionResponse<Ext::StreamingUsage>;

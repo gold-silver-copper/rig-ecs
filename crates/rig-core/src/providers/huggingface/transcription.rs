@@ -3,7 +3,6 @@ use crate::providers::huggingface::Client;
 use crate::providers::huggingface::completion::ApiResponse;
 use crate::transcription;
 use crate::transcription::TranscriptionError;
-use crate::wasm_compat::WasmCompatSync;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use serde::Deserialize;
@@ -49,7 +48,7 @@ impl<T> TranscriptionModel<T> {
 }
 impl<T> transcription::TranscriptionModel for TranscriptionModel<T>
 where
-    T: HttpClientExt + Clone + WasmCompatSync + 'static,
+    T: HttpClientExt + Clone + Sync + 'static,
 {
     type Response = TranscriptionResponse;
 

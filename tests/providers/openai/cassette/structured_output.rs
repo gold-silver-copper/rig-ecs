@@ -1,7 +1,7 @@
 //! OpenAI structured output coverage, including the migrated example path.
 
 use rig::client::CompletionClient;
-use rig::completion::{Prompt, TypedPrompt};
+use rig::completion::TypedPrompt;
 use rig::providers::openai;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -81,13 +81,11 @@ async fn prompt_typed_and_output_schema() {
                 .expect("prompt_typed should succeed");
             assert_weather_forecast(&forecast, &["new york", "nyc"]);
 
-            let extended = agent
+            let forecast = agent
                 .prompt_typed::<WeatherForecast>("What's the weather forecast for Los Angeles?")
-                .extended_details()
                 .await
-                .expect("extended prompt_typed should succeed");
-            assert_weather_forecast(&extended.output, &["los angeles", "la"]);
-            assert!(extended.usage.total_tokens > 0, "usage should be populated");
+                .expect("typed prompt should succeed");
+            assert_weather_forecast(&forecast, &["los angeles", "la"]);
 
             let agent_with_schema = client
                 .agent(openai::GPT_4O)

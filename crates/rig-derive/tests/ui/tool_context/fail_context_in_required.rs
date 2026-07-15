@@ -1,12 +1,10 @@
-#![allow(unused_imports)]
-
-use rig_core::tool::ToolContext;
 use rig_derive::rig_tool;
+
+struct ToolContext;
 
 #[rig_tool(required(context))]
 fn context_in_required(
-    #[rig(context)]
-    context: &mut ToolContext,
+    #[rig(context)] context: &mut ToolContext,
     query: String,
 ) -> Result<String, rig_core::tool::ToolExecutionError> {
     let _ = context;

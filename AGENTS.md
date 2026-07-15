@@ -70,20 +70,9 @@ Providers declare capabilities explicitly with `Capable<T>` and `Nothing`.
 
 Rig supports WebAssembly targets.
 
-Use `WasmCompatSend` and `WasmCompatSync` in trait bounds instead of raw `Send`
-and `Sync`.
-
-Use `WasmBoxedFuture` for boxed futures.
-
-When an error type stores boxed errors, use platform-specific bounds:
-
-```rust
-#[cfg(not(target_family = "wasm"))]
-Box<dyn std::error::Error + Send + Sync + 'static>
-
-#[cfg(target_family = "wasm")]
-Box<dyn std::error::Error + 'static>
-```
+Use ordinary `Send` and `Sync` bounds with the same meaning on native and WASM.
+Keep target-specific HTTP and task integration private to the asynchronous effect
+boundary; do not introduce conditional public marker traits or boxed-future aliases.
 
 ## Error Handling
 
@@ -148,36 +137,21 @@ Use an appropriate backend-specific filter type.
 
 Return `VectorStoreError` variants instead of ad hoc string errors.
 
-Use `WasmCompatSend` and `WasmCompatSync` bounds.
+Use ordinary `Send` and `Sync` bounds.
 
-## Agent Hook Changes
+## ECS Runtime Changes
 
-Agent hooks are per-run lifecycle observers and steerers. `AgentHook<M>` exposes
-one method per lifecycle event, and every method receives the run-scoped
-`HookContext` (run id, turn, streaming flag, agent name, shared `Scratchpad`).
-Each method returns an event-specific action type, so unsupported combinations
-are rejected by the compiler.
+Rig's agent runtime is Bevy ECS-native. One `World` is authoritative for domain
+state, and `RigSchedule` owns progression. Add runtime behavior through
+components, relationships, messages, and explicitly ordered systems. Do not add
+runner-owned state machines, callback stacks, or registries that mirror world
+state.
 
-Composition through `HookStack` remains event-dependent:
-
-- **Completion calls accumulate and merge.** Every
-  `CompletionCallAction::Patch(RequestPatch)` is merged in registration order;
-  `Stop` short-circuits the stack.
-- **Tool calls and results chain.** `ToolCallAction::Rewrite` and
-  `ToolResultAction::Rewrite` are threaded into later hooks. A tool-call `Skip`
-  or either event's `Stop` is terminal.
-- **Invalid tool calls** return `InvalidToolCallAction` (`Fail`, `Retry`,
-  `Repair`, `Skip`, or `Stop`).
-- **Observe-only events** return `ObservationAction` (`Continue` or `Stop`).
-
-Register observe-only hooks before steering hooks because stop actions
-short-circuit. Nested `HookStack`s must preserve merge and chaining semantics.
-`RequestPatch` remains per-turn and non-sticky; its documented merge rules are
-append `extra_context`, shallow-merge `additional_params`, intersect
-`active_tools`, and last-writer-wins scalars/history with a warning.
-
-Every hook semantic must behave identically on streaming and non-streaming
-surfaces (`AgentRunner::stream` and `AgentRunner::run` share `drive_agent`).
+External model, tool, store, persistence, and discovery work receives only owned
+immutable effect input. No ECS borrow may cross `.await`; completions must return
+through the generation-correlated ingress and be committed by systems. Preserve
+explicit ordering, tenant scope, stable identity, immutable in-flight decisions,
+and identical blocking/streaming terminal semantics.
 
 ## Style
 

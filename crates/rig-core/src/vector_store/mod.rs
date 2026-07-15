@@ -10,6 +10,8 @@
 //!
 //! Types implementing [`VectorStoreIndex`] automatically implement [`Tool`].
 
+use futures::future::BoxFuture;
+
 pub use request::VectorSearchRequest;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,6 @@ use crate::{
     embeddings::{Embedding, EmbeddingError},
     tool::Tool,
     vector_store::request::{Filter, FilterError, SearchFilter},
-    wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync},
 };
 
 pub mod builder;
@@ -40,7 +41,6 @@ pub enum VectorStoreError {
     #[error("Json error: {0}")]
     JsonError(#[from] serde_json::Error),
 
-    #[cfg(not(target_family = "wasm"))]
     /// Backend-specific datastore error.
     #[error("Datastore error: {0}")]
     DatastoreError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
@@ -48,11 +48,6 @@ pub enum VectorStoreError {
     /// Filter construction or translation failed.
     #[error("Filter error: {0}")]
     FilterError(#[from] FilterError),
-
-    #[cfg(target_family = "wasm")]
-    /// Backend-specific datastore error.
-    #[error("Datastore error: {0}")]
-    DatastoreError(#[from] Box<dyn std::error::Error + 'static>),
 
     /// A document was missing an ID required by the backend.
     #[error("Missing Id: {0}")]
@@ -72,49 +67,48 @@ pub enum VectorStoreError {
 }
 
 /// Trait for inserting documents and embeddings into a vector store.
-pub trait InsertDocuments: WasmCompatSend + WasmCompatSync {
+pub trait InsertDocuments: Send + Sync {
     /// Insert precomputed embeddings for each document.
-    fn insert_documents<Doc: Serialize + Embed + WasmCompatSend>(
+    fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, OneOrMany<Embedding>)>,
-    ) -> impl std::future::Future<Output = Result<(), VectorStoreError>> + WasmCompatSend;
+    ) -> impl std::future::Future<Output = Result<(), VectorStoreError>> + Send;
 }
 
 /// Trait for querying a vector store by similarity.
-pub trait VectorStoreIndex: WasmCompatSend + WasmCompatSync {
+pub trait VectorStoreIndex: Send + Sync {
     /// The filter type for this backend.
-    type Filter: SearchFilter + WasmCompatSend + WasmCompatSync;
+    type Filter: SearchFilter + Send + Sync;
 
     /// Returns the top N most similar documents as `(score, id, document)` tuples.
-    fn top_n<T: for<'a> Deserialize<'a> + WasmCompatSend>(
+    fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
         req: VectorSearchRequest<Self::Filter>,
-    ) -> impl std::future::Future<Output = Result<Vec<(f64, String, T)>, VectorStoreError>>
-    + WasmCompatSend;
+    ) -> impl std::future::Future<Output = Result<Vec<(f64, String, T)>, VectorStoreError>> + Send;
 
     /// Returns the top N most similar document IDs as `(score, id)` tuples.
     fn top_n_ids(
         &self,
         req: VectorSearchRequest<Self::Filter>,
-    ) -> impl std::future::Future<Output = Result<Vec<(f64, String)>, VectorStoreError>> + WasmCompatSend;
+    ) -> impl std::future::Future<Output = Result<Vec<(f64, String)>, VectorStoreError>> + Send;
 }
 
 /// Type-erased `top_n` result: `(score, id, document)` tuples as JSON values.
 pub type TopNResults = Result<Vec<(f64, String, Value)>, VectorStoreError>;
 
 /// Type-erased [`VectorStoreIndex`] for dynamic dispatch.
-pub trait VectorStoreIndexDyn: WasmCompatSend + WasmCompatSync {
+pub trait VectorStoreIndexDyn: Send + Sync {
     /// Returns the top N documents for a JSON-serializable request.
     fn top_n<'a>(
         &'a self,
         req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, TopNResults>;
+    ) -> BoxFuture<'a, TopNResults>;
 
     /// Returns only the top N document IDs for a JSON-serializable request.
     fn top_n_ids<'a>(
         &'a self,
         req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>>;
+    ) -> BoxFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>>;
 }
 
 impl<I: VectorStoreIndex<Filter = F>, F> VectorStoreIndexDyn for I
@@ -122,8 +116,8 @@ where
     F: std::fmt::Debug
         + Clone
         + SearchFilter<Value = serde_json::Value>
-        + WasmCompatSend
-        + WasmCompatSync
+        + Send
+        + Sync
         + Serialize
         + for<'de> Deserialize<'de>
         + 'static,
@@ -131,7 +125,7 @@ where
     fn top_n<'a>(
         &'a self,
         req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, TopNResults> {
+    ) -> BoxFuture<'a, TopNResults> {
         let req = req.map_filter(Filter::interpret);
 
         Box::pin(async move {
@@ -147,7 +141,7 @@ where
     fn top_n_ids<'a>(
         &'a self,
         req: VectorSearchRequest<Filter<serde_json::Value>>,
-    ) -> WasmBoxedFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>> {
+    ) -> BoxFuture<'a, Result<Vec<(f64, String)>, VectorStoreError>> {
         let req = req.map_filter(Filter::interpret);
 
         Box::pin(self.top_n_ids(req))
@@ -190,10 +184,7 @@ pub struct VectorStoreOutput {
 
 impl<T, F> Tool for T
 where
-    F: SearchFilter<Value = serde_json::Value>
-        + WasmCompatSend
-        + WasmCompatSync
-        + for<'de> Deserialize<'de>,
+    F: SearchFilter<Value = serde_json::Value> + Send + Sync + for<'de> Deserialize<'de>,
     T: VectorStoreIndex<Filter = F>,
 {
     const NAME: &'static str = "search_vector_store";
@@ -228,11 +219,7 @@ where
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let results = self.top_n(args).await?;
         Ok(results
             .into_iter()

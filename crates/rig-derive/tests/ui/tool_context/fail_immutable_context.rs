@@ -1,7 +1,6 @@
-#![allow(unused_imports)]
-
-use rig_core::tool::ToolContext;
 use rig_derive::rig_tool;
+
+struct ToolContext;
 
 #[rig_tool]
 fn immutable_context(

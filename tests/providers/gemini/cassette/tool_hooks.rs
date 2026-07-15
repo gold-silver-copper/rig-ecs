@@ -1,21 +1,30 @@
-//! Prompt-hook dispatch on the tool execution path: skip-with-reason,
-//! terminate-early, and observation of every call/result pair.
+//! ECS policy dispatch on the tool execution path: skip-with-reason,
+//! stop-before-dispatch, and observation of every call/result pair.
 
-use rig::agent::AgentHook;
+use rig::bevy_ecs::prelude::{In, On, Query};
 use rig::client::CompletionClient;
-use rig::completion::{Prompt, PromptError};
 use rig::providers::gemini;
+use rig::runtime::{
+    PolicyPoint, PolicyResponderId, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation,
+    ToolCallPrepared, ToolEffectInput, ToolResultPresentationFinalized,
+};
 use rig::tool::Tool;
 
 use super::super::agent_run_support::tool_result_texts;
 use super::super::support::with_gemini_cassette;
-use super::super::tools_support::{
-    CountingAdd, FORCE_TOOLS_PREAMBLE, SkipToolHook, TerminateOnToolHook, ToolEventRecorder,
-};
-use crate::support::assert_nonempty_response;
+use super::super::tools_support::{CountingAdd, FORCE_TOOLS_PREAMBLE, ToolEventRecorder};
+use crate::support::{assert_nonempty_response, install_policy};
 
 const SKIP_REASON: &str = "the add tool is down for maintenance; report exactly that to the user";
 const TERMINATE_REASON: &str = "tool execution vetoed by policy hook";
+
+fn stop_add(In(event): In<ToolCallPolicyInvocation>) -> Option<ToolCallPolicyDecision> {
+    Some(if event.call.decision.name == CountingAdd::NAME {
+        ToolCallPolicyDecision::Stop(TERMINATE_REASON.to_owned())
+    } else {
+        ToolCallPolicyDecision::Run
+    })
+}
 
 #[tokio::test]
 async fn on_tool_call_skip_returns_reason_without_executing() {
@@ -32,13 +41,21 @@ async fn on_tool_call_skip_returns_reason_without_executing() {
                 .tool(add)
                 .build();
 
+            install_policy(
+                &agent,
+                "skip-add",
+                0,
+                1,
+                PolicyRule::SkipToolCall {
+                    tool: Some(CountingAdd::NAME.to_owned()),
+                    reason: SKIP_REASON.to_owned(),
+                },
+            )
+            .expect("skip policy should install");
+
             let response = agent
                 .prompt("What is 19 + 23?")
                 .max_turns(3)
-                .add_hook(SkipToolHook {
-                    tool_name: CountingAdd::NAME,
-                    reason: SKIP_REASON,
-                })
                 .extended_details()
                 .await
                 .expect("a skipped tool call should not fail the run");
@@ -75,29 +92,38 @@ async fn on_tool_call_terminate_cancels_run() {
                 .tool(add)
                 .build();
 
+            let policy = install_policy(
+                &agent,
+                "stop-add",
+                0,
+                1,
+                PolicyRule::Custom(PolicyPoint::ToolCall),
+            )
+            .expect("stop policy should install");
+            agent
+                .with_runtime_mut(|runtime| {
+                    runtime
+                        .register_tool_call_policy_responder(
+                            policy,
+                            PolicyResponderId::new("stop-add").unwrap(),
+                            stop_add,
+                        )
+                        .expect("tool-call responder should register");
+                })
+                .expect("policy observer should install");
+
             let error = agent
                 .prompt("What is 19 + 23?")
                 .max_turns(3)
-                .add_hook(TerminateOnToolHook {
-                    tool_name: CountingAdd::NAME,
-                    reason: TERMINATE_REASON,
-                })
                 .extended_details()
                 .await
-                .expect_err("a terminating hook should cancel the run");
+                .expect_err("a stopping policy should fail the run");
 
             assert_eq!(counter.count(), 0, "the vetoed tool should never execute");
-            match &error {
-                PromptError::PromptCancelled { reason, .. } => {
-                    // The hook's reason passes through verbatim (no model
-                    // content), so this is exact.
-                    assert_eq!(
-                        reason, TERMINATE_REASON,
-                        "cancellation should carry the hook's reason verbatim"
-                    );
-                }
-                other => panic!("expected PromptCancelled, got {other:?}"),
-            }
+            assert!(
+                error.to_string().contains("stop-add"),
+                "policy denial should identify the stopping policy: {error:?}"
+            );
         },
     )
     .await;
@@ -119,10 +145,51 @@ async fn hooks_observe_every_tool_call_and_result() {
                 .tool(add)
                 .build();
 
+            let call_recorder = recorder.clone();
+            let result_recorder = recorder.clone();
+            agent
+                .with_runtime_mut(move |runtime| {
+                    runtime
+                        .world_mut()
+                        .add_observer(move |event: On<ToolCallPrepared>| {
+                            call_recorder
+                                .calls
+                                .lock()
+                                .expect("calls lock should not be poisoned")
+                                .push((
+                                    event.call.decision.name.clone(),
+                                    event.call.arguments.to_string(),
+                                ));
+                        });
+                    runtime.world_mut().add_observer(
+                        move |event: On<ToolResultPresentationFinalized>,
+                              inputs: Query<&ToolEffectInput>| {
+                            let arguments = result_recorder
+                                .calls
+                                .lock()
+                                .expect("calls lock should not be poisoned")
+                                .last()
+                                .map_or_else(String::new, |(_, arguments)| arguments.clone());
+                            let input = inputs.get(event.operation).expect(
+                                "finalized tool operation should retain its immutable input",
+                            );
+                            result_recorder
+                                .results
+                                .lock()
+                                .expect("results lock should not be poisoned")
+                                .push((
+                                    input.decision.name.clone(),
+                                    arguments,
+                                    event.presentation.clone(),
+                                ));
+                        },
+                    );
+                })
+                .expect("observers should install");
+
             let response = agent
                 .prompt("Use the add tool to calculate 19 + 23, then report the result.")
                 .max_turns(3)
-                .add_hook(recorder)
                 .await
                 .expect("recorded tool prompt should succeed");
 
@@ -151,8 +218,8 @@ async fn hooks_observe_every_tool_call_and_result() {
                 "result hook should see the same args"
             );
             assert_eq!(
-                result_output, "42",
-                "result hook should see the raw tool output"
+                result_output, "<typed tool output: 1 parts>",
+                "observe-only telemetry should summarize typed tool output"
             );
 
             assert!(
@@ -162,21 +229,4 @@ async fn hooks_observe_every_tool_call_and_result() {
         },
     )
     .await;
-}
-
-// Compile-time check that the fixtures implement the hook trait for the
-// Gemini model, so failures surface here instead of inside macro-expanded
-// builder code.
-#[allow(unused)]
-fn assert_hook_impls() {
-    fn requires_hook<H: AgentHook<gemini::completion::CompletionModel>>(_hook: H) {}
-    requires_hook(ToolEventRecorder::default());
-    requires_hook(SkipToolHook {
-        tool_name: "add",
-        reason: "",
-    });
-    requires_hook(TerminateOnToolHook {
-        tool_name: "add",
-        reason: "",
-    });
 }

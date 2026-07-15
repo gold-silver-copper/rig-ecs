@@ -4,11 +4,7 @@
 //! The [`RerankModel`] trait defines the interface, and [`RerankResponse`]
 //! carries both the scored results and token usage.
 
-use crate::{
-    completion::Usage,
-    http_client, provider_response,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
-};
+use crate::{completion::Usage, http_client, provider_response};
 use serde::{Deserialize, Serialize};
 
 /// Errors returned by reranking models.
@@ -41,7 +37,7 @@ pub enum RerankError {
 crate::provider_response::impl_provider_response_helpers!(RerankError);
 
 /// Trait for reranking models that score documents by relevance to a query.
-pub trait RerankModel: WasmCompatSend + WasmCompatSync {
+pub trait RerankModel: Send + Sync {
     /// The maximum number of documents that can be reranked in a single request.
     const MAX_DOCUMENTS: usize;
 
@@ -56,7 +52,7 @@ pub trait RerankModel: WasmCompatSend + WasmCompatSync {
         &self,
         query: &str,
         documents: Vec<String>,
-    ) -> impl std::future::Future<Output = Result<RerankResponse, RerankError>> + WasmCompatSend;
+    ) -> impl std::future::Future<Output = Result<RerankResponse, RerankError>> + Send;
 }
 
 /// A single reranked document result.

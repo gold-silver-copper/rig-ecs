@@ -1,7 +1,6 @@
 //! Gemini agent completion smoke test.
 
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::providers::gemini;
 
 use super::super::support::with_gemini_cassette;

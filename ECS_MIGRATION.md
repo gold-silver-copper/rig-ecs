@@ -1,1155 +1,959 @@
 # Rig as a Bevy ECS-Native Agent Runtime
 
-**Status:** Target architecture and cutover specification  
-**Scope:** `rig-core`  
-**Migration policy:** Direct replacement; no compatibility layer, dual runtime, or staged public API transition
+**Status:** Implemented architecture, migration guide, and verification contract
+
+**Scope:** `rig-core`
+
+**Migration policy:** Breaking replacement; no compatibility runtime, dual registry, or staged public API transition
+
+## How to read this document
+
+This document defines architectural constraints, runtime semantics, and acceptance criteria. It intentionally does **not** prescribe a complete set of Rust types, exact system names, module paths, or trait signatures.
+
+The implementation agent should use the most idiomatic Bevy 0.19 design that satisfies the invariants here. Illustrative concepts are not requirements to reproduce today's Rig objects as components. Exact component granularity, system decomposition, private type erasure, executor wiring, and facade naming should be decided while implementing and validating vertical slices.
+
+The target is an ECS-native runtime, not the existing runtime relocated into a `World`.
 
 ## Executive decision
 
-Rig will make [`bevy_ecs`](https://github.com/bevyengine/bevy/tree/493a2f477b3bcc1b52d45e2359fc7e26d7037b27/crates/bevy_ecs) a required dependency of `rig-core` and adopt its model as the foundation of the runtime:
+Rig will make [`bevy_ecs` 0.19](https://github.com/bevyengine/bevy/tree/v0.19.0/crates/bevy_ecs) a required dependency of `rig-core` and use Bevy ECS as the foundation of agent execution.
 
-- entities provide identity;
-- components hold runtime data and capabilities;
-- systems contain behavior;
-- schedules define ordering and safe parallelism;
-- resources hold singleton runtime services;
-- relationships connect agents, models, tools, stores, runs, and calls;
-- buffered messages move asynchronous results between schedule boundaries;
-- deferred commands apply structural changes atomically;
-- change detection drives incremental recomputation;
-- bundles and plugins are the construction and extension mechanisms.
+- entities provide runtime identity;
+- components hold domain state, configuration, capabilities, and outcomes;
+- relationships express durable runtime structure;
+- systems implement behavior and state transitions;
+- schedules and system sets define ordering and safe parallelism;
+- resources hold true runtime-wide services;
+- messages carry buffered work across schedule boundaries;
+- commands apply structural changes at explicit synchronization points;
+- observers provide reactive integration where immediate ordering is not part of correctness;
+- change detection drives incremental work;
+- bundles and extension installers provide ergonomic construction and composition.
 
-The ECS world will be the single authoritative runtime state. The convenient `agent.prompt(...)` experience will remain possible, but it will be a facade over entities and schedules—not a second execution engine.
+Each runtime has one authoritative `World`. Convenient APIs such as prompting an agent are facades over entities and the same schedules used by hosted, manually stepped, tested, and embedded execution.
 
-The migration deliberately prioritizes the ideal architecture over source compatibility. Existing APIs that duplicate ECS responsibilities will be removed rather than deprecated or mirrored.
+The migration prioritizes the ideal architecture over source compatibility. Existing abstractions that duplicate ECS responsibilities are removed rather than wrapped, mirrored, or preserved inside components.
+
+## Pinned foundation
+
+### Bevy version
+
+`rig-core` targets the Bevy ECS 0.19 release line. The workspace dependency is `bevy_ecs = "0.19"`, the lockfile pins the selected patch release, and no git or development revision is used. Rig must intentionally review any future Bevy upgrade rather than accepting an architectural upgrade incidentally.
+
+Bevy ECS 0.19 requires Rust 1.95, so the workspace toolchain and MSRV move to Rust 1.95 or newer as part of the cutover.
+
+The dependency should begin with default features disabled and enable only features justified by the runtime. `rig-core` must not acquire rendering or game-engine dependencies. `bevy_app` remains outside `rig-core`; integration with a full Bevy `App` belongs in a separate crate or adapter.
+
+### Re-export policy
+
+Rig re-exports its selected `bevy_ecs` dependency so extension crates can use the exact same `Entity`, `World`, `Component`, `Resource`, message, relationship, and schedule types. Rig may provide a focused prelude, but it should not hide standard Bevy concepts behind parallel Rig-specific versions.
+
+### Standard Rust bounds; no WASM compatibility traits
+
+The `wasm_compat` abstraction is removed. In particular, the migration removes custom conditional marker traits and aliases such as:
+
+- `WasmCompatSend`;
+- `WasmCompatSync`;
+- `WasmCompatSendStream`;
+- `WasmBoxedFuture` and equivalent compatibility aliases where they exist only to vary thread-safety semantics by target.
+
+Runtime-facing traits use ordinary Rust bounds with the same semantic meaning on every target. Values stored as Bevy components or ordinary resources obey Bevy's normal `Send + Sync + 'static` requirements. Public trait contracts must not silently mean something different on WASM.
+
+A Bevy non-send resource may be used narrowly for a genuinely thread-affine platform service at the effect boundary. It must not become a registry for addressable domain objects or a replacement compatibility mechanism.
+
+WASM remains a supported target. Target-specific HTTP, task spawning, and browser integration may exist privately at the asynchronous effect boundary, but platform differences must not leak into ECS identity, component validity, policy semantics, or public marker traits. Native and `wasm32-unknown-unknown` compilation are mandatory cutover gates.
 
 ## Why ECS belongs in `rig-core`
 
-Rig is evolving from a collection of typed provider clients into a runtime that coordinates:
+Rig coordinates heterogeneous models, tools, MCP servers, stores, policies, concurrent runs, streaming calls, cancellation, telemetry, persistence, and dynamically changing infrastructure. These concerns have identity, lifecycle, composition, visibility, and scheduling semantics.
 
-- heterogeneous models;
-- dynamic tools and MCP servers;
-- databases and memory stores;
-- retrieval and policy;
-- concurrent agent runs;
-- tool-call batches;
-- cancellation and retries;
-- telemetry and auditing;
-- long-lived, dynamically changing infrastructure.
-
-These are identity- and lifecycle-heavy concerns. Treating them as nested builder fields and registries creates ownership, synchronization, discovery, and extensibility problems. ECS makes identity, composition, lifecycle, querying, mutation, and scheduling explicit.
-
-Bevy ECS is suitable as a standalone crate, not only as part of the Bevy game engine. Its core concepts and standalone intent are documented in the [Bevy ECS README](https://github.com/bevyengine/bevy/blob/493a2f477b3bcc1b52d45e2359fc7e26d7037b27/crates/bevy_ecs/README.md#L10-L117).
+Nested builders, shared registries, generic runner objects, callback stacks, and ad hoc synchronization obscure those semantics. ECS makes them queryable and explicit. The benefit is not primarily archetype performance; it is a coherent runtime model with clear ownership and extension boundaries.
 
 ## Goals
 
-1. Make `World` the sole source of truth for live runtime state.
-2. Represent agents, models, tools, stores, runs, model calls, and tool calls as entities.
-3. Represent capabilities and configuration as independently queryable components.
-4. Express runtime behavior as systems in explicitly ordered schedules.
-5. Use one execution engine for local, hosted, blocking, and streaming APIs.
-6. Preserve typed authoring while using private erasure at heterogeneous runtime boundaries.
-7. Never borrow the ECS world across `.await`.
-8. Preserve deterministic transcript and tool ordering under concurrency.
-9. Make extensions normal systems and plugins rather than privileged hook traits.
-10. Keep secrets and global services in resources, not ordinary components.
-11. Make dynamic infrastructure updates observable through change detection.
-12. Support native embedding into an existing Bevy ECS world.
+1. Make one Bevy `World` the sole authority for each live Rig runtime.
+2. Give agents, executable capabilities, stores, runs, turns, and asynchronous operations entity identity where lifecycle or relationships matter.
+3. Represent runtime state and capability through components rather than nested runtime object graphs.
+4. Express orchestration, policy, dispatch, commit, persistence, and cleanup as systems.
+5. Use one schedule-driven execution engine for local, hosted, blocking, streaming, test, and embedded use.
+6. Preserve ergonomic typed authoring without allowing generic types to define runtime topology.
+7. Keep all world access synchronous; no ECS borrow may cross `.await`.
+8. Make externally visible ordering deterministic under system and effect concurrency.
+9. Make normal Bevy systems, system sets, messages, relationships, observers, and change detection the extension model.
+10. Keep secrets and process-wide services out of ordinary domain components.
+11. Support embedding Rig schedules in an existing Bevy ECS world.
+12. Keep native and WASM behavior aligned without custom compatibility traits.
 
 ## Non-goals
 
-1. Preserving the current `Agent<M>`, `AgentBuilder`, `AgentRunner`, `ToolSet`, `ToolServer`, or `HookStack` APIs.
-2. Providing an `ecs` Cargo feature that leaves the old runtime available.
-3. Running two registries or synchronizing a classic object graph with an ECS world.
-4. Turning every token, message part, JSON value, or provider chunk into an entity.
-5. Giving asynchronous tools or models `&mut World` access.
-6. Persisting raw Bevy `Entity` identifiers.
-7. Using ECS archetype performance as the primary justification; the primary benefits are composition, lifecycle correctness, extensibility, and safe scheduling.
-8. Depending on `bevy_app` in `rig-core`. A separate integration can embed Rig schedules into a full Bevy `App`.
+1. Preserving the current `Agent<M>`, `AgentBuilder`, `AgentRunner`, `ToolSet`, `ToolServer`, `HookStack`, or `AgentRun` architecture.
+2. Providing an optional ECS mode alongside the old runtime.
+3. Converting the old object graph one-for-one into component wrappers.
+4. Keeping a classic registry synchronized with ECS entities.
+5. Turning every message part, token, provider chunk, JSON value, or transient calculation into an entity.
+6. Giving asynchronous providers, tools, stores, or user futures access to `World`, `Commands`, `Query`, or component references.
+7. Persisting or transmitting raw Bevy `Entity` values.
+8. Requiring `bevy_app` in `rig-core`.
+9. Freezing exact component layouts or public API names before vertical slices prove them.
 
-## Hard architectural rules
+## Non-negotiable architectural rules
 
-### One world
+### One authoritative world per runtime
 
-Every live runtime object exists in one `World`. There is no parallel `ToolSet`, model registry, agent registry, memory registry, or runner-owned copy of authoritative state.
+Every live ECS-managed agent, model, tool, store, policy, run, turn, and call belongs to one authoritative world. There is no parallel runtime registry or runner-owned copy of authoritative state.
+
+Multiple runtime worlds are valid and are the preferred boundary for strong tenant or trust isolation. “One world” means one source of truth within a runtime, not one global process singleton.
+
+### ECS-native structures, not wrapped legacy structures
+
+The implementation must decompose behavior into systems and runtime state into components. It must not make the migration appear complete by inserting the old runner, hook stack, tool registry, or state machine into a component and advancing it from one system.
+
+Private adapters at external typed boundaries are acceptable where heterogeneous I/O requires them. They are not acceptable as a way to preserve the old orchestration model.
+
+When choosing among designs, prefer Bevy-native mechanisms:
+
+- typed components queried by capability systems;
+- relationships rather than copied ownership vectors;
+- messages for buffered cross-boundary work;
+- registered systems or provider-specific systems where dynamic behavior fits them;
+- `SystemParam` for coherent system access;
+- commands and explicit deferred boundaries for structural mutation;
+- change detection and removal detection rather than manual invalidation callbacks;
+- observers for reaction and integration, not hidden ownership of the core state machine.
+
+Trait objects or private erasure may still be the right boundary for some provider, tool, or store calls. Their use should be justified by heterogeneous execution, kept private, and prevented from becoming a second runtime architecture.
 
 ### One execution engine
 
-All user-facing paths drive the same schedules:
+All agent execution paths drive the same world state and schedules. A facade may own a world, a hosted task may own it, or an external Bevy host may run its schedule, but none may implement agent progression independently.
 
-- local prompt;
-- hosted runtime prompt;
-- blocking completion;
-- streaming completion;
-- manual stepping;
-- tests;
-- embedded Bevy application.
-
-Convenience APIs may hide the world, but may not implement execution separately.
+Low-level provider clients may continue to expose direct transport APIs. They are authoring and transport boundaries, not an alternative agent runtime.
 
 ### No world borrow across `.await`
 
-Systems snapshot owned inputs, submit effects to an executor resource, mark entities in flight, and return. Effect completions re-enter through a thread-safe inbox and are applied by later systems.
+Systems synchronously inspect world state and create owned asynchronous work. External work completes without a world borrow and re-enters through a controlled inbox, message, or command boundary. Only later systems validate and apply the result.
+
+No future may capture a `World`, `Query`, `Commands`, `Res`, `Mut`, or borrowed entity/component data. Copying an `Entity` handle for correlation is permitted, but completion application must still validate its generation and expected state.
+
+### One source of truth for every fact
+
+Run phase, transcript, usage, budgets, call outcomes, cancellation, and persistence status each have one authoritative representation. Derived components or indexes are permitted only when they are clearly derived, invalidated, and rebuildable.
+
+Mutually exclusive phases and outcomes must be represented so contradictory states are difficult or impossible to construct. The implementation may use cohesive enum state, component presence, required components, or another idiomatic Bevy design, but must not rely on a large set of independent marker components plus routine repair.
 
 ### Determinism is explicit
 
-ECS query order is never used as semantic order. Tool registration order, model-call order, and tool-call order are represented by explicit ordinal components and sorted before provider presentation or transcript commit.
+Query order, hash-map order, system scheduling order, and effect completion order are never semantic order. Provider-facing tools, policies, calls, transcript entries, and persisted records use explicit ordering data and deterministic tie-breaking.
 
-### Runtime entities are not persistent identities
+### Runtime identity is not persistent identity
 
-Every persistable entity has a stable application ID such as a UUID. Raw Bevy `Entity` values are process-local handles and never cross persistence, network, or public protocol boundaries.
+Bevy `Entity` is the canonical in-memory handle. Anything crossing process, persistence, network, or public protocol boundaries uses stable domain identity. Persistence reconstructs entities and relationships through stable-ID remapping.
 
-### Components are cohesive units
+Stable-ID uniqueness and stale-entity behavior must be enforced rather than assumed.
 
-ECS-native does not mean one component per scalar field. Data that shares invariants or mutation patterns stays together. Components are split when systems need independent access, querying, replacement, or change detection.
+### In-flight work sees immutable decisions
 
-## Dependency and re-export policy
+A turn or call must execute against the exact model, tool definitions, grants, policy decisions, and capability revisions accepted for it. Later world mutations affect future preparation, not already dispatched work.
 
-`bevy_ecs` is a normal, required dependency of `rig-core`.
+The implementation may guarantee this with retained version entities, owned immutable snapshots, leases, revisioned capabilities, or another ECS-native design. Storing only an entity ID is insufficient if that entity can be replaced or despawned before the operation completes.
 
-Rig re-exports its exact version so extension crates use compatible ECS types:
+## Runtime shape
 
-```rust
-pub mod ecs {
-    pub use bevy_ecs::*;
-}
+### World and schedules
 
-pub mod ecs_prelude {
-    pub use bevy_ecs::prelude::*;
-    pub use crate::bundles::*;
-    pub use crate::components::*;
-    pub use crate::relationships::*;
-    pub use crate::runtime::{RigApp, RigPlugin, RigSet};
-}
-```
+Rig installs one or more labeled Bevy schedules into the world's schedule resources. The exact labels and number of schedules are implementation choices, but the core runtime must have a documented update entry point suitable for:
 
-Rig plugins should import ECS types through `rig::ecs` or `rig_core::ecs`, preventing accidental duplicate Bevy versions and incompatible `Entity`/`Component` identities.
+- local `run_until` execution;
+- hosted wake-driven execution;
+- deterministic tests;
+- manual stepping;
+- installation into an existing Bevy world.
 
-`bevy_app` remains outside `rig-core`. A future `rig-bevy` crate can install Rig schedules and resources into an existing Bevy application.
+A convenience owner may wrap `World`, but schedules should remain world-resident rather than becoming a private second scheduling abstraction.
 
-## Core runtime object
+Core system ordering must be expressed with Bevy system sets and explicit dependencies. Required command-application boundaries must be intentional. Core tests should treat schedule ambiguities as failures rather than relying on Bevy's permissive defaults.
 
-```rust
-pub struct RigApp {
-    world: World,
-    schedule: Schedule,
-    plugins: PluginRegistry,
-}
-```
+### Entity categories
 
-`RigApp` exposes:
+The following concepts normally deserve entity identity:
 
-```rust
-impl RigApp {
-    pub fn new() -> Self;
-    pub fn world(&self) -> &World;
-    pub fn world_mut(&mut self) -> &mut World;
-    pub fn add_plugins<P: RigPlugins>(&mut self, plugins: P) -> &mut Self;
-    pub fn update(&mut self) -> UpdateStatus;
-    pub async fn run_until(&mut self, run: RunId) -> Result<PromptResponse, RunError>;
-}
-```
+- agents;
+- model capabilities or configured model endpoints;
+- tools and dynamically discovered executable capabilities;
+- addressable stores and infrastructure capabilities;
+- MCP or other discovery sources;
+- policy, grant, or approval instances when they have independent lifecycle;
+- runs;
+- committed turns;
+- model, tool, store, and persistence operations;
+- subscriptions or approvals when they have cancellation or audit semantics.
 
-`update` drains external commands and effect completions, executes the Rig schedule until quiescent, and reports whether the world has immediate work or is waiting for external effects.
+This list describes the domain topology, not mandatory marker component names. The implementation may combine or refine categories when invariants and query patterns justify it.
 
-A hosted `RigRuntime` owns a `RigApp` on a dedicated runtime task. Cloneable handles communicate through a command inbox:
+Small immutable values, message parts, tool arguments, deltas, usage counters, and provider payload fragments remain values unless independent identity or lifecycle is useful.
 
-```rust
-pub struct RigRuntimeHandle { /* command sender + wake handle */ }
-pub struct AgentHandle { runtime: RigRuntimeHandle, entity: Entity }
-pub struct RunHandle { runtime: RigRuntimeHandle, stable_id: StableRunId }
-```
+### Components
 
-The local and hosted forms differ only in world ownership. Both execute the same systems.
+Components should represent cohesive state, configuration, capability, ordering, relationship metadata, or outcome. They should be split when systems need independent querying, change detection, replacement, access, or lifecycle—not merely because a field can be separated.
 
-## Entity taxonomy
-
-The initial entity categories are:
-
-```rust
-#[derive(Component)] pub struct Agent;
-#[derive(Component)] pub struct Model;
-#[derive(Component)] pub struct Tool;
-#[derive(Component)] pub struct Store;
-#[derive(Component)] pub struct McpServer;
-#[derive(Component)] pub struct Run;
-#[derive(Component)] pub struct Turn;
-#[derive(Component)] pub struct ModelCall;
-#[derive(Component)] pub struct ToolCall;
-#[derive(Component)] pub struct ToolGrant;
-```
-
-Marker components identify broad categories. Capabilities and relationships provide the meaningful behavior.
+Good component design should make these facts easy to query:
 
-## Stable identity
+- what an entity is capable of;
+- what it is related to;
+- whether it is eligible for new work;
+- what immutable decision an in-flight operation uses;
+- what phase or outcome it currently has;
+- who may observe or mutate it;
+- whether it is persistent, retired, cancelled, or ready for cleanup.
 
-```rust
-#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StableId(pub Uuid);
+Components that contain clients or executable handles must satisfy normal Bevy component bounds on every platform. Components must not contain borrowed world data.
 
-pub struct AgentId(pub Entity);
-pub struct ModelId(pub Entity);
-pub struct ToolId(pub Entity);
-pub struct StoreId(pub Entity);
-pub struct RunId(pub Entity);
-```
+### Relationships
 
-Typed entity wrappers are ergonomic domain identifiers. Components and relationships may store raw `Entity` internally where required by Bevy APIs. Serialization uses `StableId`, never `Entity`.
-
-Loading persisted state is a two-pass process:
-
-1. spawn entities and build `StableId -> Entity`;
-2. restore relationships using that map.
-
-## Agent entities
-
-An agent is configuration plus relationships, not a generic object containing every dependency.
-
-```rust
-#[derive(Component)]
-pub struct AgentIdentity {
-    pub name: Option<String>,
-    pub description: Option<String>,
-}
-
-#[derive(Component)]
-pub struct Instructions {
-    pub preamble: Option<String>,
-    pub static_context: Vec<Document>,
-}
-
-#[derive(Component)]
-pub struct SamplingConfig {
-    pub temperature: Option<f64>,
-    pub max_tokens: Option<u64>,
-    pub additional_params: Option<serde_json::Value>,
-}
-
-#[derive(Component)]
-pub struct AgentBudget {
-    pub max_turns: usize,
-    pub max_invalid_tool_call_retries: usize,
-}
-
-#[derive(Component)]
-pub struct StructuredOutputConfig {
-    pub schema: Option<schemars::Schema>,
-    pub mode: OutputMode,
-}
-```
-
-Relationships attach the model and stores:
-
-```rust
-#[derive(Component)]
-#[relationship(relationship_target = AgentsUsingModel)]
-pub struct UsesModel(pub Entity);
-
-#[derive(Component)]
-#[relationship_target(relationship = UsesModel)]
-pub struct AgentsUsingModel(Vec<Entity>);
-
-#[derive(Component)]
-#[relationship(relationship_target = AgentsUsingMemory)]
-pub struct UsesMemory(pub Entity);
-```
-
-Common agent construction uses a bundle:
-
-```rust
-#[derive(Bundle)]
-pub struct AgentBundle {
-    pub marker: Agent,
-    pub stable_id: StableId,
-    pub identity: AgentIdentity,
-    pub instructions: Instructions,
-    pub sampling: SamplingConfig,
-    pub budget: AgentBudget,
-    pub output: StructuredOutputConfig,
-    pub model: UsesModel,
-}
-```
-
-`Agent<M>` is removed. The model type belongs to the model entity, not the agent type.
-
-## Model entities
-
-Typed models are preserved at insertion boundaries:
-
-```rust
-let model = app.spawn_model(openai_client.completion_model("gpt-5"));
-```
-
-Internally, each model entity contains a private erased driver:
-
-```rust
-#[derive(Component)]
-struct ModelDriver(Arc<dyn ErasedCompletionModel>);
-
-#[derive(Component)]
-pub struct ModelIdentity {
-    pub provider: String,
-    pub model: String,
-}
-
-#[derive(Component)]
-pub struct ModelCapabilities {
-    pub streaming: bool,
-    pub tools: bool,
-    pub native_structured_output: bool,
-    pub multimodal: bool,
-}
-
-#[derive(Component)]
-pub struct ModelHealth {
-    pub status: HealthStatus,
-    pub last_checked: Option<Instant>,
-}
-```
-
-The private erased driver accepts canonical requests and starts effects that return canonical model results. Typed provider responses are preserved as typed effect metadata where possible and serialized metadata where persistence is required.
-
-The public `CompletionModel` trait remains a typed authoring and direct-provider interface. A blanket adapter converts it into a model bundle.
-
-## Tool entities
-
-Rig's tool architecture provides the correct typed-authoring/private-erasure boundary. ECS registration makes the erased executor an entity component.
-
-```rust
-#[derive(Component)]
-pub struct ToolIdentity {
-    pub name: String,
-    pub registration_order: u64,
-}
-
-#[derive(Component, Clone)]
-pub struct ToolSpec {
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
-
-#[derive(Component)]
-struct ToolExecutor(Arc<dyn ErasedTool>);
-
-#[derive(Component)]
-pub struct ToolStatus {
-    pub enabled: bool,
-    pub health: HealthStatus,
-}
+Use Bevy relationships for structural links whose consistency benefits from relationship hooks and target queries, such as agent-to-model, run-to-agent, turn-to-run, call-to-turn, capability-to-host, and store usage.
 
-#[derive(Component)]
-pub struct ToolRevision(pub u64);
+Many-to-many access with independent metadata generally deserves a relationship or grant entity rather than a vector copied onto an agent.
 
-#[derive(Bundle)]
-pub struct ToolBundle {
-    pub marker: Tool,
-    pub stable_id: StableId,
-    pub identity: ToolIdentity,
-    pub spec: ToolSpec,
-    executor: ToolExecutor,
-    pub status: ToolStatus,
-    pub revision: ToolRevision,
-}
-```
+Cascade despawn is appropriate only when the target can never outlive its owner semantically. Dynamically discovered tools, snapshots, and in-flight calls require retirement semantics; they must not disappear merely because a discovery source refreshes or disconnects.
 
-A typed tool is spawned directly:
+### Resources
 
-```rust
-let search = app.spawn_tool(SearchTool::new(client));
-```
+Resources are reserved for runtime-wide services and coordination, such as:
 
-The `Tool` trait remains an ergonomic typed authoring interface. Registration consumes a typed tool and creates a `ToolBundle`. `ToolSet` and `ToolServerHandle` are removed.
+- external effect submission and completion ingress;
+- wakeup coordination;
+- clocks and ID generation;
+- secret resolution;
+- runtime configuration;
+- telemetry sinks;
+- indexes that are explicitly derived from world state;
+- progress or quiescence tracking.
 
-### Runtime-defined tools
+Addressable models, tools, stores, policies, pools, and tenant-scoped capabilities remain entities even if only one currently exists. Cardinality alone does not turn a domain object into a resource.
 
-`DynamicTool` remains a construction type, but registration immediately spawns a normal tool entity. Static, dynamic, retrieved, and MCP tools share the same entity representation after insertion.
+### Messages, commands, observers, and change detection
 
-### MCP ownership
+Use Bevy messages for ordered, buffered work crossing schedule stages or runtime boundaries. Use commands for deferred structural mutation. Use change and removal detection for incremental reconciliation.
 
-```rust
-#[derive(Component)]
-#[relationship(relationship_target = HostedTools)]
-pub struct HostedBy(pub Entity);
+Observers are useful for telemetry, UI, audit, integration notifications, and localized reactions. Core transcript, phase, authorization, or commit correctness must not depend on undocumented observer timing.
 
-#[derive(Component)]
-#[relationship_target(relationship = HostedBy, linked_spawn)]
-pub struct HostedTools(Vec<Entity>);
-```
+## Domain architecture
 
-MCP discovery and refresh mutate tool entities through deferred commands. Ownership, generation, liveness, and server ordering are components. A refresh computes changes outside the world, then applies one atomic command batch.
+### Agents
 
-## Tool grants and policy
+An agent is an entity composed from configuration and relationships. Its identity does not encode a model type. Models, stores, policies, and tools are associated through world structure and resolved by systems.
 
-Agent-to-tool access is many-to-many, so it is represented by grant entities rather than a vector on the agent.
+Agent configuration should be separated according to real mutation and query patterns: identity, instructions, model selection or routing, sampling, budgets, output requirements, memory relationships, and policy relationships need not form one permanent object.
 
-```rust
-#[derive(Component)] pub struct GrantAgent(pub Entity);
-#[derive(Component)] pub struct GrantTool(pub Entity);
+Construction should be ergonomic through bundles, helper functions, or builders that spawn into a world. A builder is acceptable as a construction aid; an owned agent object that becomes a second runtime is not.
 
-#[derive(Component)]
-pub struct GrantPolicy {
-    pub priority: i32,
-    pub expires_at: Option<SystemTime>,
-    pub tenant: Option<TenantId>,
-    pub permission: PermissionPolicy,
-}
+### Models
 
-#[derive(Bundle)]
-pub struct ToolGrantBundle {
-    pub marker: ToolGrant,
-    pub stable_id: StableId,
-    pub agent: GrantAgent,
-    pub tool: GrantTool,
-    pub policy: GrantPolicy,
-}
-```
+A configured model is an entity with provider identity, capabilities, configuration, health, routing metadata, and whatever executable integration the chosen ECS design requires.
 
-This makes access control, expiration, auditing, tenant scoping, and ordering independently queryable and change-detectable.
+Do not assume the current generic `CompletionModel` object must be stored behind an erased component. Prefer typed provider components and systems, generic system registration, registered systems, or other Bevy-native dispatch where practical. Private erasure remains available when it is genuinely the cleanest heterogeneous I/O boundary.
 
-## Store and database entities
+Typed provider authoring remains desirable, but current trait signatures and associated types are not migration constraints. They may be redesigned to use ordinary Rust bounds and to integrate cleanly with Bevy.
 
-A database is not represented by a backend enum. A store entity carries one or more capability components:
+Provider-specific raw data must not become necessary for core progression. Preserve it for diagnostics or specialized integrations without making canonical runtime state provider-dependent.
 
-```rust
-#[derive(Component)]
-pub struct ConversationMemoryDriver(Arc<dyn ConversationMemory>);
+### Tools
 
-#[derive(Component)]
-pub struct VectorSearchDriver(Arc<dyn VectorSearch>);
+A tool is an entity with stable identity, provider-facing definition, ordering, status, provenance, revision, policy visibility, and executable capability.
 
-#[derive(Component)]
-pub struct DocumentStoreDriver(Arc<dyn DocumentStore>);
+Static, dynamically created, retrieved, and MCP-discovered tools converge on the same runtime representation. Their construction paths may differ; dispatch and policy semantics must not.
 
-#[derive(Component)]
-pub struct SqlExecutorDriver(Arc<dyn SqlExecutor>);
+The old `ToolSet` and `ToolServer` are not retained as hidden registries. Tool discovery and visibility are world queries over capabilities, relationships, grants, status, and policy.
 
-#[derive(Component)]
-pub struct StoreHealth {
-    pub status: HealthStatus,
-    pub latency: Option<Duration>,
-}
-```
+Tool-name collisions, replacement, discovery ordering, and duplicate suppression must have explicit deterministic semantics. The exact ordering representation is an implementation decision, but current externally valuable behavior should be covered by tests before old registries are removed.
 
-A MongoDB entity may provide document storage and conversation memory. A Postgres entity may provide SQL execution, vector search, and memory. Systems query capabilities rather than matching concrete backend variants.
+Per-call context should be represented by call state, relationships, and owned effect input assembled by systems. The existing `ToolContext` type map must not survive as an alternate orchestration or dependency-injection world. A smaller typed value may remain at a tool authoring boundary if useful.
 
-Singleton pools may be resources when there is exactly one process-wide instance. Addressable stores with identity, policy, health, or relationships are entities.
+### Dynamic discovery and MCP
 
-Secrets are never ordinary components. Store components carry opaque references into a `SecretStore` resource.
+Discovery sources are entities with configuration, generation, liveness, ownership, and refresh state. Discovery work occurs outside world borrows and applies a reconciled change set at a schedule boundary.
 
-## Run entities
+Refresh must distinguish retirement from immediate destruction. Existing snapshots and calls continue to reference the exact capability version they accepted. New snapshots exclude retired versions. Cleanup occurs only when no in-flight work needs them.
 
-A prompt creates a run entity. Runs are the central lifecycle objects.
+Stale refresh completions must not overwrite newer generations.
 
-```rust
-#[derive(Component)]
-pub struct ForAgent(pub Entity);
+### Stores and infrastructure
 
-#[derive(Component)]
-pub struct Transcript(pub Vec<Message>);
+Stores are capability entities rather than variants in a central backend enum. A single entity may support conversation memory, vector search, document storage, SQL execution, or several capabilities.
 
-#[derive(Component, Default)]
-pub struct RunUsage(pub Usage);
+Systems query the capability they need. Provider-specific installation adds the corresponding data and systems without changing a central dispatch match.
 
-#[derive(Component)]
-pub struct RemainingBudget {
-    pub turns: usize,
-    pub invalid_tool_call_retries: usize,
-}
+Secrets are resolved through runtime services using opaque references. Secret material is not a normal component, is not persisted with domain records, and is not exposed through debug output.
 
-#[derive(Component)]
-pub struct RunScratchpad(TypeMap);
+### Runs, turns, and operations
 
-#[derive(Component)]
-pub struct CancellationToken(/* runtime-neutral cancellation primitive */);
-```
-
-Initially, the existing sans-I/O `AgentRun` may be stored as one cohesive component:
-
-```rust
-#[derive(Component)]
-struct RunState(AgentRun);
-```
-
-This is not a compatibility runtime. It is reuse of the canonical state machine as ECS-owned data. It can later be split only where independent component access is valuable and invariants remain explicit.
-
-## Run phases
+A prompt creates a run entity. The run is authoritative ECS state, not a wrapper around the old `AgentRun` state machine.
 
-Lifecycle phases are marker components:
+Systems own progression. State should be decomposed around actual invariants and access patterns while keeping one source of truth for phase, transcript, budget, usage, output state, and terminal outcome.
 
-```rust
-#[derive(Component)] pub struct ReadyForModel;
-#[derive(Component)] pub struct WaitingForModel;
-#[derive(Component)] pub struct ApplyingModelResult;
-#[derive(Component)] pub struct ReadyForTools;
-#[derive(Component)] pub struct WaitingForTools;
-#[derive(Component)] pub struct ReadyToCommit;
-#[derive(Component)] pub struct Persisting;
-#[derive(Component)] pub struct RunCompleted;
-#[derive(Component)] pub struct RunFailed;
-#[derive(Component)] pub struct RunCancelled;
-```
-
-Systems query exactly the phase they process. Deferred commands replace markers at schedule barriers.
-
-Only one primary phase marker may exist on a run. Debug validation systems assert this invariant.
-
-## Turn entities and exact snapshots
-
-Each accepted model turn gets a turn entity:
-
-```rust
-#[derive(Component)] pub struct ForRun(pub Entity);
-#[derive(Component)] pub struct TurnIndex(pub u32);
-
-#[derive(Component)]
-pub struct ToolSnapshot {
-    pub registry_revision: u64,
-    pub tools: Vec<Entity>,
-    pub definitions: Vec<crate::completion::ToolDefinition>,
-}
-```
-
-The snapshot is built from enabled grants and tools, sorted by explicit registration/grant order. It captures both provider definitions and exact executable entities.
-
-A tool mutation during an in-flight turn never changes that turn. It affects only snapshots built for later turns.
-
-## Model-call entities
-
-```rust
-#[derive(Component)] pub struct ForTurn(pub Entity);
-#[derive(Component)] pub struct ModelRequest(pub CompletionRequest);
-#[derive(Component)] pub struct ModelCallIndex(pub u32);
-#[derive(Component)] pub struct ModelCallInFlight;
-#[derive(Component)] pub struct ModelCallResponse(pub ModelTurn);
-#[derive(Component)] pub struct ModelCallFailure(pub CompletionError);
-```
-
-A dispatch system snapshots `ModelRequest` and `ModelDriver`, submits an async effect, marks the call in flight, and returns.
-
-## Tool-call entities
-
-```rust
-#[derive(Component)] pub struct CallsTool(pub Entity);
-#[derive(Component)] pub struct ToolCallIndex(pub u32);
-#[derive(Component)] pub struct ToolArguments(pub serde_json::Value);
-#[derive(Component)] pub struct InternalCallId(pub String);
-#[derive(Component)] pub struct ToolCallInFlight;
-#[derive(Component)] pub struct ToolCallResult(pub ToolResult);
-#[derive(Component)] pub struct ToolDispatchMetadata(pub ToolContext);
-```
-
-Every model-emitted tool call has its own entity. Correlation never depends on a single pending slot or event arrival order.
-
-Parallel execution may complete in any order. Commit systems wait until the complete batch is terminal, sort by `ToolCallIndex`, and commit atomically.
-
-## Schedule
-
-Rig defines one core schedule with ordered sets:
-
-```rust
-#[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RigSet {
-    Ingress,
-    Resolve,
-    PolicyBeforeModel,
-    PrepareModel,
-    DispatchModel,
-    ApplyModel,
-    PolicyAfterModel,
-    PrepareTools,
-    PolicyBeforeTool,
-    DispatchTools,
-    ApplyTools,
-    PolicyAfterTool,
-    Commit,
-    Persist,
-    Observe,
-    Cleanup,
-    Flush,
-}
-```
-
-Core sets are chained in semantic order. Systems inside a set run in parallel when their declared data access permits it. Extensions place systems in documented sets and use explicit ordering when composition order matters.
-
-The final `Flush` barrier applies deferred structural changes and publishes outbound notifications.
-
-## Core systems
-
-The target runtime includes at least these systems:
-
-```text
-drain_runtime_commands
-drain_effect_completions
-validate_entity_invariants
-resolve_agent_configuration
-build_tool_snapshot
-create_model_call
-apply_before_model_policy
-dispatch_model_calls
-apply_model_completions
-resolve_invalid_tool_calls
-create_tool_calls
-apply_before_tool_policy
-dispatch_tool_calls
-apply_tool_completions
-apply_after_tool_policy
-commit_tool_batches
-advance_run_state
-persist_transcripts
-complete_runs
-cancel_runs
-cleanup_terminal_calls
-cleanup_terminal_runs
-publish_observations
-```
-
-Systems are small and capability-oriented. No single system recreates the old monolithic runner.
-
-## Async effect boundary
-
-Bevy systems are synchronous. Models, tools, MCP, and stores are asynchronous. Rig bridges them with an explicit effect layer.
-
-```rust
-#[derive(Resource)]
-pub struct EffectExecutor {
-    commands: EffectCommandSender,
-}
-
-pub enum EffectCommand {
-    Model(ModelEffect),
-    Tool(ToolEffect),
-    Store(StoreEffect),
-}
-
-pub enum EffectCompletion {
-    Model(ModelEffectCompletion),
-    Tool(ToolEffectCompletion),
-    Store(StoreEffectCompletion),
-}
-```
-
-An effect contains only owned data, stable correlation IDs, and cloneable driver handles. It contains no `World`, `Query`, `Commands`, component reference, or system parameter.
-
-Execution flow:
-
-1. schedule system clones required inputs;
-2. system submits an effect;
-3. system inserts an in-flight marker;
-4. executor performs asynchronous work;
-5. executor sends an effect completion;
-6. runtime wakes and drains completions;
-7. apply system verifies correlation and entity generation;
-8. apply system writes result components;
-9. later systems commit state.
-
-The executor is runtime-neutral. Native builds may use Tokio or another executor. WASM may use a local executor. Tests use a deterministic fake executor.
-
-## Resources
-
-Singleton runtime services are resources:
-
-```rust
-#[derive(Resource)] pub struct EffectExecutor(...);
-#[derive(Resource)] pub struct RuntimeInbox(...);
-#[derive(Resource)] pub struct RuntimeWake(...);
-#[derive(Resource)] pub struct Clock(...);
-#[derive(Resource)] pub struct IdGenerator(...);
-#[derive(Resource)] pub struct SecretStore(...);
-#[derive(Resource)] pub struct TelemetrySink(...);
-#[derive(Resource)] pub struct RuntimeConfig(...);
-#[derive(Resource)] pub struct RegistryRevision(pub u64);
-```
-
-Resources do not represent addressable domain objects. If users need multiple independently configured instances, those instances are entities.
-
-## ToolContext in an ECS-native core
-
-`ToolContext` remains a per-dispatch snapshot. Tools never receive `&mut World`.
-
-Before dispatch, systems populate context with owned or cloneable values:
-
-```rust
-context.insert(RunEntity(run));
-context.insert(AgentEntity(agent));
-context.insert(TurnEntity(turn));
-context.insert(TenantContext(...));
-context.insert(AuthContext(...));
-```
-
-Tool-authored result metadata remains isolated in the returned dispatch context. The apply system attaches relevant metadata to the tool-call entity or makes it available to policy systems.
-
-This preserves async safety, dispatch isolation, and the raw-versus-model-presentation separation of the tool runtime.
-
-## Policy and extension systems
-
-`AgentHook` and `HookStack` are removed.
-
-Policy is represented by components that systems inspect or mutate:
-
-```rust
-#[derive(Component)] pub struct RequestPatch(...);
-#[derive(Component)] pub struct ToolCallDecision(...);
-#[derive(Component)] pub struct ToolPresentation(...);
-#[derive(Component)] pub struct InvalidToolCallDecision(...);
-#[derive(Component)] pub struct RunDecision(...);
-```
-
-Extensions register systems in policy sets:
-
-```rust
-app.add_systems(
-    RigSet::PolicyBeforeTool,
-    (tenant_guard, approval_policy, argument_normalizer).chain(),
-);
-```
-
-Rewrites compose by mutating the current decision/presentation component in explicit system order. Stops and failures are terminal states validated by later systems.
-
-Core correctness never depends on immediate observer ordering.
-
-## Messages and observers
-
-Buffered messages drive control and integration boundaries:
-
-```rust
-#[derive(Message)] pub struct RunRequested(...);
-#[derive(Message)] pub struct ModelEffectFinished(...);
-#[derive(Message)] pub struct ToolEffectFinished(...);
-#[derive(Message)] pub struct StoreEffectFinished(...);
-#[derive(Message)] pub struct RunFinished(...);
-#[derive(Message)] pub struct RunFailedMessage(...);
-```
-
-Messages are consumed at fixed schedule points. This gives deterministic batching and ordering.
-
-Observers are reserved for reactive notifications that do not own core state transitions:
-
-- UI updates;
-- metrics;
-- tracing;
-- audit sinks;
-- debugging;
-- external notifications.
-
-An observer may enqueue a command or message, but does not directly mutate transcript or call-phase invariants.
-
-## Change detection
-
-Change detection replaces manual invalidation plumbing.
-
-Examples:
-
-- `Changed<ToolSpec>` increments registry revision;
-- `Changed<ToolStatus>` invalidates future agent snapshots;
-- added/removed `ToolGrant` entities update visibility indexes;
-- `Changed<Instructions>` recompiles derived prompt context;
-- `Changed<ModelHealth>` changes routing eligibility;
-- `Changed<StoreHealth>` activates failover systems;
-- `Changed<McpServerConfig>` schedules a refresh effect.
-
-In-flight snapshots remain immutable. Change detection affects only future preparation systems.
-
-## Plugin model
-
-```rust
-pub trait RigPlugin: Send + Sync + 'static {
-    fn build(&self, app: &mut RigApp);
-    fn ready(&self, _world: &World) -> bool { true }
-    fn finish(&self, _app: &mut RigApp) {}
-    fn cleanup(&self, _app: &mut RigApp) {}
-}
-```
-
-Plugins may:
+A committed turn is distinct from an in-flight model operation. Model calls, tool calls, store calls, and persistence work should have entity identity when they need correlation, cancellation, retries, policy, telemetry, or independent lifecycle.
 
-- initialize resources;
-- register systems and ordering;
-- register messages;
-- install observers;
-- spawn model/store/server entities;
-- add capability components;
-- install policy systems.
+Call entities make concurrency explicit. They allow multiple operations to exist simultaneously without a single pending slot and let results be correlated independently of arrival order.
 
-Example plugins:
+Terminal outcomes should be write-once from the perspective of a call generation. Success, failure, cancellation, timeout, and supersession must not coexist ambiguously.
 
-```text
-CoreAgentPlugin
-ToolRuntimePlugin
-MemoryPlugin
-McpPlugin
-OpenAiPlugin
-AnthropicPlugin
-GeminiPlugin
-TelemetryPlugin
-PersistencePlugin
-CortexPlugin
-```
+### Immutable turn decisions and tool snapshots
 
-Provider clients are not required to be plugins merely to create a model entity. Plugins are for runtime integration and reusable system packages.
+Before provider dispatch, systems resolve the material facts needed by the turn. The accepted decision must preserve:
 
-## Public API
+- selected model and capability revision;
+- ordered provider-facing tool definitions;
+- the exact executable tool capability behind each definition;
+- grants, tenant scope, and policy decisions relevant to execution;
+- ordering and correlation information;
+- any infrastructure choice that must not drift mid-turn.
 
-The normal API remains concise while creating real entities:
+A mutation after this boundary applies to later turns. It must not alter what the provider saw or which implementation executes a returned tool call.
 
-```rust
-use rig::ecs_prelude::*;
-use rig::providers::openai;
+The snapshot representation should be designed for lifecycle correctness rather than as a copy of the current `ToolRegistrySnapshot`. It may use ECS version entities, leases, immutable owned values, or another mechanism proven by replacement and retirement tests.
 
-let mut app = RigApp::new();
-app.add_plugins(DefaultRigPlugins);
+### Policy and extensions
 
-let model = app.spawn_model(openai::Client::from_env()?.completion_model("gpt-5"));
-let memory = app.spawn_store(PostgresMemory::connect(url).await?);
-let search = app.spawn_tool(SearchTool::new(search_client));
+Policy is ordinary ECS data interpreted or transformed by systems in documented sets. Per-agent or per-run policy instances have entity/component state and relationships rather than a privileged callback stack.
 
-let agent = app.spawn_agent(
-    AgentBundle::builder(model)
-        .name("researcher")
-        .preamble("Research carefully and cite sources.")
-        .memory(memory)
-        .max_turns(16)
-        .build(),
-);
+Extensions may inspect and transform prepared requests, approve or deny calls, normalize arguments, shape model-visible results, react to invalid calls, select routing, or stop a run. Composition order is explicit where order affects semantics.
 
-app.grant_tool(agent, search, GrantPolicy::default());
+`AgentHook` and `HookStack` are removed. The implementation must not recreate them as an erased callback list in a component. Where users need dynamic policy instances, represent instance state in ECS and use registered or typed systems, observers, messages, or a narrowly scoped private dispatch boundary that remains subordinate to the schedule.
 
-let run = app.spawn_run(agent, "Compare the two implementations");
-let response = app.run_until(run).await?;
-```
+Core state transitions remain owned by core systems. Observation extensions do not mutate transcript or lifecycle invariants out of band.
 
-Hosted usage:
+### Streaming
 
-```rust
-let runtime = RigRuntime::spawn(app);
-let response = runtime.agent(agent).prompt("Hello").await?;
-```
+Streaming chunks are values, not entities. The corresponding model-call entity owns stream lifecycle, cancellation, accumulation, correlation, and final outcome.
 
-Advanced users add native systems:
+Blocking and streaming consumers observe the same committed run state. Streaming adds incremental delivery; it does not use a separate runner.
 
-```rust
-fn deny_unhealthy_tools(
-    tools: Query<&ToolStatus, With<Tool>>,
-    mut calls: Query<(&CallsTool, &mut ToolCallDecision), With<ToolCall>>,
-) {
-    // policy
-}
+The implementation must define bounded buffering, slow-consumer behavior, dropped subscribers, cancellation, and final usage handling. Policies that inspect deltas should receive them at controlled schedule boundaries rather than borrowing the world from a stream task.
 
-app.add_systems(RigSet::PolicyBeforeTool, deny_unhealthy_tools);
-```
+### Errors
 
-## Streaming
+Direct typed authoring APIs may preserve concrete provider errors. Heterogeneous ECS state uses canonical outcomes suitable for policy, retry, telemetry, persistence, and model-visible presentation.
 
-Streaming chunks remain values delivered through a stream channel; they do not become entities.
+Concrete source diagnostics, retry classification, operator detail, raw tool output, and model-facing presentation are distinct concerns. Rewriting presentation must not corrupt audit or retry data.
 
-The model-call entity owns stream lifecycle and accumulated state. Stream events carry stable run/call IDs. Systems apply canonical deltas or completion summaries at controlled boundaries.
+### Cancellation, retirement, and cleanup
 
-The same model-call entity and systems serve blocking and streaming modes. Blocking consumers ignore incremental output; streaming consumers subscribe to it. There is no separate blocking runner.
+Cancellation is a state transition, not despawn. It prevents new dispatch, requests cancellation of external work where supported, and defines how late completions are handled.
 
-## Error model
+Retirement prevents new references while preserving old ones. Despawn occurs only after in-flight effects, persistence, telemetry, subscriptions, and result observation no longer require the entity.
 
-Typed model/tool/store errors are preserved at direct authoring boundaries and normalized before entering heterogeneous ECS state.
+The implementation must define result retention so a facade cannot lose a completed run to cleanup before observing it.
 
-Entities carry canonical failures:
+## Scheduling and progression
 
-```rust
-#[derive(Component)] pub struct RunFailure(pub PromptError);
-#[derive(Component)] pub struct ModelCallFailure(pub CompletionError);
-#[derive(Component)] pub struct ToolCallFailure(pub ToolExecutionError);
-#[derive(Component)] pub struct StoreCallFailure(pub StoreError);
-```
+The exact system-set enum is intentionally unspecified. The schedule must nevertheless expose clear semantic stages equivalent to:
 
-Operator diagnostics, model-visible presentation, retryability, refusal, and concrete typed sources remain distinct.
+1. ingest external commands and effect completions;
+2. reconcile changed world structure and resolve configuration;
+3. prepare immutable run, model, tool, store, and policy decisions;
+4. apply ordered policy;
+5. dispatch owned external effects;
+6. validate and apply completions;
+7. commit deterministic turn and batch outcomes;
+8. persist required state;
+9. publish observations;
+10. cancel, retire, and clean up terminal entities.
 
-A failed entity has exactly one terminal outcome. Validation systems reject contradictory success/failure components.
+Systems within a stage should run in parallel when their Bevy access permits it. Ordering between stages and order-sensitive extensions must be explicit.
 
-## Cancellation and cleanup
+Structural changes made through `Commands` become visible only at intentional synchronization points. The implementation must choose and test its `ApplyDeferred` boundaries instead of assuming a final flush is sufficient.
 
-Cancellation is entity-scoped:
+### Quiescence and wakeup
 
-- cancelling a run marks it `RunCancelled`;
-- dispatch systems stop creating new effects;
-- effect executor receives cancellation requests for in-flight call IDs;
-- late completions are recognized and discarded or recorded as late telemetry;
-- child call entities become terminal;
-- cleanup runs only after all required cancellation bookkeeping settles.
+A local or hosted driver repeatedly runs the schedule while immediate progress is possible. It stops when the requested result is observable, the runtime is waiting exclusively on external work, or a bounded progress guard detects a livelock.
 
-Despawn is not cancellation. Entities are despawned only after terminal state is externally observable and persistence/telemetry obligations complete.
+The implementation should track progress explicitly rather than infer it from arbitrary component scans. External command or effect arrival wakes a hosted runtime. Tests must be able to drive the same progression deterministically without sleeps.
 
-## Multi-tenancy and security
+## Asynchronous effect boundary
 
-Recommended isolation is one `RigApp`/`World` per strong tenant or trust boundary.
+Bevy systems are synchronous; provider, tool, store, persistence, and discovery work is asynchronous. The effect boundary is the only place where execution leaves the world.
 
-If multiple tenants share a world:
+The design must guarantee:
 
-- every agent, tool, store, run, grant, and call carries tenant scope;
-- all core queries include tenant-compatible relationships or filters;
-- tool snapshots validate tenant scope before provider exposure;
-- secrets remain in a resource that resolves tenant-scoped opaque keys;
-- debug formatting never exposes secret resource values;
-- cross-tenant invariant tests are mandatory.
+1. systems create an operation entity or otherwise establish authoritative correlation state;
+2. all effect input is owned;
+3. no ECS borrow enters the future;
+4. submission records the operation generation;
+5. completion re-enters through a thread-safe or target-appropriate ingress;
+6. an apply system validates identity, generation, cancellation, and expected phase;
+7. duplicate, stale, and late completions are idempotently rejected or recorded;
+8. only ECS systems transition authoritative runtime state.
 
-A broad query must never be sufficient to grant access. Access comes from explicit grant entities and validated snapshots.
+The exact executor, task type, channel, message, and erasure strategy are implementation choices. The design should support native and WASM executors without conditional public trait semantics.
+
+Queues and streams must have explicit capacity and backpressure behavior. Shutdown, task panic, timeout ownership, cancellation, and wakeup semantics are part of the implementation contract, not incidental executor behavior.
+
+Tests use controllable fake effects that can complete out of order, fail, duplicate, arrive late, or remain pending.
+
+## Extension and plugin model
+
+An extension is a package that installs Bevy-native pieces into a world and its schedules:
+
+- components and bundles;
+- resources;
+- relationships;
+- messages;
+- systems and system sets;
+- observers;
+- provider/tool/store installation helpers;
+- policy and telemetry behavior.
+
+Because `rig-core` does not depend on `bevy_app`, it may expose a small installation abstraction or functions for configuring a `World` and its schedules. That abstraction must remain a thin composition aid, not a competing scheduler or service container.
+
+Extensions must declare ordering when composition semantics require it. Duplicate schedule labels, incompatible resources, stable-ID conflicts, and ambiguous mandatory ordering should fail clearly.
+
+A separate full-Bevy integration can translate the same installers into `bevy_app::Plugin` implementations.
+
+## Public API principles
+
+The public API should be concise without obscuring entity ownership:
+
+- creating an agent, model, tool, store, or run spawns or configures world entities;
+- handles identify runtime/world ownership and reject stale or foreign entities;
+- prompting through a handle submits a command and observes the resulting run;
+- local and hosted handles drive the same schedules;
+- advanced users can query the world, install systems, and run schedules directly at documented safe points;
+- typed provider and tool construction remains ergonomic even if runtime storage is heterogeneous;
+- APIs do not expose private erasure solely because the runtime needs it internally.
+
+Direct mutable world access is safe during construction and controlled schedule execution. A hosted runtime should accept commands or execute user closures at a safe point rather than expose concurrent `&mut World` access.
+
+Exact facade names, handle types, builders, and return types should emerge from the implementation rather than be fixed by this document.
 
 ## Determinism and concurrency invariants
 
-1. Provider tool definitions are sorted by explicit registration/grant order.
-2. Every turn stores the exact tool entity snapshot advertised to the model.
-3. The entity executed for a call is the one captured in that snapshot.
-4. Parallel tool completion order never determines transcript order.
-5. Tool batches commit atomically in `ToolCallIndex` order.
-6. System ordering required for semantics is explicit.
+1. Provider-facing definitions use explicit deterministic ordering.
+2. Name collisions and replacement have documented deterministic resolution.
+3. A turn executes the exact capabilities and policy decisions advertised for that turn.
+4. Tool or model replacement cannot mutate an in-flight decision.
+5. Parallel completion order does not determine transcript order.
+6. A logical tool batch commits in model-call order, not arrival order.
 7. Query iteration order is never persisted or externally observable.
-8. Effect completions include stable correlation IDs and are idempotently applied.
-9. Late or duplicate completions cannot mutate a newer run/call generation.
-10. Blocking and streaming consumers observe the same committed history and terminal outcome.
+8. Required system and policy ordering is explicit.
+9. Completion application is correlated and idempotent.
+10. Late work cannot mutate a newer entity generation.
+11. Blocking and streaming consumers observe the same committed history and terminal outcome.
+12. Cancellation and retirement are deterministic under concurrent completion.
+
+## Multi-tenancy and security
+
+A separate world per strong tenant or trust boundary is preferred.
+
+When tenants share a world, tenant scope must participate in agent, capability, grant, run, call, and secret resolution. Broad discovery never grants access by itself. Authorization comes from explicit relationships and policy evaluated before immutable turn decisions are accepted.
+
+Core tests must attempt cross-tenant model, tool, store, snapshot, and stable-ID misuse.
 
 ## Persistence
 
-Persistence operates on explicit snapshots, not raw world serialization.
+Persistence operates on explicit domain records or snapshots, never raw world serialization.
 
-Persistable records use stable IDs and canonical data:
+Persisted data uses stable IDs and canonical values. Runtime-only clients, executable handles, tasks, channels, schedules, private erasure, and raw `Entity` values are reconstructed rather than serialized.
 
-```text
-AgentRecord
-ModelReferenceRecord
-StoreReferenceRecord
-ToolRecord
-ToolGrantRecord
-RunRecord
-TurnRecord
-CallRecord
-```
+Loading is a remapping operation: establish entities and stable-ID uniqueness first, then restore relationships and capability state. Missing or conflicting references produce explicit errors.
 
-Private drivers, live clients, task handles, channels, and raw `Entity` values are not serialized. Plugins reconstruct runtime-only components from persisted configuration.
+Persistence itself participates in ECS scheduling and call lifecycle where its completion affects run correctness.
 
 ## Observability
 
-Entity identity provides correlation across the runtime:
+Stable agent, run, turn, and operation identities provide correlation. Telemetry and audit systems observe changed or terminal ECS state and effect metadata.
 
-```text
-stable_run_id
-stable_turn_id
-stable_call_id
-agent_stable_id
-model_stable_id
-tool_stable_id
-store_stable_id
-```
+Observability must distinguish:
 
-Telemetry systems query terminal or changed call/run components. Raw execution result and model-facing presentation remain separate components, preventing presentation rewrites from corrupting policy or audit data.
+- raw external response;
+- canonical runtime outcome;
+- policy decision;
+- model-visible presentation;
+- retry and cancellation history;
+- persistence status.
 
-## Module layout
+Instrumentation should arise from systems and effect boundaries rather than hidden callbacks embedded throughout provider code.
 
-```text
-rig-core/src/
-├── app.rs
-├── ecs.rs
-├── components/
-│   ├── agent.rs
-│   ├── model.rs
-│   ├── tool.rs
-│   ├── store.rs
-│   ├── run.rs
-│   ├── turn.rs
-│   └── call.rs
-├── bundles/
-├── relationships/
-├── messages/
-├── schedules/
-├── systems/
-│   ├── ingress.rs
-│   ├── resolve.rs
-│   ├── model.rs
-│   ├── tool.rs
-│   ├── policy.rs
-│   ├── commit.rs
-│   ├── persistence.rs
-│   └── cleanup.rs
-├── effects/
-│   ├── executor.rs
-│   ├── model.rs
-│   ├── tool.rs
-│   └── store.rs
-├── plugins/
-├── runtime/
-│   ├── local.rs
-│   └── hosted.rs
-├── provider/          # canonical provider traits and request/response types
-├── tool/              # typed authoring and private erasure
-├── memory/
-└── prelude.rs
-```
+## APIs and concepts removed at cutover
 
-Provider implementations may remain in their current modules initially, but registration and execution enter through model entities and effects.
-
-## APIs removed at cutover
-
-| Removed API/concept | ECS-native replacement |
+| Removed concept | ECS-native direction |
 | --- | --- |
-| `Agent<M>` as runtime object | `Agent` entity + components + `UsesModel` |
-| `AgentBuilder` returning an owned agent | `AgentBundleBuilder` + spawn into `World` |
-| `AgentRunner` as execution engine | Rig schedules and run entities |
-| runner-owned configuration copies | queried agent/run components and turn snapshots |
-| `ToolSet` | tool entities + grants + snapshot queries |
-| `ToolServer` / `ToolServerHandle` | world commands and tool entity lookup |
-| `HookStack` / `AgentHook` | systems in policy/observation sets |
-| agent-owned memory handle | `UsesMemory` relationship to store entity |
-| dynamic context vectors | retrieval store relationships and preparation systems |
-| mutable registry callbacks | deferred commands and change detection |
-| separate blocking/streaming loops | one call entity lifecycle with optional delta subscription |
-| persisted runtime IDs | stable UUID components and remapping |
+| `Agent<M>` as a runtime object | agent entity composed from components and relationships |
+| runner-owning `AgentBuilder` | construction helper that spawns into a world |
+| `AgentRunner` and parallel streaming loops | schedule-driven run, turn, and operation entities |
+| `AgentRun` as the orchestration state machine | ECS-owned run state transitioned by systems |
+| runner-owned configuration copies | resolved ECS state and immutable in-flight decisions |
+| `ToolSet` | tool entities, capability queries, grants, and snapshots |
+| `ToolServer` / `ToolServerHandle` | world mutation and discovery/reconciliation systems |
+| `HookStack` / `AgentHook` | policy components, systems, sets, messages, and observers |
+| `ToolContext` as a general type-map runtime bus | typed call state and owned effect input |
+| agent-owned memory/store handles | relationships to store capability entities |
+| mutable registry callbacks | commands, messages, relationships, and change detection |
+| separate blocking and streaming runners | one operation lifecycle with optional delta delivery |
+| persisted runtime handles | stable IDs and remapping |
+| `WasmCompat*` traits and aliases | ordinary Rust bounds plus private target-specific effect integration |
 
-Typed `Tool`, `CompletionModel`, canonical request/response/message types, and provider clients remain as authoring and wire boundaries, but no longer own runtime orchestration.
+Typed provider clients, request/response/message values, and ergonomic typed tool/model authoring may remain, but their existing signatures are not compatibility requirements and they do not own agent orchestration.
 
 ## Migration strategy: one architectural cutover
 
-This migration is not delivered as a sequence of compatibility-preserving runtime modes. Implementation may use parallel internal workstreams, but the merged result is one coherent ECS-native runtime.
+The migration is developed on a rewrite branch that may temporarily be non-releasable. Work can proceed in dependency order, but the merged result contains one ECS runtime and no compatibility mode.
+
+### Implementation sequence
+
+1. Pin Bevy ECS 0.19, move the toolchain to Rust 1.95, establish the re-export, and compile minimal native/WASM ECS fixtures.
+2. Remove `wasm_compat` traits and aliases; convert public and private contracts to ordinary Rust bounds and isolate unavoidable target-specific execution details.
+3. Install world-resident schedules, resources, messages, progress tracking, and invariant tests.
+4. Establish the ECS domain topology and stable-identity rules without embedding old registries or `AgentRun`.
+5. Implement one end-to-end model-call vertical slice through the owned effect boundary.
+6. Implement tool discovery, immutable turn decisions, execution, replacement, retirement, and deterministic batch commit.
+7. Implement policy as systems and ECS state, including per-agent or per-run dynamic policy data.
+8. Add stores, memory, retrieval, persistence, MCP reconciliation, streaming, cancellation, and observability through the same operation model.
+9. Route every agent facade through the installed schedules and validate local, hosted, test, and embedded driving.
+10. Delete old runners, registries, hook infrastructure, duplicated state, compatibility bounds, and dead adapters.
+11. Merge only after the complete cutover criteria pass.
+
+These are implementation dependencies, not compatibility phases. No released or merged target state contains two agent runtimes.
+
+### Implementation freedom
+
+The executing agent is expected to revise details when code, Bevy APIs, provider constraints, or tests reveal a better ECS-native design. It may choose different component names, cohesive state layouts, system boundaries, registered-system strategies, private adapters, or facade shapes.
+
+It must preserve the architectural rules and observable invariants in this document. Significant deviations should update this document with rationale rather than silently preserve legacy architecture.
 
 ### Explicitly forbidden migration techniques
 
-- no `ecs` feature that selects a second implementation;
-- no old and new agent runners living side-by-side in a release;
-- no `ToolSet` mirrored into tool entities;
-- no compatibility registry synchronizing strings and entity IDs;
-- no deprecated wrappers that retain old ownership semantics;
-- no adapter that executes outside the world and merely reports results into ECS;
-- no public API that sometimes uses ECS and sometimes bypasses it;
-- no long-lived conversion layer between `Agent<M>` and agent entities;
-- no temporary persistence of raw Bevy entity IDs;
-- no silent fallback to old hook behavior.
-
-### Development branch policy
-
-A dedicated rewrite branch may be temporarily non-releasable. Work is organized by internal subsystem, not by backwards-compatible release phases:
-
-1. establish components, bundles, relationships, schedule sets, and invariant tests;
-2. implement effect executor and completion inbox;
-3. move model execution into model-call entities;
-4. move tool execution into tool-call entities;
-5. move transcript advancement and batch commit into systems;
-6. move memory/store execution into store entities and effects;
-7. replace hooks with extension systems;
-8. route every public execution API through `RigApp`;
-9. delete old registries, runner control flow, and duplicated state;
-10. merge only when cutover criteria are satisfied.
-
-These are implementation workstreams, not compatibility stages. The target branch contains no dual runtime when merged.
-
-### Release policy
-
-The cutover ships as an explicitly breaking release. Migration documentation teaches the new entity/bundle/system model rather than presenting mechanical aliases for removed APIs.
+- an `ecs` feature that selects a second runtime;
+- old and new runners living side by side in the completed branch;
+- mirroring `ToolSet`, model registries, or store registries into entities;
+- storing the old `AgentRun` or hook stack in a component and driving it from ECS;
+- a compatibility registry synchronizing strings and entities;
+- deprecated wrappers that retain old ownership semantics;
+- public APIs that sometimes bypass ECS orchestration;
+- a long-lived conversion layer between generic agents and agent entities;
+- raw Bevy entity IDs in persistence or protocols;
+- custom `WasmCompat*` bounds reintroduced under new names;
+- effect tasks that borrow or mutate the world;
+- silent fallback to old hook or runner behavior.
 
 ## Cutover criteria
 
-The ECS-native rewrite is ready only when all criteria pass.
+### Dependency and platform
+
+- `bevy_ecs` 0.19 is a required `rig-core` dependency and is re-exported by Rig.
+- the workspace toolchain satisfies Bevy 0.19's Rust requirement.
+- `wasm_compat` traits, aliases, imports, and target-dependent public bounds are gone.
+- native and `wasm32-unknown-unknown` checks pass.
+- Bevy features beyond the minimal runtime set have explicit justification.
 
 ### Architecture
 
-- `bevy_ecs` is required by `rig-core`.
-- every live agent, model, tool, store, run, turn, and call has entity identity.
-- the world is the only authoritative registry.
-- all execution APIs use the same schedule.
-- no world borrow crosses `.await`.
-- old runner and registry implementations are deleted.
-- extension behavior is implemented through systems/plugins.
+- each runtime has one authoritative world;
+- agents, executable capabilities, stores, runs, turns, and lifecycle-bearing operations have ECS identity;
+- core behavior is implemented by systems and schedules rather than an embedded legacy runner;
+- addressable domain objects are not hidden singleton resources;
+- all agent execution APIs drive the same schedules;
+- no world borrow crosses `.await`;
+- old runners, registries, hook stacks, and duplicated orchestration state are deleted;
+- extension behavior uses Bevy-native composition.
 
 ### Correctness
 
-- exact advertised/executed tool snapshot tests pass;
-- deterministic parallel tool ordering tests pass;
-- atomic batch commit tests pass;
-- cancellation and late-completion tests pass;
-- blocking/streaming transcript parity tests pass;
-- invalid-tool repair/skip/failure tests pass;
-- structured-output tests pass;
-- memory persistence tests pass;
-- MCP ownership/refresh tests pass;
-- tenant isolation tests pass;
-- stable-ID persistence/remapping tests pass;
-- change-detection invalidation tests pass.
+- advertised and executed capability identity remains exact across replacement and retirement;
+- duplicate-name and ordering tests are deterministic;
+- parallel tool completion commits in model-call order;
+- logical batches commit atomically;
+- cancellation, timeout, duplicate, stale, and late-completion tests pass;
+- blocking and streaming histories and terminal outcomes agree;
+- policy ordering and stop/failure semantics are deterministic;
+- structured-output behavior passes;
+- memory and persistence behavior passes;
+- MCP refresh generation and retirement behavior passes;
+- tenant isolation and stable-ID remapping tests pass;
+- cleanup never destroys unobserved required results or referenced capability versions.
 
-### Providers and platforms
+### Providers and effects
 
-- all provider completion and streaming suites pass;
-- tool and multimodal result suites pass;
-- native and WASM checks pass;
-- no provider needs direct world access;
-- fake executor tests are deterministic without network or sleeps.
+- representative provider completion, streaming, tool, and multimodal suites pass before broad provider conversion;
+- all supported providers pass before cutover;
+- no provider, tool, or store future receives ECS access;
+- fake effect tests control completion order without network calls or sleeps;
+- queue capacity, backpressure, wakeup, shutdown, panic, timeout, and cancellation behavior are tested.
 
-### Quality
+### ECS quality
 
-- no schedule ambiguity exists in core sets;
-- component invariant validator passes in debug/test builds;
-- ECS query order is absent from externally visible semantics;
-- benchmarks cover one-shot prompts, many concurrent runs, large tool registries, and tool-batch execution;
-- public examples demonstrate both simple facade usage and native ECS extension.
+- mandatory schedule ambiguities fail tests;
+- required deferred-command visibility is covered by schedule tests;
+- mutually exclusive phases and outcomes cannot silently coexist;
+- stable-ID and relationship invariants are validated;
+- query order is absent from observable semantics;
+- removal and retirement paths are tested;
+- facade tests are matched by direct world/schedule tests;
+- examples show both concise facade usage and native ECS extension.
+
+### Performance and operability
+
+Benchmarks cover one-shot prompts, many concurrent runs, large capability sets, streaming, and parallel tool batches. Lifecycle metrics make stuck, retired, cancelled, and cleanup-eligible entities observable.
 
 ## Testing architecture
 
+### Vertical-slice tests
+
+Prefer schedule-level vertical slices over unit tests of copied legacy helpers. Spawn representative world state, run schedules, control effects, and inspect state transitions and outcomes.
+
 ### Deterministic fake effects
 
-Tests use a fake `EffectExecutor` that records effects and allows explicit completion order. This makes concurrency, cancellation, retries, and late completion deterministic.
+A fake effect boundary records owned work and allows tests to choose success, failure, ordering, duplication, lateness, cancellation, and delay. Core concurrency tests use no wall-clock sleeps.
 
-### Schedule-level tests
+### Invariant tests
 
-Tests spawn entities, run schedules, inspect components, and assert transitions. They do not test core behavior exclusively through facade APIs.
+Debug and test configurations validate at least:
 
-### Facade conformance
+- stable-ID uniqueness;
+- valid and tenant-compatible relationships;
+- coherent run and operation phase/outcome state;
+- exact immutable turn decisions;
+- no commit before a complete logical batch settles;
+- no stale or duplicate completion mutation;
+- no despawn while required references or effects remain;
+- no secret material in persisted or debug-visible state.
 
-Every facade operation is checked against direct world/schedule operation to prove it is only a convenience layer.
+### Platform tests
 
-### Invariant systems
+Compile and run the appropriate deterministic suites on native and WASM. Platform differences are confined to effect integration and do not change ECS semantics.
 
-Debug/test builds run validation systems for:
-
-- exactly one primary run phase;
-- exactly one terminal call outcome;
-- valid relationships;
-- stable IDs present on persistable entities;
-- no cross-tenant grants;
-- snapshot definitions aligned with executable entities;
-- no commit before complete batch settlement;
-- no despawn with outstanding required effects.
-
-## Risks and mitigations
+## Risks and architectural responses
 
 ### Bevy version coupling
 
-**Risk:** ECS plugins compiled against different Bevy versions have incompatible types.  
-**Mitigation:** re-export the pinned version through Rig and require plugins to import through Rig.
+ECS extensions compiled against different Bevy releases have incompatible types. Rig therefore pins and re-exports Bevy ECS 0.19 and treats upgrades as deliberate migrations.
 
-### Compile-time increase
+### Compile-time cost
 
-**Risk:** `bevy_ecs` increases compilation cost for simple provider users.  
-**Mitigation:** accept this as the cost of making `rig-core` ECS-native; keep optional provider features narrow and avoid `bevy_app`/rendering dependencies.
+A required Bevy ECS dependency increases compile time for simple users. This is accepted as the cost of one coherent `rig-core` runtime; optional provider features should remain narrow and rendering/full-engine dependencies stay out of core.
 
 ### Async impedance mismatch
 
-**Risk:** systems are synchronous while AI infrastructure is I/O-heavy.  
-**Mitigation:** enforce the effect boundary and prohibit world borrows in futures.
+AI infrastructure is I/O-heavy while systems are synchronous. The owned effect boundary, explicit operation entities, completion ingress, and wake-driven scheduling make that boundary visible and testable.
 
-### Excessive component fragmentation
+### Recreating the old runtime inside ECS
 
-**Risk:** related invariants become distributed across too many components.  
-**Mitigation:** use cohesive components, bundles, required components, and invariant systems.
+The easiest migration path would wrap legacy traits, registries, and `AgentRun` in components. The cutover explicitly forbids that. Vertical slices should be reviewed for ECS-native ownership and behavior before broad conversion.
+
+### Excessive fragmentation
+
+Too many components can distribute invariants and create marker-state contradictions. Use cohesive state, required components, relationships, bundles, and carefully chosen outcome representations.
+
+### Service-locator world
+
+Broad queries can weaken boundaries. Systems should query narrow capabilities and explicit relationships; access should come from grants and resolved immutable decisions rather than discovery alone.
 
 ### Hidden nondeterminism
 
-**Risk:** query and parallel completion order leaks into provider requests or transcripts.  
-**Mitigation:** explicit ordinal components, snapshots, ordered commit systems, and deterministic fake-executor tests.
+System parallelism, query order, and external completion order can leak into provider requests or transcripts. Explicit ordering, immutable decisions, atomic commit, and adversarial fake-effect tests prevent that.
 
-### World as service locator
+### Lifecycle leaks
 
-**Risk:** systems query broad global state and weaken boundaries.  
-**Mitigation:** capability components, explicit relationships, narrow queries, resources only for true singletons, and tenant isolation rules.
-
-### Entity lifecycle leaks
-
-**Risk:** abandoned call/run entities accumulate.  
-**Mitigation:** terminal markers, cleanup systems, lifecycle metrics, and invariant checks for aged in-flight entities.
+Long-lived runtimes can accumulate calls, retired tools, subscriptions, and completed runs. Retirement and cleanup are explicit scheduled lifecycles with observability and reference-aware tests.
 
 ## Definition of the ideal end state
 
-The migration is complete when the following description is literally true:
+The migration is complete when this statement is literally true:
 
-> Rig is an asynchronous agent ECS built on `bevy_ecs`. Models, tools, stores, agents, runs, turns, and calls are entities. Their data and capabilities are components. Their connections are relationships. Agent execution is a schedule of systems. Network and tool I/O cross an explicit owned effect boundary. Deferred commands make lifecycle transitions atomic. Buffered messages deliver completions predictably. Change detection drives dynamic updates. Plugins extend the runtime by adding components, systems, resources, and observers. The ergonomic prompt API is only a handle over this world, and no second runtime exists.
+> Rig is an asynchronous agent runtime built directly on Bevy ECS 0.19. Agents, executable capabilities, stores, policies, runs, turns, and lifecycle-bearing operations are entities composed from components and relationships. Systems own orchestration and policy. World-resident schedules own progression and deterministic commit. Asynchronous I/O crosses an owned, testable effect boundary and never borrows ECS state. Messages, commands, observers, and change detection are used according to Bevy semantics. Native and WASM use ordinary Rust bounds without compatibility marker traits. The ergonomic prompt API is only a facade over this world, and no legacy runner, mirrored registry, or second runtime exists.
+
+## Implemented capability matrix
+
+The table below is the audit map for the pre-ECS runtime. Test names refer to
+`runtime::tests` unless a provider or adapter suite is named explicitly.
+
+| Pre-ECS capability | ECS primitive and authoritative state | Public surface | Principal evidence | Migrated example |
+| --- | --- | --- | --- | --- |
+| blocking prompt loop | run/model-operation entities progressed by `RigSchedule` | `AgentFacade::prompt`, `RuntimeHandle::prompt` | `model_effect_round_trip_uses_world_resident_schedule` | `agent` |
+| streaming prompt loop | ordered `EffectIngressMessage` deltas plus run subscription entities | `prompt_stream`, `RunStream` | streaming sequence, parity, slow-consumer, and adapter suites | `agent_stream_chat` |
+| streamed tool-call steering | durable ordered delta evaluations retaining sequence and provider/Rig correlation | `ToolCallDeltaStopPolicyBundle`, `ToolCallDeltaPolicyInvocation` | tool-call delta stop/no-policy fast-path tests | `agent_stream_chat` |
+| completion-call hook | durable request-policy evaluation entity and targeted invocation event | `RequestPatchPolicyBundle`, `RequestPolicyInvocation` | request patch/order/non-sticky tests | `request_hook` |
+| completion-response hook | response-policy evaluation before model commit | `CompletionResponsePolicyInvocation` | completion rewrite/stop tests | `request_hook` observes the corresponding applied boundary |
+| model-turn-finished hook | observe-only targeted entity event | `ModelTurnFinished` | `completion_response_policy_runs_before_commit_and_emits_turn_event` | `agent_with_tools_otel` |
+| invalid-tool hook | pending-invalid component plus ordered durable evaluation | repair/retry/skip bundles and invocation event | invalid-tool action, budget, streaming, and snapshot tests | `gemini_default_api_recovery` |
+| tool-call hook | per-operation policy evaluation with immutable tool decision | rewrite/approval/skip bundles | rewrite, approval, skip, and snapshot tests | `agent_with_approval_policy` |
+| tool-result hook | immutable raw effect plus mutable presentation evaluation | `ToolResultRedactionPolicyBundle` | raw/presentation separation, content-free settlement telemetry, and stop tests | `tool_result_outcomes` |
+| hook scratchpad/context | extension-owned typed components and tenant-checked relationship queries | `RigOperationContext`, `RigRunContext`, `RigPolicyContext`, `TenantScopedQuery`, ordinary `Component` | extension/SystemParam and tenant-scope tests | `ecs_extension`, `tool_result_outcomes` |
+| asynchronous hooks | approval operation entities and owned effect I/O | `PolicyRule::RequireApproval` | request/tool/result/invalid approval snapshot tests | `agent_with_durable_approval` |
+| tools and dynamic tools | capability and grant entities with revisioned immutable snapshots | agent builder tools, `spawn_tool`, `grant_tool` | collision, retirement, batch, and provider suites | `agent_with_tools`, `rag_dynamic_tools` |
+| MCP/tool-server refresh | discovery-source and discovered-capability relationships | discovery commands and RMCP adapter | generation/retirement tests plus the local live-protocol example | `rmcp` |
+| memory and retrieval | store capability/grant/operation entities | builder `memory` and `dynamic_context` | memory and vector-retrieval tests | `agent_with_memory`, `rag` |
+| structured output | `OutputRequirement` plus run-local retry counters | output schema/mode/retry builder methods | validation, retry, snapshot, provider extraction tests | `extractor` |
+| cancellation and suspension | `RunControl` orthogonal to `RunState` | pause modes, resume, cancel commands | drain/freeze/cancel-and-suspend race tests | `agent_run_stepping`, `multi_agent` |
+| active `AgentRun` serialization | stable-ID `ActiveRunSnapshot` with migrations, limits, integrity envelope, and extension codecs | `snapshot_active_run`, `restore_active_run`, `snapshot_summary` | waiting-phase, migration, limit, integrity, and extension-rebinding tests | `agent_with_durable_approval`, `ecs_runtime` |
+| child-agent delegation | `ParentRun`/`ChildRuns`, `WaitingForChildren`, explicit ordinal | `spawn_agent`, `spawn_child_run` | deterministic result and cancellation tests | `agent_with_agent_tool` |
+| telemetry hooks | observe-only entity events and optional typed counters | `LifecycleTelemetryBundle` | lifecycle event ordering and telemetry tests | `agent_with_tools_otel` |
+| provider diagnostics | canonical effect outcome plus immutable serialized and concrete typed response components on the model operation | `TypedProviderResponseDiagnostics<M::Response>`, `ProviderResponseDiagnostics`, and generation-validated ingress | typed facade query, response-policy query, streaming ingress, and snapshot tests | provider examples |
+| WASM | identical ECS state with target-specific effect transport only | normal Rust bounds | WASM compile gate plus headless-Chrome local future/effect round trip | `crates/rig-core/tests/wasm_runtime.rs` |
+
+## Hook-to-ECS migration guide
+
+Old hooks no longer form a callback stack. Steering is represented by policy
+entities sorted by `(Policy.order, StableId)`. An operation snapshots the exact
+policy revisions, creates a durable evaluation, and targets one policy entity at
+a time. The next policy therefore sees the effective value produced by every
+earlier policy. Observer registration order has no semantic role.
+
+| Old event | Steering boundary | Observe-only boundary |
+| --- | --- | --- |
+| completion call | `RequestPolicyInvocation` | `CompletionRequestPrepared`, `ModelDispatched` |
+| completion response | `CompletionResponsePolicyInvocation` | `ModelSettled`, `CompletionResponseApplied` |
+| model turn finished | none after commit | `ModelTurnFinished` |
+| invalid tool call | `InvalidToolCallPolicyInvocation` | `InvalidToolCallDetected` |
+| tool call | `ToolCallPolicyInvocation` | `ToolCallPrepared`, `ToolExecutionStarted` |
+| tool result | `ToolResultPolicyInvocation` | `ToolExecutionSettled`, `ToolResultPresentationFinalized` |
+| stream text delta | `TextDeltaPolicyInvocation` | `TextDeltaObserved`, `StreamResponseFinished` |
+| stream tool-call delta | `ToolCallDeltaPolicyInvocation` | `ToolCallDeltaObserved`, `StreamResponseFinished` |
+
+`RequestPatch` is operation-local. The evaluation retains the baseline request,
+the reduced `accumulated` patch, and the current effective request separately.
+Context appends, provider parameters shallow-merge, active tools intersect, and
+scalar/history fields use last-writer-wins. Repeated last-writer fields emit a
+structured warning containing the field and later policy ID. The next turn is
+always rebuilt from agent/run state, never from the prior patched input.
+
+Every fail-closed responder, explicit stop, and rejected approval terminates
+with `CanonicalError::PolicyTerminated`. Its `PolicyTermination` retains the
+accepted stable policy ID and revision, lifecycle point, exact reason, stable
+run and operation IDs, and the complete transcript at the decision boundary.
+The high-level facade preserves that record while translating the outcome into
+the ordinary prompt-cancellation surface.
+
+Asynchronous policy behavior creates a `PolicyApproval` operation related to
+the evaluation. The evaluation remains at its cursor while the owned request is
+outside the world. Completion ingress validates operation identity, generation,
+phase, cancellation, and output kind before advancing the cursor.
+
+Tool settlement telemetry deliberately carries only `ToolExecutionStatus`
+(classification, retryability, and refusal flags). Raw output and operator
+diagnostics remain immutable operation audit state and are not copied into
+`ToolExecutionSettled`. `ToolResultPresentationFinalized` carries only the
+policy-approved presentation, while `ToolBatchCommitted` uses
+`PublishedToolResult` values with the same content-safe boundary. Neither event
+is emitted when result policy stops the run, so redaction and stop decisions
+cannot leak raw content through observation payloads or stream publication.
+
+## Public extension API
+
+`RigExtension` is intentionally only an installer over `&mut World`. The common
+policy helpers—`RequestPatchPolicyBundle`, `ToolApprovalPolicyBundle`,
+`ToolArgumentRewritePolicyBundle`, `ToolSkipPolicyBundle`,
+`ToolResultRedactionPolicyBundle`, `InvalidToolRepairPolicyBundle`, and
+`InvalidToolRetryPolicyBundle`—are ordinary Bevy `Bundle`s and also implement
+the installer. `LifecycleTelemetryBundle` is inserted on an agent to opt into
+queryable observe-only counters. `RigOperationContext` is a read-only
+`SystemParam` resolving operation → run → agent metadata without allowing a
+borrow to escape into asynchronous work. `RigRunContext` and
+`RigPolicyContext` expose the corresponding tenant-validated ownership facts,
+while `TenantScopedQuery` keeps its underlying read-only query private and
+requires an explicit tenant on every lookup or iteration.
+
+`EcsEffect` gives extensions typed input, output, and error components while
+reusing core operation ownership, generation, phase, cancellation, stable ID,
+and tenant correlation. `spawn_extension_effect`,
+`dispatch_extension_effect`, and `settle_extension_effect` enforce the common
+lifecycle without adding extension variants to `EffectInput` or `EffectOutput`.
+
+Custom behavior may add components and systems at the public `RigSet`
+boundaries or attach one targeted steering observer to a `PolicyRule::Custom`
+entity. Additional audit observers consume the separate observation events.
+
+The high-level `AgentBuilder::extension` accepts a factory after the generated
+agent entity exists, so relationship-bearing bundles can target that entity
+without guessing a raw ID. `AgentBuilder::tool_approval_policy` pairs the
+native policy bundle with an `EcsPolicyApprover`; blocking and streaming facade
+runs execute its owned `PolicyApprovalEffectInput` outside the world and ingest
+the correlated typed result through the same schedule boundary. Run-local
+policies use `AgentPromptRequest::run_policy` for blocking prompts and
+`LocalModelAgent::stream_run_with_policies` for streams; both submit the policy
+definitions in the same hosted command as the run, so no unprotected admission
+window exists before `PolicyForRun` relationships are established.
+
+## Schedule and lifecycle diagrams
+
+The public schedule is one ordered progression engine for every agent and run:
+
+```text
+IngestCommands -> IngestControlCommands -> IngestEffects -> Reconcile
+ -> ReconcileAgentControl -> ApplyRunControl -> SpawnDynamicAgentsAndRuns
+ -> PrepareRun -> PrepareModel -> BeginRequestPolicy -> InvokeRequestPolicy
+ -> ReduceRequestPolicy -> FinalizeRequest -> DispatchModel
+ -> ApplyModelCompletion -> BeginResponsePolicy -> CommitModelTurn
+ -> ResolveInvalidTools -> PrepareToolBatch -> BeginToolCallPolicy
+ -> DispatchTools -> ApplyToolCompletions -> BeginToolResultPolicy
+ -> CommitToolBatch -> Persist -> Publish -> Cancel -> Retire -> Cleanup
+ -> MaintainMessages
+```
+
+Mandatory ambiguity detection is enabled at `Error` level and the core schedule
+graph is asserted conflict-free. Deferred structural commands are visible at
+the intentional chained system boundaries. Component lifecycle tests cover
+`Add -> Insert`, replacement `Discard -> Insert`, explicit removal
+`Discard -> Remove`, required-component insertion, observer commands, and the
+despawn observation/removal sequence. Business phases remain ordinary
+queryable components rather than lifecycle-hook control flow.
+
+Parent/child progression is explicit:
+
+```text
+parent model operation active
+ -> SpawnChildRun command
+ -> ParentRun/ChildRuns relationship + WaitingForChildren marker
+ -> child progresses in the same RigSchedule
+ -> child terminal outcome retained
+ -> results reduced by ChildOrdinal (not completion order)
+ -> marker removed only after every child result commits
+ -> parent resumes its preserved RunState
+```
+
+Every ready evaluation is visited once per schedule pass, ordered by stable run
+identity and cursor. The runtime does not cap a pass after one run, so an
+immediately-ready policy-heavy run cannot exclude a ready sibling. Waiting and
+paused runs do not report progress. Separate worlds remain the isolation and
+scheduling-shard boundary for distinct trust domains.
+
+Core effect dispatch uses `RunPriority`, the run's monotonic `ReadyAt` admission
+tick, and stable identity as its deterministic order. The bounded per-pass
+budget is divided round-robin across every ready `(tenant, effect kind)` pair;
+the cursor advances across passes so a noisy tenant or earlier schedule stage
+cannot monopolize a small budget. In-flight run, agent, and tenant counters are
+rebuilt once per pass and updated per reservation, avoiding a world scan for
+every dispatched operation.
+
+`ReadyAt` is a runtime-local logical order, not a portable wall-clock value.
+Active-run restoration rebases distinct captured readiness ranks at or before
+the target runtime's current tick. This preserves relative captured order while
+ensuring subsequently admitted equal-priority work cannot indefinitely jump
+ahead of a checkpoint restored from an older world.
+
+## Active-run snapshot format
+
+`ActiveRunSnapshot` format version 6 contains only stable domain IDs plus opaque
+snapshot-local references. It records:
+
+- root and descendant runs, parent identity, child ordinal, and committed-child status;
+- authoritative run phase, orthogonal pause mode, priority, and readiness age;
+- prompt, transcript, usage, turn/model budgets, invalid-tool retries, and structured-output retries;
+- memory/retrieval decisions, conversation state, pending output, and persistence state;
+- operation generation/phase, immutable model/tool/store decisions, stream sequence, settled output, and serialized provider diagnostics;
+- tool batches and explicit call order;
+- accepted policy IDs/revisions/order/lifecycle capability, evaluation kind/cursor, accumulated request patch, effective arguments/presentation, and pending approvals;
+- run-scoped policy definitions, status, and stable run relationships;
+- committed-turn audit records;
+- extension-owned JSON sections keyed by stable binding ID and exact codec revision.
+
+Raw entity IDs, observers, registered systems, clients, secrets, channels, and
+task handles are never serialized. Restoration validates tenant and revision
+compatibility, remaps stable references, reconstructs relationships and the
+`WaitingForChildren` dependency, and then resumes through `RigSchedule`.
+In-flight effects are rejected unless cancel-and-suspend first produced a
+redispatchable prepared generation. Snapshots contain prompts, transcripts,
+tool data, policy decisions, and provider content and must therefore be handled
+as application-sensitive data. Runtime-only custom observers/systems must be
+reinstalled after domain restoration before runs resume.
+
+Versions 4 and 5 migrate explicitly to version 6. Version 6 adds a
+default-empty extension section, so historical snapshots require no invented
+extension state. `ActiveRunSnapshotLimits` rejects oversized byte counts, run
+graphs, depths, child fan-out, operation/evaluation counts, transcripts, and
+extension payloads before entity creation. Required extension codecs and exact
+revisions are validated before mutation; optional missing sections are ignored.
+`encode_active_run_snapshot` adds a SHA-256 integrity envelope and optionally
+invokes an application-owned reversible protection hook. Core never owns or
+serializes protection keys, and decoding requires the caller's expected
+protection mode to match the envelope. Typed extension-effect inputs/results
+remain concrete application components, so core capture rejects non-discarded
+extension operations rather than silently losing them. `snapshot_summary`
+returns a structured JSON-ready
+inventory of topology, states, operation kinds, transcript size, and extension
+size. `ActiveRunCheckpointJournal` provides optional append-only, hash-chained
+complete checkpoints; it deliberately does not define field-level deltas.
+
+## Known behavior not yet equivalent
+
+No merge-base examples, provider tests, cassettes, or documented features were
+removed. The remaining improvement work tracked by this PR is evidence and
+hardening rather than restoration of a deleted public capability: independent
+policy evaluations currently make deterministic progress in one shared
+schedule but are not executed on multiple worker threads. Worker-thread
+parallelism must not be described as implemented until benchmark evidence
+shows it improves these short, ordered evaluation steps without changing
+rewrite chaining or browser behavior.
+
+## Restored example inventory
+
+`.github/example-inventory.txt` is the CI-enforced merge-base inventory. The
+complete restored root package set is:
+
+`agent_autonomous`, `agent_evaluator_optimizer`, `agent_orchestrator`,
+`agent_parallelization`, `agent_prompt_chaining`, `agent_routing`,
+`agent_run_stepping`, `agent_stream_chat`, `agent_with_agent_tool`,
+`agent_with_approval_policy`, `agent_with_context`,
+`agent_with_default_max_turns`, `agent_with_durable_approval`,
+`agent_with_echochambers`, `agent_with_human_in_the_loop`,
+`agent_with_loaders`, `agent_with_memory_streaming`, `agent_with_memory`,
+`agent_with_tools_otel`, `agent_with_tools`, `agent`, `calculator_chatbot`,
+`chain`, `complex_agentic_loop_claude`, `custom_vector_store`, `debate`,
+`discord_bot`, `enum_dispatch`, `extractor`, `force_tool_first_turn`,
+`gemini_deep_research`, `gemini_default_api_recovery`,
+`gemini_extractor_with_rag`, `gemini_nanobanana_image_generation`,
+`gemini_stream_kill_token_count`, `gemini_video_understanding`,
+`manual_tool_calls`, `multi_agent`, `multi_extract`,
+`multi_turn_agent_extended`, `multi_turn_agent`,
+`openai_agent_completions_api_otel`, `openai_streaming_per_call_usage`,
+`openai_streaming_with_tools_otel`, `pdf_agent`,
+`rag_dynamic_tools_multi_turn`, `rag_dynamic_tools`, `rag_ollama`, `rag`,
+`reasoning_loop`, `request_hook`, `reqwest_middleware`, `rmcp`,
+`sentiment_classifier`, `tool_result_outcomes`, `transcription`,
+`vector_search_cohere`, `vector_search_ollama`, and `vector_search`.
+
+Core-native `ecs_runtime`, `ecs_extension`, and `ecs_async_extension` examples
+additionally demonstrate standalone execution with structured diagnostics,
+embedded-world execution, and typed asynchronous extension effects. The
+feature-to-example map is:
+
+| Runtime feature | Example |
+| --- | --- |
+| targeted lifecycle observation / embedded world | `crates/rig-core/examples/ecs_extension.rs` |
+| structured snapshot diagnostics | `crates/rig-core/examples/ecs_runtime.rs` |
+| typed asynchronous extension effects | `crates/rig-core/examples/ecs_async_extension.rs` |
+| request patch / deterministic ordering | `request_hook` |
+| tool rewrite, skip, result redaction | `agent_with_human_in_the_loop`, `agent_with_approval_policy`, `tool_result_outcomes` |
+| approval / durable approval | `agent_with_human_in_the_loop`, `agent_with_approval_policy`, `agent_with_durable_approval` |
+| invalid repair/retry | `gemini_default_api_recovery` |
+| streaming delta observation/cancellation | `agent_stream_chat`, `gemini_stream_kill_token_count` |
+| checkpoint/resume and all pause modes | `agent_run_stepping`, `agent_with_durable_approval`, `multi_agent` |
+| shared world, sibling progress, child delegation | `multi_agent`, `agent_with_agent_tool` |
+
+## Benchmark matrix
+
+`cargo bench -p rig-core --bench ecs_runtime` measures all required operational
+shapes with deterministic fake effects: no-policy one-shot prompts, one policy
+on one run, 100 policies on one run, one shared policy across 1,000 runs,
+asynchronous approval, 100 concurrent runs on one agent, 100 concurrent runs
+across eight agents, freeze/resume beside an active sibling, dynamic child
+orchestration, 100 plain and policy-steered stream deltas, and a 16-call logical
+tool batch with a policy on every call. Results are machine-specific;
+the final PR verification record captures the exact run used for review rather
+than presenting these smoke timings as stable performance guarantees. The
+2026-07-15 verification run on the PR workstation reported:
+
+| Shape | Result |
+| --- | ---: |
+| no-policy one-shot prompt | 2,026,842.5 ns/op |
+| 100 runs, one agent | 27,394.6 ns/op |
+| 100 runs, eight agents | 27,096.2 ns/op |
+| freeze/resume beside active | 578,854.0 ns/op |
+| dynamic child orchestration | 1,204,625.0 ns/op |
+| 100-policy run | 245,717.1 ns/op |
+| one policy, one run | 2,057,834.0 ns/op |
+| one policy, 1,000 runs | 21,491.4 ns/op |
+| asynchronous approval | 2,514,959.0 ns/op |
+| 1,000 advertised capabilities | 3,020,875.0 ns/op |
+| 100 streaming deltas, no policy | 6,550.8 ns/op |
+| 100 streaming deltas, one policy | 6,552.9 ns/op |
+| 16-call tool batch, policy on each call | 49,520.9 ns/op |

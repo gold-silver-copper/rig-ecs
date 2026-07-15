@@ -1,185 +1,106 @@
-//! Demonstrates the composing hook model with `AgentHook`. Several hooks are
-//! stacked via `.add_hook(…).add_hook(…)` and, crucially, **all of them run** —
-//! a request patch from one hook no longer short-circuits the others:
+//! Compose request steering and observation with ECS policies and observers.
 //!
-//! - `LoggingHook` — observe-only. Registered first so a later terminate could
-//!   never hide events from it. Reads the run-scoped [`HookContext`] (run id,
-//!   turn, streaming flag).
-//! - `ContextHook` — injects an extra context document for the turn via
-//!   `RequestPatch::extra_context` (passive RAG).
-//! - `SamplingHook` — lowers the sampling temperature for the turn via
-//!   `RequestPatch::temperature`.
-//! - `TurnCounterHook` — counts completion calls using the run-scoped
-//!   `HookContext` scratchpad instead of its own interior mutability.
-//!
-//! On each `CompletionCall`, the patches from `ContextHook` and `SamplingHook`
-//! are **merged in registration order** into one effective patch (see the
-//! per-field merge rules on `RequestPatch`), so both take effect on the same
-//! turn — and `TurnCounterHook` still runs afterwards. A typed stop action
-//! short-circuits the stack.
-//!
-//! Requires `OPENAI_API_KEY`.
+//! Two ordered policy entities contribute independent per-operation patches:
+//! one appends context and one changes sampling. Observe-only systems log the
+//! resolved run/agent identity and update typed run-scoped state. Observer
+//! registration order has no steering semantics.
 
 use anyhow::Result;
-use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent, HookContext,
-    ObservationAction, RequestPatch,
+use rig::bevy_ecs::{
+    lifecycle::Add,
+    observer::On,
+    prelude::{Commands, Component, Query},
 };
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{CompletionModel, CompletionResponse, Document, Message, Prompt};
-use rig::message::UserContent;
-use rig::providers::openai;
+use rig::{
+    client::{CompletionClient, ProviderClient},
+    providers::openai,
+    runtime::{
+        CompletionRequestPrepared, CompletionResponseApplied, Policy, PolicyRule, RequestPatch,
+        RetrievedDocument, RigOperationContext, RunRecord, StableId, TenantId,
+    },
+};
 
-// ---------------------------------------------------------------------------
-// Hook 1: LoggingHook — observe-only. Reads run-scoped identity from the context.
-// ---------------------------------------------------------------------------
+#[derive(Component, Default)]
+struct CompletionCallCount(u32);
 
-#[derive(Clone)]
-struct LoggingHook;
-
-impl<M> AgentHook<M> for LoggingHook
-where
-    M: CompletionModel,
-{
-    async fn on_completion_call(
-        &self,
-        ctx: &HookContext,
-        event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        if let Message::User { content } = event.prompt {
-            let prompt_text = content
-                .iter()
-                .filter_map(|c| match c {
-                    UserContent::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !prompt_text.is_empty() {
-                println!(
-                    "[run {} · turn {}] sending prompt: {}",
-                    ctx.run_id(),
-                    ctx.turn(),
-                    prompt_text
-                );
-            }
-        }
-        CompletionCallAction::continue_run()
-    }
-
-    async fn on_completion_response(
-        &self,
-        ctx: &HookContext,
-        event: CompletionResponseEvent<'_, M>,
-    ) -> ObservationAction {
-        let response: &CompletionResponse<M::Response> = event.response;
-        println!(
-            "[run {}] received response: {:?}",
-            ctx.run_id(),
-            response.choice
-        );
-        ObservationAction::continue_run()
-    }
+fn initialize_run_state(event: On<Add, RunRecord>, mut commands: Commands) {
+    commands
+        .entity(event.entity)
+        .insert(CompletionCallCount::default());
 }
 
-// ---------------------------------------------------------------------------
-// Hook 2: ContextHook — injects an extra context document for the turn.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct ContextHook;
-
-impl<M> AgentHook<M> for ContextHook
-where
-    M: CompletionModel,
-{
-    async fn on_completion_call(
-        &self,
-        _ctx: &HookContext,
-        _event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        let doc = Document {
-            id: "style-guide".to_string(),
-            text: "House style: keep jokes short and family-friendly.".to_string(),
-            additional_props: Default::default(),
-        };
-        CompletionCallAction::patch(RequestPatch::new().context(doc))
-    }
+fn observe_request(
+    event: On<CompletionRequestPrepared>,
+    context: RigOperationContext<'_, '_>,
+    mut counters: Query<&mut CompletionCallCount>,
+) {
+    let Some(context) = context.resolve(event.operation) else {
+        return;
+    };
+    let call = counters.get_mut(event.run).map_or(0, |mut counter| {
+        counter.0 = counter.0.saturating_add(1);
+        counter.0
+    });
+    println!(
+        "request run={} turn={} streaming=false agent={:?} policies={}",
+        context.run_id.as_str(),
+        call,
+        context.agent_name,
+        event.policies.len()
+    );
 }
 
-// ---------------------------------------------------------------------------
-// Hook 3: SamplingHook — lowers the temperature for the turn. Its patch MERGES
-// with ContextHook's rather than replacing it.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct SamplingHook;
-
-impl<M> AgentHook<M> for SamplingHook
-where
-    M: CompletionModel,
-{
-    async fn on_completion_call(
-        &self,
-        _ctx: &HookContext,
-        _event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        CompletionCallAction::patch(RequestPatch::new().temperature(0.2))
-    }
+fn observe_response(event: On<CompletionResponseApplied>) {
+    println!(
+        "response run={:?} text_bytes={}",
+        event.run,
+        event.effective.text.len()
+    );
 }
-
-// ---------------------------------------------------------------------------
-// Hook 4: TurnCounterHook — counts completion calls via the shared scratchpad.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Default)]
-struct TurnCount(usize);
-
-#[derive(Clone)]
-struct TurnCounterHook;
-
-impl<M> AgentHook<M> for TurnCounterHook
-where
-    M: CompletionModel,
-{
-    async fn on_completion_call(
-        &self,
-        ctx: &HookContext,
-        _event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        let n = ctx.scratchpad().update(|c: &mut TurnCount| {
-            c.0 += 1;
-            c.0
-        });
-        println!("[turn-counter] completion call #{n} this run");
-        CompletionCallAction::continue_run()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let agent = openai::Client::from_env()?
         .agent(openai::GPT_4O)
-        .preamble("You are a comedian here to entertain the user using humour and jokes.")
+        .name("request-policy-example")
+        .preamble("You are a comedian. Use supplied context and keep the joke family-friendly.")
         .build();
 
-    // Attach four hooks. They run in registration order on every event; the two
-    // request-patch hooks (ContextHook, SamplingHook) both contribute to the
-    // same turn because CompletionCall patches accumulate and merge — neither
-    // short-circuits the other, and TurnCounterHook still runs after them.
-    let response = agent
-        .prompt("Entertain me!")
-        .add_hook(LoggingHook)
-        .add_hook(ContextHook)
-        .add_hook(SamplingHook)
-        .add_hook(TurnCounterHook)
-        .await?;
+    agent.with_runtime_mut(|runtime| {
+        runtime.world_mut().add_observer(initialize_run_state);
+        runtime.world_mut().add_observer(observe_request);
+        runtime.world_mut().add_observer(observe_response);
 
+        runtime.spawn_policy(
+            StableId::new("append-comedy-context")?,
+            TenantId::new("local")?,
+            Policy {
+                order: 0,
+                revision: 1,
+                rule: PolicyRule::PatchRequest(RequestPatch::new().extra_context([
+                    RetrievedDocument {
+                        id: "house-style".to_owned(),
+                        text: "House rule: the punchline must mention a polite penguin.".to_owned(),
+                        metadata: Default::default(),
+                    },
+                ])),
+            },
+            agent.handle(),
+        )?;
+        runtime.spawn_policy(
+            StableId::new("lower-sampling-temperature")?,
+            TenantId::new("local")?,
+            Policy {
+                order: 1,
+                revision: 1,
+                rule: PolicyRule::PatchRequest(RequestPatch::new().temperature(0.2)),
+            },
+            agent.handle(),
+        )?;
+        Ok::<_, anyhow::Error>(())
+    })??;
+
+    let response = agent.prompt("Tell me a short joke.").await?;
     println!("\nFinal response:\n{response}");
-
     Ok(())
 }

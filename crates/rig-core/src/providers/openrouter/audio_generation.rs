@@ -3,7 +3,6 @@ use crate::audio_generation::{
 };
 use crate::http_client::{self, HttpClientExt};
 use crate::providers::openrouter::Client;
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use bytes::Bytes;
 use serde_json::json;
 
@@ -39,13 +38,7 @@ impl<T> AudioGenerationModel<T> {
 
 impl<T> audio_generation::AudioGenerationModel for AudioGenerationModel<T>
 where
-    T: HttpClientExt
-        + Clone
-        + std::fmt::Debug
-        + Default
-        + WasmCompatSend
-        + WasmCompatSync
-        + 'static,
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + Sync + 'static,
 {
     type Response = Bytes;
     type Client = Client<T>;

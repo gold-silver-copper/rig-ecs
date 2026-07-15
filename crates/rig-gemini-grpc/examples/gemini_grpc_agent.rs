@@ -1,4 +1,3 @@
-use rig_core::completion::Prompt;
 use rig_core::prelude::*;
 use rig_gemini_grpc::Client;
 

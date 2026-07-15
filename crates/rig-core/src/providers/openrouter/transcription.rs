@@ -2,7 +2,6 @@ use crate::http_client::HttpClientExt;
 use crate::providers::openrouter::Client;
 use crate::transcription;
 use crate::transcription::TranscriptionError;
-use crate::wasm_compat::WasmCompatSend;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
@@ -120,7 +119,7 @@ fn infer_format_from_filename(filename: &str) -> String {
 
 impl<T> transcription::TranscriptionModel for TranscriptionModel<T>
 where
-    T: HttpClientExt + Clone + std::fmt::Debug + Default + WasmCompatSend + 'static,
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
 {
     type Response = TranscriptionResponse;
     type Client = Client<T>;

@@ -13,4 +13,4 @@ then:
   header:
   - name: content-type
     value: application/json
-  body: '{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Your favorite color is teal, the label is crimson-harbor, and the release lane is canary.","role":"assistant","tool_calls":null}}],"created":0,"id":"chatcmpl-REDACTED_1","model":"mistral-small-latest","object":"chat.completion","usage":{"completion_tokens":25,"prompt_tokens":148,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":173}}'
+  body: '{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Your favorite color is teal, the harbor label is crimson-harbor, and the release lane is canary.","role":"assistant","tool_calls":null}}],"created":0,"id":"chatcmpl-REDACTED_1","model":"mistral-small-latest","object":"chat.completion","usage":{"completion_tokens":26,"prompt_tokens":148,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":174}}'

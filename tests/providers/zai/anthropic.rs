@@ -1,7 +1,6 @@
 //! Z.AI Anthropic-compatible completion smoke test.
 
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::providers::zai;
 
 use crate::support::{BASIC_PREAMBLE, BASIC_PROMPT, assert_nonempty_response};

@@ -1,5 +1,5 @@
-error: a `ToolContext` parameter must have type `&mut ToolContext`
- --> tests/ui/tool_context/fail_immutable_context.rs:8:30
+error: runtime ToolContext parameters were replaced by typed ECS components; attach extension state to the agent, run, policy, or operation instead
+ --> tests/ui/tool_context/fail_immutable_context.rs:7:5
   |
-8 |     #[rig(context)] context: &ToolContext,
-  |                              ^^^^^^^^^^^^
+7 |     #[rig(context)] context: &ToolContext,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

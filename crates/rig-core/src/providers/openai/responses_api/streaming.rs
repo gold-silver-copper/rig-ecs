@@ -8,7 +8,6 @@ use crate::providers::openai::responses_api::{ReasoningSummary, ResponsesUsage};
 use crate::streaming;
 use crate::streaming::RawStreamingChoice;
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder};
-use crate::wasm_compat::WasmCompatSend;
 use async_stream::stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -606,7 +605,7 @@ pub(crate) fn stream_from_event_source<HttpClient, RequestBody>(
 ) -> streaming::StreamingCompletionResponse<StreamingCompletionResponse>
 where
     HttpClient: HttpClientExt + Clone + 'static,
-    RequestBody: Into<bytes::Bytes> + Clone + WasmCompatSend + 'static,
+    RequestBody: Into<bytes::Bytes> + Clone + Send + 'static,
 {
     stream_from_event_source_with_options(event_source, span, ResponsesStreamOptions::strict())
 }
@@ -618,7 +617,7 @@ pub(crate) fn stream_from_event_source_with_options<HttpClient, RequestBody>(
 ) -> streaming::StreamingCompletionResponse<StreamingCompletionResponse>
 where
     HttpClient: HttpClientExt + Clone + 'static,
-    RequestBody: Into<bytes::Bytes> + Clone + WasmCompatSend + 'static,
+    RequestBody: Into<bytes::Bytes> + Clone + Send + 'static,
 {
     let stream = stream! {
         let mut accumulator = RawChoiceAccumulator::new(ResponsesUsage::new());
@@ -851,10 +850,9 @@ pub enum SummaryPartChunkPart {
 
 impl<Ext, H> GenericResponsesCompletionModel<Ext, H>
 where
-    crate::client::Client<Ext, H>:
-        HttpClientExt + Clone + std::fmt::Debug + WasmCompatSend + 'static,
+    crate::client::Client<Ext, H>: HttpClientExt + Clone + std::fmt::Debug + Send + 'static,
     Ext: crate::client::Provider + super::ResponsesProviderExt + Clone + 'static,
-    H: Clone + Default + std::fmt::Debug + WasmCompatSend + 'static,
+    H: Clone + Default + std::fmt::Debug + Send + 'static,
 {
     pub(crate) async fn stream(
         &self,

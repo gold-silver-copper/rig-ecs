@@ -53,14 +53,13 @@ pub use rig_core::memory::{
 
 use rig_core::completion::Message;
 use rig_core::message::UserContent;
-use rig_core::wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync};
 
 /// A transformation applied to messages loaded from a [`ConversationMemory`].
 ///
 /// Policies typically truncate, summarize, or re-order history. They are
 /// pure, fallible message transformers: implementors that cannot fail should
 /// always return `Ok`.
-pub trait MemoryPolicy: WasmCompatSend + WasmCompatSync {
+pub trait MemoryPolicy: Send + Sync {
     /// Transform `messages` into the history that should be returned to the
     /// agent. This is the required method — every policy must implement it.
     fn apply(&self, messages: Vec<Message>) -> Result<Vec<Message>, MemoryError>;
@@ -234,14 +233,14 @@ impl MemoryPolicy for SlidingWindowMemory {
 /// Implementors should pick a counting strategy appropriate for their target
 /// provider (for example, `tiktoken-rs` for OpenAI). Counting must be cheap;
 /// it runs once per message on every memory load.
-pub trait TokenCounter: WasmCompatSend + WasmCompatSync {
+pub trait TokenCounter: Send + Sync {
     /// Approximate the number of tokens contributed by `message`.
     fn count(&self, message: &Message) -> usize;
 }
 
 impl<F> TokenCounter for F
 where
-    F: Fn(&Message) -> usize + WasmCompatSend + WasmCompatSync,
+    F: Fn(&Message) -> usize + Send + Sync,
 {
     fn count(&self, message: &Message) -> usize {
         (self)(message)
@@ -546,7 +545,7 @@ where
     fn load<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Message>, MemoryError>> {
         Box::pin(async move {
             let messages = self.inner.load(conversation_id).await?;
             self.policy.apply(messages)
@@ -557,14 +556,14 @@ where
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
         self.inner.append(conversation_id, messages)
     }
 
     fn clear<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
         self.inner.clear(conversation_id)
     }
 }
@@ -718,7 +717,7 @@ where
     fn load<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Message>, MemoryError>> {
         Box::pin(async move {
             let messages = self.inner.load(conversation_id).await?;
             let (kept, mut demoted) = self.policy.apply_with_demoted(messages)?;
@@ -814,14 +813,14 @@ where
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
         self.inner.append(conversation_id, messages)
     }
 
     fn clear<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move {
             self.inner.clear(conversation_id).await?;
             self.forget(conversation_id);
@@ -1107,7 +1106,7 @@ where
     fn load<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Message>, MemoryError>> {
         Box::pin(async move {
             let messages = self.inner.load(conversation_id).await?;
             let (kept, demoted) = self.policy.apply_with_demoted(messages)?;
@@ -1257,14 +1256,14 @@ where
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
         self.inner.append(conversation_id, messages)
     }
 
     fn clear<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move {
             self.inner.clear(conversation_id).await?;
             self.forget(conversation_id);
@@ -1406,7 +1405,7 @@ impl Compactor for TemplateCompactor {
         _conversation_id: &'a str,
         evicted: &'a [Message],
         carry_over: Option<&'a Self::Artifact>,
-    ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+    ) -> futures::future::BoxFuture<'a, Result<Self::Artifact, MemoryError>> {
         Box::pin(async move {
             let mut buf = String::new();
             buf.push_str(&self.header);
@@ -1914,7 +1913,7 @@ mod tests {
             &'a self,
             conversation_id: &'a str,
             messages: Vec<Message>,
-        ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+        ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
             Box::pin(async move {
                 self.seen
                     .lock()
@@ -2003,7 +2002,7 @@ mod tests {
             &'a self,
             _conversation_id: &'a str,
             _messages: Vec<Message>,
-        ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+        ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
             Box::pin(async move {
                 *self.calls.lock().unwrap() += 1;
                 Err(MemoryError::backend(std::io::Error::other("hook failed")))
@@ -2093,7 +2092,7 @@ mod tests {
             &'a self,
             _conversation_id: &'a str,
             _messages: Vec<Message>,
-        ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+        ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
             let calls = self.calls.clone();
             let rendezvous = self.rendezvous.clone();
             let release = self.release.clone();
@@ -2311,7 +2310,7 @@ mod tests {
                 &'a self,
                 _conversation_id: &'a str,
                 _messages: Vec<Message>,
-            ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+            ) -> futures::future::BoxFuture<'a, Result<(), MemoryError>> {
                 let release = Arc::new(tokio::sync::Notify::new());
                 self.releases.lock().unwrap().push(release.clone());
                 Box::pin(async move {
@@ -2565,7 +2564,7 @@ mod tests {
             _conversation_id: &'a str,
             evicted: &'a [Message],
             _carry_over: Option<&'a Self::Artifact>,
-        ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+        ) -> futures::future::BoxFuture<'a, Result<Self::Artifact, MemoryError>> {
             Box::pin(async move {
                 let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n == 0 {
@@ -2621,7 +2620,7 @@ mod tests {
             _conversation_id: &'a str,
             evicted: &'a [Message],
             carry_over: Option<&'a Self::Artifact>,
-        ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+        ) -> futures::future::BoxFuture<'a, Result<Self::Artifact, MemoryError>> {
             Box::pin(async move {
                 self.log
                     .lock()
@@ -3031,7 +3030,7 @@ mod tests {
                 _conversation_id: &'a str,
                 _evicted: &'a [Message],
                 _carry_over: Option<&'a Self::Artifact>,
-            ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+            ) -> futures::future::BoxFuture<'a, Result<Self::Artifact, MemoryError>> {
                 Box::pin(async move {
                     self.entered.store(true, Ordering::SeqCst);
                     self.release.notified().await;
@@ -3095,7 +3094,7 @@ mod tests {
                 _conversation_id: &'a str,
                 _evicted: &'a [Message],
                 _carry_over: Option<&'a Self::Artifact>,
-            ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+            ) -> futures::future::BoxFuture<'a, Result<Self::Artifact, MemoryError>> {
                 Box::pin(async move {
                     self.entered.fetch_add(1, Ordering::SeqCst);
                     self.release.notified().await;
@@ -3167,7 +3166,7 @@ mod tests {
                 _conversation_id: &'a str,
                 _evicted: &'a [Message],
                 _carry_over: Option<&'a Self::Artifact>,
-            ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+            ) -> futures::future::BoxFuture<'a, Result<Self::Artifact, MemoryError>> {
                 Box::pin(async move {
                     self.entered.fetch_add(1, Ordering::SeqCst);
                     self.rendezvous.notify_one();

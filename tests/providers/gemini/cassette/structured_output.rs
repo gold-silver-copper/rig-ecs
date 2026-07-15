@@ -1,7 +1,6 @@
 //! Gemini structured output smoke test.
 
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 
 use super::super::support::with_gemini_cassette;
 use crate::support::{

@@ -165,7 +165,7 @@ where
                     let embeddings = response
                         .data
                         .into_iter()
-                        .zip(documents.into_iter())
+                        .zip(documents)
                         .map(|(embedding, document)| embeddings::Embedding {
                             document,
                             vec: embedding

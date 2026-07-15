@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"operation":"multiply","x":6,"y":7},"name":"macro_calculator"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":25,"promptTokenCount":103,"promptTokensDetails":[{"modality":"TEXT","tokenCount":103}],"serviceTier":"standard","thoughtsTokenCount":54,"totalTokenCount":182}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"operation":"multiply","x":6,"y":7},"name":"macro_calculator"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":25,"promptTokenCount":103,"promptTokensDetails":[{"modality":"TEXT","tokenCount":103}],"serviceTier":"standard","thoughtsTokenCount":62,"totalTokenCount":190}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent

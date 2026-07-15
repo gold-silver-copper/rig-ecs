@@ -3,7 +3,7 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rig::OneOrMany;
 use rig::client::CompletionClient;
-use rig::completion::{Chat, Prompt};
+use rig::completion::Chat;
 use rig::message::{
     Document, DocumentMediaType, DocumentSourceKind, Message as RigMessage, Text,
     UserContent as RigUserContent,

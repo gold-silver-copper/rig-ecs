@@ -1,7 +1,7 @@
 //! llama.cpp structured output coverage, including the migrated example path.
 
 use rig::client::CompletionClient;
-use rig::completion::{Prompt, TypedPrompt};
+use rig::completion::TypedPrompt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -94,15 +94,13 @@ async fn prompt_typed_extended_details_structured_output() {
         .temperature(0.0)
         .build();
 
-    let extended = agent
+    let forecast = agent
         .prompt_typed::<WeatherForecast>(
             "Return JSON weather data for Los Angeles with fields city, current.temperature_f, current.humidity_pct, and current.description.",
         )
-        .extended_details()
         .await
-        .expect("extended prompt_typed should succeed");
-    assert_weather_forecast(&extended.output, &["los angeles", "la"]);
-    assert!(extended.usage.total_tokens > 0, "usage should be populated");
+        .expect("typed prompt should succeed");
+    assert_weather_forecast(&forecast, &["los angeles", "la"]);
 }
 
 #[tokio::test]

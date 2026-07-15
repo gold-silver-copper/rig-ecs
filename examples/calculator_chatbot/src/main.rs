@@ -3,10 +3,8 @@ use rig::integrations::cli_chatbot::ChatBotBuilder;
 use rig::prelude::*;
 use rig::providers::openai;
 use rig::{
-    embeddings::EmbeddingsBuilder,
     providers::openai::Client,
-    tool::{Tool, ToolEmbedding, ToolSet},
-    vector_store::in_memory_store::InMemoryVectorStore,
+    tool::{Tool, ToolEmbedding},
 };
 
 use serde::{Deserialize, Serialize};
@@ -56,11 +54,7 @@ impl Tool for Add {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x + args.y;
         Ok(result)
     }
@@ -112,11 +106,7 @@ impl Tool for Subtract {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x - args.y;
         Ok(result)
     }
@@ -167,11 +157,7 @@ impl Tool for Multiply {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x * args.y;
         Ok(result)
     }
@@ -217,11 +203,7 @@ impl Tool for Divide {
             "required": [ "x", "y" ]
         })
     }
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x / args.y;
         Ok(result)
     }
@@ -248,24 +230,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
     let openai_client = Client::from_env()?;
 
-    // Create dynamic tools embeddings
-    let toolset = ToolSet::builder()
-        .retrieved_tool(Add)
-        .retrieved_tool(Subtract)
-        .retrieved_tool(Multiply)
-        .retrieved_tool(Divide)
-        .build();
-    let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
-    let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
-        .documents(toolset.schemas()?)?
-        .build()
-        .await?;
-
-    let vector_store =
-        InMemoryVectorStore::from_documents_with_id_f(embeddings, |tool| tool.name.clone());
-    let index = vector_store.index(embedding_model);
-
-    // Create RAG agent with a single context prompt and a dynamic tool source
+    // Install executable capabilities as ECS entities.
     let calculator_rag = openai_client
         .agent(openai::GPT_4)
         .preamble(
@@ -280,9 +245,10 @@ async fn main() -> Result<(), anyhow::Error> {
             Inputs: <list of inputs>
             "
         )
-        // Add a dynamic tool source with a sample rate of 1 (i.e.: only
-        // 1 additional tool will be added to prompts)
-        .retrieved_tools(4, index, toolset)
+        .tool(Add)
+        .tool(Subtract)
+        .tool(Multiply)
+        .tool(Divide)
         .build();
 
     // Create a CLI chatbot from the agent

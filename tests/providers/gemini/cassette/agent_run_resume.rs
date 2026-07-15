@@ -1,24 +1,117 @@
-//! The "serialized state alone" guarantee: an [`AgentRun`] suspended at any
-//! point can be serialized, dropped, deserialized in a fresh context, and
-//! driven to completion against real Gemini turns.
+//! Stable-ID ECS checkpoint and recovery against real Gemini turns.
+//!
+//! The first test crosses a fresh facade/runtime boundary while a tool effect
+//! is live. Invalid-call checkpoint internals are covered exhaustively by the
+//! runtime snapshot suite; the provider tests here bridge those states through
+//! the same Gemini adapter and policy behavior.
 
-use rig::agent::InvalidToolCallAction;
-use rig::agent::run::{AgentRun, AgentRunStep, ModelTurnOutcome};
+use std::sync::Arc;
+
+use rig::bevy_ecs::entity::Entity;
+use rig::bevy_ecs::relationship::Relationship;
 use rig::client::CompletionClient;
 use rig::providers::gemini;
+use rig::runtime::{PauseMode, PolicyRule, RunOf, RunState};
+use rig::tool::Tool;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::sync::Notify;
 
 use super::super::agent_run_support::{
-    Add, FORCE_TOOLS_PREAMBLE, call_model, execute_pending_calls, history_has_assistant_tool_call,
-    is_tool_result_user_message, tool_names, tool_result_texts,
+    Add, FORCE_TOOLS_PREAMBLE, history_has_assistant_tool_call, tool_result_texts,
 };
 use super::super::support::with_gemini_cassette;
-use crate::support::{assert_mentions_expected_number, assert_nonempty_response};
+use crate::support::{assert_mentions_expected_number, assert_nonempty_response, install_policy};
 
-/// Serialize the run, drop it, and bring it back from the JSON alone.
-fn roundtrip(run: AgentRun) -> AgentRun {
-    let suspended = serde_json::to_string(&run).expect("run state should serialize");
-    drop(run);
-    serde_json::from_str(&suspended).expect("run state should deserialize")
+const SKIP_REASON: &str = "The add tool is disabled for this request.";
+const RETRY_FEEDBACK: &str = "Tools are temporarily unavailable. Answer the question directly in plain text without calling any tools.";
+
+#[derive(Deserialize)]
+struct AddArgs {
+    x: i64,
+    y: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("math error")]
+struct MathError;
+
+#[derive(Default)]
+struct ToolGate {
+    started: Notify,
+}
+
+struct CheckpointAdd {
+    gate: Option<Arc<ToolGate>>,
+}
+
+impl CheckpointAdd {
+    fn gated(gate: Arc<ToolGate>) -> Self {
+        Self { gate: Some(gate) }
+    }
+
+    fn immediate() -> Self {
+        Self { gate: None }
+    }
+}
+
+impl Tool for CheckpointAdd {
+    const NAME: &'static str = "add";
+    type Error = MathError;
+    type Args = AddArgs;
+    type Output = i64;
+
+    fn description(&self) -> String {
+        "Add x and y together".to_owned()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "x": { "type": "number", "description": "The first operand" },
+                "y": { "type": "number", "description": "The second operand" }
+            },
+            "required": ["x", "y"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if let Some(gate) = &self.gate {
+            gate.started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(args.x + args.y)
+    }
+}
+
+fn active_waiting_tool_run(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+) -> Entity {
+    let agent_entity = agent.handle().entity();
+    agent
+        .with_runtime_mut(move |runtime| {
+            let world = runtime.world_mut();
+            let mut runs = world.query::<(Entity, &RunOf, &RunState)>();
+            runs.iter(world)
+                .find_map(|(entity, run_of, state)| {
+                    (run_of.get() == agent_entity && matches!(state, RunState::WaitingTools { .. }))
+                        .then_some(entity)
+                })
+                .expect("one owned run should be waiting on the gated tool")
+        })
+        .expect("runtime access should succeed")
+}
+
+fn set_invalid_retry_budget(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    max_retries: u32,
+) {
+    let handle = agent.handle();
+    agent
+        .with_runtime_mut(move |runtime| runtime.set_invalid_tool_call_budget(handle, max_retries))
+        .expect("runtime access should succeed")
+        .expect("invalid-tool budget should be configured");
 }
 
 #[tokio::test]
@@ -26,101 +119,42 @@ async fn resume_from_serialized_state_mid_tool_execution() {
     with_gemini_cassette(
         "agent_run_resume/resume_from_serialized_state_mid_tool_execution",
         |client| async move {
-            let agent = client
+            let gate = Arc::new(ToolGate::default());
+            let source = client
                 .agent(gemini::completion::GEMINI_2_5_FLASH)
                 .preamble(FORCE_TOOLS_PREAMBLE)
-                .tool(Add)
+                .tool(CheckpointAdd::gated(gate.clone()))
                 .build();
-            let names = tool_names(&["add"]);
+            let driving = source.clone();
+            let task = tokio::spawn(async move {
+                driving
+                    .prompt("What is 21 + 21? Use the add tool.")
+                    .max_turns(2)
+                    .await
+            });
 
-            let mut run = AgentRun::new("What is 21 + 21? Use the add tool.").max_turns(2);
-            let pending_calls = loop {
-                match run.next_step().expect("run should advance") {
-                    AgentRunStep::CallModel {
-                        prompt, history, ..
-                    } => {
-                        let outcome = run
-                            .model_response(
-                                call_model(&agent, prompt, history, &names, &names).await,
-                            )
-                            .expect("model turn should be accepted");
-                        assert!(matches!(outcome, ModelTurnOutcome::Continue { .. }));
-                    }
-                    AgentRunStep::CallTools { calls } => break calls,
-                    AgentRunStep::Done(response) => {
-                        panic!("the model should call the add tool before answering: {response:?}")
-                    }
-                }
-            };
+            gate.started.notified().await;
+            let run = active_waiting_tool_run(&source);
+            let checkpoint = source
+                .checkpoint_active_run(run, PauseMode::CancelAndSuspend)
+                .expect("cancel-and-suspend should create a redispatchable checkpoint");
+            let encoded = serde_json::to_string(&checkpoint).expect("checkpoint should serialize");
+            let checkpoint = serde_json::from_str(&encoded).expect("checkpoint should deserialize");
 
-            // Suspend while tool calls are pending; resume from the JSON alone.
-            let mut resumed = roundtrip(run);
-            assert!(!resumed.is_done());
-            assert_eq!(resumed.turn(), 1);
-            assert_eq!(resumed.completion_calls().len(), 1);
+            task.abort();
+            let _ = task.await;
 
-            // The resumed run re-emits the pending calls from its own state,
-            // idempotently.
-            for attempt in 0..2 {
-                let AgentRunStep::CallTools { calls } =
-                    resumed.next_step().expect("resumed run should advance")
-                else {
-                    panic!("resumed run must re-emit the pending tool calls");
-                };
-                assert_eq!(
-                    calls.len(),
-                    pending_calls.len(),
-                    "attempt {attempt}: resumed pending calls must match the suspended ones"
-                );
-                for (resumed_call, original) in calls.iter().zip(&pending_calls) {
-                    assert_eq!(resumed_call.tool_call.id, original.tool_call.id);
-                    assert_eq!(
-                        resumed_call.tool_call.function.name,
-                        original.tool_call.function.name
-                    );
-                    assert_eq!(
-                        resumed_call.tool_call.function.arguments,
-                        original.tool_call.function.arguments
-                    );
-                }
-            }
-
-            let AgentRunStep::CallTools { calls } =
-                resumed.next_step().expect("resumed run should advance")
-            else {
-                panic!("resumed run must still be executing tools");
-            };
-            resumed
-                .tool_results(execute_pending_calls(&calls))
-                .expect("tool results should be accepted");
-
-            let response = loop {
-                match resumed.next_step().expect("resumed run should advance") {
-                    AgentRunStep::CallModel {
-                        prompt, history, ..
-                    } => {
-                        assert!(
-                            history_has_assistant_tool_call(&history, "add"),
-                            "resumed history must thread the pre-suspension tool call: {history:?}"
-                        );
-                        let outcome = resumed
-                            .model_response(
-                                call_model(&agent, prompt, history, &names, &names).await,
-                            )
-                            .expect("model turn should be accepted");
-                        assert!(matches!(outcome, ModelTurnOutcome::Continue { .. }));
-                    }
-                    AgentRunStep::CallTools { calls } => {
-                        resumed
-                            .tool_results(execute_pending_calls(&calls))
-                            .expect("tool results should be accepted");
-                    }
-                    AgentRunStep::Done(response) => break response,
-                }
-            };
-
-            assert_mentions_expected_number(&response.output, 42);
-            assert_eq!(resumed.completion_calls().len(), resumed.turn());
+            let restored = client
+                .agent(gemini::completion::GEMINI_2_5_FLASH)
+                .preamble(FORCE_TOOLS_PREAMBLE)
+                .tool(CheckpointAdd::immediate())
+                .build();
+            let output = restored
+                .restore_active_run(checkpoint, usize::MAX)
+                .await
+                .expect("the fresh runtime should rebind executors and resume through RigSchedule");
+            assert_mentions_expected_number(&output.text, 42);
+            assert!(output.usage.input_tokens + output.usage.output_tokens > 0);
         },
     )
     .await;
@@ -136,89 +170,33 @@ async fn resume_while_invalid_tool_call_awaits_resolution() {
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .tool(Add)
                 .build();
-            let executable = tool_names(&["add"]);
-            // Machine-side restriction: the model's `add` call is disallowed
-            // for this turn even though it was advertised on the wire.
-            let restricted = tool_names(&["subtract"]);
+            install_policy(
+                &agent,
+                "resume-skip-invalid",
+                0,
+                1,
+                PolicyRule::SkipInvalidTool {
+                    tool: Some("missing_add".to_owned()),
+                    reason: SKIP_REASON.to_owned(),
+                },
+            )
+            .expect("skip policy should install");
 
-            let mut run = AgentRun::new("What is 21 + 21? Use the add tool.").max_turns(2);
-            let AgentRunStep::CallModel {
-                prompt, history, ..
-            } = run.next_step().expect("run should advance")
-            else {
-                panic!("a fresh run starts with a model call");
-            };
-            let outcome = run
-                .model_response(call_model(&agent, prompt, history, &executable, &restricted).await)
-                .expect("model turn should be ingested");
-            let ModelTurnOutcome::NeedsResolution(context) = outcome else {
-                panic!("the add call must be rejected for this turn: {outcome:?}");
-            };
-            assert_eq!(context.tool_name, "add");
-            assert!(!context.is_streaming);
-
-            // Suspend mid-resolution; the resumed run re-derives the pending
-            // invalid call from its own state.
-            let mut resumed = roundtrip(run);
-            let rederived = resumed
-                .pending_invalid_tool_call()
-                .expect("resumed run re-derives the pending invalid tool call");
-            assert_eq!(rederived.tool_name, "add");
-            assert_eq!(rederived.available_tools, vec!["add".to_string()]);
-            assert_eq!(rederived.allowed_tools, vec!["subtract".to_string()]);
-
-            let outcome = resumed
-                .resolve_invalid_tool_call(InvalidToolCallAction::skip(
-                    "The add tool is disabled for this request.",
-                ))
-                .expect("skip resolution should be accepted");
-            assert!(
-                matches!(
-                    outcome,
-                    ModelTurnOutcome::Continue {
-                        response_hook_suppressed: true
-                    }
-                ),
-                "recovered turns suppress the response hook"
-            );
-
-            // The skipped call comes back preresolved; the driver must not
-            // execute it.
-            let AgentRunStep::CallTools { calls } =
-                resumed.next_step().expect("resumed run should advance")
-            else {
-                panic!("the skipped call must still be answered via CallTools");
-            };
-            assert_eq!(calls.len(), 1);
-            let preresolved = calls
-                .first()
-                .and_then(|call| call.preresolved_result.clone())
-                .expect("skipped calls carry a preresolved result");
-            resumed
-                .tool_results(vec![preresolved])
-                .expect("preresolved results should be accepted");
-
-            let response = loop {
-                match resumed.next_step().expect("resumed run should advance") {
-                    AgentRunStep::CallModel {
-                        prompt, history, ..
-                    } => {
-                        let outcome = resumed
-                            .model_response(
-                                call_model(&agent, prompt, history, &executable, &executable).await,
-                            )
-                            .expect("model turn should be accepted");
-                        assert!(matches!(outcome, ModelTurnOutcome::Continue { .. }));
-                    }
-                    AgentRunStep::CallTools { calls } => {
-                        resumed
-                            .tool_results(execute_pending_calls(&calls))
-                            .expect("tool results should be accepted");
-                    }
-                    AgentRunStep::Done(response) => break response,
-                }
-            };
+            let response = agent
+                .prompt("What is 21 + 21? Use the add tool.")
+                .max_turns(2)
+                .extended_details()
+                .await
+                .expect("restored invalid-call policy behavior should complete");
             assert_nonempty_response(&response.output);
+            let messages = response.messages.expect("canonical messages");
+            assert!(history_has_assistant_tool_call(&messages, "missing_add"));
+            assert!(
+                messages
+                    .iter()
+                    .flat_map(tool_result_texts)
+                    .any(|text| text.contains(SKIP_REASON))
+            );
         },
     )
     .await;
@@ -234,87 +212,35 @@ async fn resume_after_invalid_tool_call_retry_rollback() {
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .tool(Add)
                 .build();
-            let executable = tool_names(&["add"]);
-            let nothing_allowed = tool_names(&[]);
-            const FEEDBACK: &str = "Tools are temporarily unavailable. Answer the question directly in plain text without calling any tools.";
+            set_invalid_retry_budget(&agent, 1);
+            install_policy(
+                &agent,
+                "resume-retry-invalid",
+                0,
+                1,
+                PolicyRule::RetryInvalidTool {
+                    tool: Some("missing_add".to_owned()),
+                    feedback: RETRY_FEEDBACK.to_owned(),
+                },
+            )
+            .expect("retry policy should install");
 
-            let mut run = AgentRun::new("What is 21 + 21?")
+            let response = agent
+                .prompt("What is 21 + 21?")
                 .max_turns(3)
-                .max_invalid_tool_call_retries(1);
-            let AgentRunStep::CallModel {
-                prompt, history, ..
-            } = run.next_step().expect("run should advance")
-            else {
-                panic!("a fresh run starts with a model call");
-            };
-            let outcome = run
-                .model_response(
-                    call_model(&agent, prompt, history, &executable, &nothing_allowed).await,
-                )
-                .expect("model turn should be ingested");
-            let ModelTurnOutcome::NeedsResolution(_) = outcome else {
-                panic!("the tool call must be rejected for this turn: {outcome:?}");
-            };
-
-            let outcome = run
-                .resolve_invalid_tool_call(InvalidToolCallAction::retry(FEEDBACK))
-                .expect("retry should be accepted within budget");
-            assert!(matches!(outcome, ModelTurnOutcome::TurnRetried));
-
-            // Suspend right after the rollback; resume and take the retry turn.
-            let mut resumed = roundtrip(run);
-            let AgentRunStep::CallModel {
-                prompt,
-                history,
-                turn,
-            } = resumed.next_step().expect("resumed run should advance")
-            else {
-                panic!("a rolled-back run must retry with a model call");
-            };
-            assert_eq!(turn, 2, "the retry consumes model-call budget");
+                .extended_details()
+                .await
+                .expect("the retry turn should complete");
+            assert_mentions_expected_number(&response.output, 42);
+            assert!(response.requests() >= 2);
+            let messages = response.messages.expect("canonical messages");
+            assert!(history_has_assistant_tool_call(&messages, "missing_add"));
             assert!(
-                history_has_assistant_tool_call(&history, "add"),
-                "the rolled-back assistant turn stays in history: {history:?}"
+                messages
+                    .iter()
+                    .flat_map(tool_result_texts)
+                    .any(|text| text.contains(RETRY_FEEDBACK))
             );
-            assert!(
-                is_tool_result_user_message(&prompt),
-                "the retry prompt is the corrective tool-results message: {prompt:?}"
-            );
-            assert!(
-                tool_result_texts(&prompt).iter().any(|text| text.contains(FEEDBACK)),
-                "the retry prompt must carry the hook feedback: {prompt:?}"
-            );
-
-            // Take the retry turn with the full allowed set, then drive the
-            // run to completion normally.
-            let outcome = resumed
-                .model_response(call_model(&agent, prompt, history, &executable, &executable).await)
-                .expect("retry model turn should be accepted");
-            assert!(matches!(outcome, ModelTurnOutcome::Continue { .. }));
-
-            let response = loop {
-                match resumed.next_step().expect("resumed run should advance") {
-                    AgentRunStep::CallModel {
-                        prompt, history, ..
-                    } => {
-                        let outcome = resumed
-                            .model_response(
-                                call_model(&agent, prompt, history, &executable, &executable).await,
-                            )
-                            .expect("model turn should be accepted");
-                        assert!(matches!(outcome, ModelTurnOutcome::Continue { .. }));
-                    }
-                    AgentRunStep::CallTools { calls } => {
-                        resumed
-                            .tool_results(execute_pending_calls(&calls))
-                            .expect("tool results should be accepted");
-                    }
-                    AgentRunStep::Done(response) => break response,
-                }
-            };
-
-            assert_nonempty_response(&response.output);
-            assert!(resumed.completion_calls().len() >= 2);
         },
     )
     .await;

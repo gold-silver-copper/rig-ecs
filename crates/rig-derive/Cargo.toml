@@ -23,6 +23,7 @@ proc-macro = true
 
 [dev-dependencies]
 anyhow = { workspace = true }
+bevy_ecs = { workspace = true }
 rig-core = { path = "../rig-core" }
 schemars = { workspace = true }
 serde = { workspace = true }

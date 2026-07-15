@@ -1,19 +1,142 @@
-//! Hook-system stress suite: the tool-execution lifecycle — chained
-//! `ToolCallAction::Rewrite`, chained `ToolResultAction::Rewrite` (redact / wrap / truncate),
-//! `Terminate` from a `ToolResult` (post-execution), and model-driven recovery
+//! ECS policy stress suite: the tool-execution lifecycle — chained
+//! argument rewrites, chained result rewrites (redact / wrap / truncate),
+//! stopping from a tool result (post-execution), and model-driven recovery
 //! from a tool error. Recorded against real Gemini.
 
+use rig::bevy_ecs::prelude::{In, On, Query};
 use rig::client::CompletionClient;
-use rig::completion::{Prompt, PromptError};
 use rig::providers::gemini;
+use rig::runtime::{
+    PolicyPoint, PolicyResponderId, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation,
+    ToolCallPrepared, ToolEffectInput, ToolResultPolicyDecision, ToolResultPolicyInvocation,
+    ToolResultPresentationFinalized,
+};
+use rig::tool::Tool;
 use serde_json::json;
 
-use super::super::hook_stress_support::{
-    ResultRewrite, RewriteToolResult, SetArg, TerminateOnResult,
-};
 use super::super::support::with_gemini_cassette;
 use super::super::tools_support::{CodewordLookup, CountingAdd, MottoTool, ToolEventRecorder};
-use crate::support::assert_nonempty_response;
+use crate::support::{assert_nonempty_response, install_policy};
+
+pub(super) fn install_arg_patch(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    id: &str,
+    order: u32,
+    key: &'static str,
+    value: serde_json::Value,
+) {
+    let policy = install_policy(
+        agent,
+        id,
+        order,
+        1,
+        PolicyRule::Custom(PolicyPoint::ToolCall),
+    )
+    .expect("argument policy should install");
+    agent
+        .with_runtime_mut(move |runtime| {
+            runtime
+                .register_tool_call_policy_responder(
+                    policy,
+                    PolicyResponderId::new(id).unwrap(),
+                    move |In(event): In<ToolCallPolicyInvocation>| {
+                        if event.call.decision.name != CountingAdd::NAME {
+                            return Some(ToolCallPolicyDecision::Run);
+                        }
+                        let mut arguments = event.call.arguments.clone();
+                        arguments
+                            .as_object_mut()
+                            .expect("add arguments should be an object")
+                            .insert(key.to_owned(), value.clone());
+                        Some(ToolCallPolicyDecision::Rewrite(arguments))
+                    },
+                )
+                .expect("argument responder should register");
+        })
+        .expect("argument observer should install");
+}
+
+fn install_result_transform(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    id: &str,
+    order: u32,
+    tool: &'static str,
+    transform: impl Fn(&str) -> String + Send + Sync + 'static,
+) {
+    let policy = install_policy(
+        agent,
+        id,
+        order,
+        1,
+        PolicyRule::Custom(PolicyPoint::ToolResult),
+    )
+    .expect("result policy should install");
+    agent
+        .with_runtime_mut(move |runtime| {
+            runtime
+                .register_tool_result_policy_responder(
+                    policy,
+                    PolicyResponderId::new(id).unwrap(),
+                    move |In(event): In<ToolResultPolicyInvocation>| {
+                        Some(if event.result.name == tool {
+                            ToolResultPolicyDecision::Rewrite(
+                                transform(&event.result.presentation.render()).into(),
+                            )
+                        } else {
+                            ToolResultPolicyDecision::Keep
+                        })
+                    },
+                )
+                .expect("result responder should register");
+        })
+        .expect("result observer should install");
+}
+
+pub(super) fn install_recorder(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    recorder: ToolEventRecorder,
+) {
+    let call_recorder = recorder.clone();
+    agent
+        .with_runtime_mut(move |runtime| {
+            runtime
+                .world_mut()
+                .add_observer(move |event: On<ToolCallPrepared>| {
+                    call_recorder
+                        .calls
+                        .lock()
+                        .expect("calls lock should not be poisoned")
+                        .push((
+                            event.call.decision.name.clone(),
+                            event.call.arguments.to_string(),
+                        ));
+                });
+            runtime.world_mut().add_observer(
+                move |event: On<ToolResultPresentationFinalized>,
+                      inputs: Query<&ToolEffectInput>| {
+                    let arguments = recorder
+                        .calls
+                        .lock()
+                        .expect("calls lock should not be poisoned")
+                        .last()
+                        .map_or_else(String::new, |(_, arguments)| arguments.clone());
+                    let input = inputs
+                        .get(event.operation)
+                        .expect("finalized tool operation should retain its immutable input");
+                    recorder
+                        .results
+                        .lock()
+                        .expect("results lock should not be poisoned")
+                        .push((
+                            input.decision.name.clone(),
+                            arguments,
+                            event.presentation.clone(),
+                        ));
+                },
+            );
+        })
+        .expect("recorder observers should install");
+}
 
 // ---------------------------------------------------------------------------
 // Argument rewriting.
@@ -37,16 +160,12 @@ async fn arg_rewrite_sets_one_key_preserving_rest_blocking() {
                 .tool(add)
                 .build();
 
+            install_arg_patch(&agent, "force-x", 0, "x", json!(100));
+            install_recorder(&agent, recorder);
+
             let response = agent
                 .prompt("Use the add tool to add 3 and 4, then report the tool's result.")
                 .max_turns(4)
-                // Force x = 100 but leave y untouched, then observe.
-                .add_hook(SetArg {
-                    tool: "add",
-                    key: "x",
-                    value: json!(100),
-                })
-                .add_hook(recorder)
                 .await
                 .expect("single-key arg rewrite run should succeed");
 
@@ -65,7 +184,6 @@ async fn arg_rewrite_sets_one_key_preserving_rest_blocking() {
     )
     .await;
 }
-
 #[tokio::test]
 async fn two_arg_rewrites_chain_blocking() {
     let add = CountingAdd::default();
@@ -83,22 +201,13 @@ async fn two_arg_rewrites_chain_blocking() {
                 .tool(add)
                 .build();
 
+            install_arg_patch(&agent, "force-x", 0, "x", json!(7));
+            install_arg_patch(&agent, "force-y", 1, "y", json!(8));
+            install_recorder(&agent, recorder);
+
             let response = agent
                 .prompt("Use the add tool to add 1 and 1, then report the tool's result.")
                 .max_turns(4)
-                // Two rewriters chain: the second sees the first's output and adds
-                // its own key, so the tool executes against {x:7, y:8}.
-                .add_hook(SetArg {
-                    tool: "add",
-                    key: "x",
-                    value: json!(7),
-                })
-                .add_hook(SetArg {
-                    tool: "add",
-                    key: "y",
-                    value: json!(8),
-                })
-                .add_hook(recorder)
                 .await
                 .expect("chained arg rewrite run should succeed");
 
@@ -113,9 +222,10 @@ async fn two_arg_rewrites_chain_blocking() {
                 "both chained rewrites must compose"
             );
             let results = recorder_probe.recorded_results();
-            assert_eq!(
-                results[0].2, "15",
-                "the tool executed against the composed args"
+            assert_eq!(results[0].2, "<typed tool output: 1 parts>");
+            assert!(
+                response.contains("15"),
+                "the composed result reached Gemini"
             );
         },
     )
@@ -144,21 +254,24 @@ async fn two_result_rewrites_chain_redact_then_wrap_blocking() {
                 .tool(add)
                 .build();
 
+            install_policy(
+                &agent,
+                "redact-result",
+                0,
+                1,
+                PolicyRule::RewriteToolResult {
+                    tool: Some("add".to_owned()),
+                    presentation: "SECRET".into(),
+                },
+            )
+            .expect("redaction policy should install");
+            install_result_transform(&agent, "wrap-result", 1, "add", |value| {
+                format!("[{value}]")
+            });
+
             let response = agent
                 .prompt("Use the add tool to add 2 and 2, then report the exact tool result.")
                 .max_turns(4)
-                // Redact -> wrap: the model sees "[SECRET]".
-                .add_hook(RewriteToolResult {
-                    tool: "add",
-                    rewrite: ResultRewrite::Replace("SECRET"),
-                })
-                .add_hook(RewriteToolResult {
-                    tool: "add",
-                    rewrite: ResultRewrite::Wrap {
-                        prefix: "[",
-                        suffix: "]",
-                    },
-                })
                 .await
                 .expect("chained result rewrite run should succeed");
 
@@ -190,15 +303,15 @@ async fn result_truncation_reaches_model_blocking() {
                 .tool(MottoTool)
                 .build();
 
+            install_result_transform(&agent, "truncate-result", 0, "fetch_motto", |value| {
+                value.chars().take(6).collect()
+            });
+
             // The motto is "steady hands\ncalm waters"; truncate to its first 6
             // chars ("steady") before the model sees it.
             let response = agent
                 .prompt("Call fetch_motto and report exactly what it returns.")
                 .max_turns(4)
-                .add_hook(RewriteToolResult {
-                    tool: "fetch_motto",
-                    rewrite: ResultRewrite::Truncate(6),
-                })
                 .await
                 .expect("result truncation run should succeed");
 
@@ -235,30 +348,33 @@ async fn terminate_from_tool_result_cancels_after_execution_blocking() {
                 .tool(add)
                 .build();
 
+            install_policy(
+                &agent,
+                "veto-add-result",
+                0,
+                1,
+                PolicyRule::StopToolResult {
+                    tool: Some("add".to_owned()),
+                    reason: "result vetoed by policy hook".to_owned(),
+                },
+            )
+            .expect("result stop policy should install");
+
             let error = agent
                 .prompt("Use the add tool to add 21 and 21, then report the result.")
                 .max_turns(4)
-                // Unlike a ToolCall terminate, the tool body DOES run first; the
-                // hook then vetoes the run when it sees the result.
-                .add_hook(TerminateOnResult {
-                    tool: "add",
-                    reason: "result vetoed by policy hook",
-                })
                 .await
-                .expect_err("a ToolResult terminate should cancel the run");
+                .expect_err("a tool-result stop should fail the run");
 
             // The tool executed before the terminate fired.
             assert!(
                 add_calls.count() >= 1,
                 "the tool body must have run before the ToolResult terminate"
             );
-            match &error {
-                PromptError::PromptCancelled { reason, .. } => assert_eq!(
-                    reason, "result vetoed by policy hook",
-                    "the cancellation must carry the hook reason verbatim"
-                ),
-                other => panic!("expected PromptCancelled, got {other:?}"),
-            }
+            assert!(
+                error.to_string().contains("veto-add-result"),
+                "policy denial should identify the stopping policy: {error:?}"
+            );
         },
     )
     .await;

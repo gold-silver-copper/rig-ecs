@@ -1,261 +1,296 @@
-//! Human-in-the-loop (HITL) tool-call approval with `AgentHook`.
+//! Interactive human-in-the-loop control for every ECS tool call.
 //!
-//! An agent is given two side-effecting tools (`send_email`, `delete_file`).
-//! Before *any* tool runs, an [`ApprovalHook`] pauses the run on the
-//! [`ToolCallEvent`] event, shows the human the tool name and arguments,
-//! and waits for a decision on stdin. Each decision maps to an existing
-//! event-specific action — no special HITL machinery is required:
-//!
-//! | Human decision | Action returned                  | Effect                                                              |
-//! |----------------|----------------------------------|--------------------------------------------------------------------|
-//! | **approve**    | [`ToolCallAction::run`]          | the tool executes as the model requested                           |
-//! | **deny**       | [`ToolCallAction::skip`]         | the tool does *not* run; the reason becomes the tool result the model sees, so it can adapt |
-//! | **edit**       | [`ToolCallAction::rewrite`]      | the tool executes with human-supplied arguments instead            |
-//! | **abort**      | [`ToolCallAction::stop`]         | the whole run stops and surfaces the reason as an error            |
-//!
-//! Because `AgentHook::on_tool_call` is `async`, the hook can simply `.await` the
-//! human's input inline (here from stdin; in a real app this might be an HTTP
-//! request to an approval UI, a Slack round-trip, or a database poll). The same
-//! hook works unchanged on the streaming driver (`stream_prompt`).
-//!
-//! Requires `OPENAI_API_KEY`. Run with: `cargo run -p agent_with_human_in_the_loop`
+//! An ordered approval policy first suspends the call on an external operation.
+//! The host reads stdin while holding no ECS borrow, stores the answer as a
+//! typed policy component, and approves resumption. The next targeted policy
+//! maps that durable decision to run, skip, argument rewrite, or stop.
 
-use anyhow::Result;
-use rig::agent::{AgentHook, HookContext, ToolCall as ToolCallEvent, ToolCallAction};
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{CompletionModel, Prompt};
-use rig::providers::openai;
-use rig::tool::Tool;
-use serde::Deserialize;
-use serde_json::json;
+#[path = "../../ecs_demo.rs"]
+mod ecs_demo;
 
-// ---------------------------------------------------------------------------
-// Two side-effecting tools worth gating behind human approval.
-// ---------------------------------------------------------------------------
+use std::io::Write;
 
-#[derive(Debug, thiserror::Error)]
-#[error("tool failed: {0}")]
-struct ToolError(String);
+use anyhow::{Context, Result};
+use rig::bevy_ecs::prelude::{Component, In, Query};
+use rig::runtime::{
+    EffectCompletion, EffectOutput, ModelEffectOutput, ModelToolCall, Policy,
+    PolicyApprovalEffectOutput, PolicyPoint, PolicyResponderId, PolicyRule, RunState,
+    ToolCallPolicyDecision, ToolCallPolicyEvaluation, ToolCallPolicyEvaluationPhase,
+    ToolCallPolicyInvocation, ToolCapability, ToolEffectInput, ToolGrant, Usage,
+};
 
-#[derive(Deserialize)]
-struct SendEmailArgs {
-    to: String,
-    subject: String,
-    body: String,
+const SEND_EMAIL: &str = "send_email";
+const DELETE_FILE: &str = "delete_file";
+
+#[derive(Component, Clone)]
+enum ReviewerDecision {
+    Run,
+    Rewrite(serde_json::Value),
+    Skip(String),
+    Stop(String),
 }
 
-struct SendEmail;
-
-impl Tool for SendEmail {
-    const NAME: &'static str = "send_email";
-    type Error = ToolError;
-    type Args = SendEmailArgs;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Send an email to a recipient.".to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "to": { "type": "string", "description": "Recipient email address" },
-                "subject": { "type": "string", "description": "Email subject line" },
-                "body": { "type": "string", "description": "Email body" }
-            },
-            "required": ["to", "subject", "body"]
-        })
-    }
-
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        // A real implementation would hit an email API here.
-        println!(
-            "   📧 [send_email] -> {} (subject: {:?}, {} chars)",
-            args.to,
-            args.subject,
-            args.body.len()
-        );
-        Ok(format!("email sent to {}", args.to))
-    }
+fn apply_reviewer_decision(
+    In(event): In<ToolCallPolicyInvocation>,
+    decisions: Query<&ReviewerDecision>,
+) -> Option<ToolCallPolicyDecision> {
+    Some(match decisions.get(event.policy) {
+        Ok(ReviewerDecision::Run) => ToolCallPolicyDecision::Run,
+        Ok(ReviewerDecision::Rewrite(arguments)) => {
+            ToolCallPolicyDecision::Rewrite(arguments.clone())
+        }
+        Ok(ReviewerDecision::Skip(reason)) => ToolCallPolicyDecision::Skip(reason.clone()),
+        Ok(ReviewerDecision::Stop(reason)) => ToolCallPolicyDecision::Stop(reason.clone()),
+        Err(_) => ToolCallPolicyDecision::Stop(
+            "reviewer decision was missing; refusing to execute".to_owned(),
+        ),
+    })
 }
 
-#[derive(Deserialize)]
-struct DeleteFileArgs {
-    path: String,
-}
-
-struct DeleteFile;
-
-impl Tool for DeleteFile {
-    const NAME: &'static str = "delete_file";
-    type Error = ToolError;
-    type Args = DeleteFileArgs;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Permanently delete a file at the given path.".to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "Absolute path of the file to delete" }
-            },
-            "required": ["path"]
-        })
-    }
-
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        // A real implementation would delete the file here.
-        println!("   🗑️  [delete_file] -> {}", args.path);
-        Ok(format!("deleted {}", args.path))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The HITL hook: pause on each tool call and ask a human.
-// ---------------------------------------------------------------------------
-
-/// Print `prompt`, then read one trimmed line from stdin without blocking the
-/// async runtime (the blocking read runs on a dedicated thread). Returns `None`
-/// on EOF / closed stdin (e.g. piped `< /dev/null`, Ctrl-D) or a read error —
-/// the caller treats "no input" as fail-closed, never as approval.
-async fn ask(prompt: &str) -> Option<String> {
-    use std::io::Write;
+fn ask(prompt: &str) -> Option<String> {
     print!("{prompt}");
     let _ = std::io::stdout().flush();
-    let line = tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => None, // EOF / closed stdin / read error
-            Ok(_) => Some(line),
-        }
-    })
-    .await
-    .ok()
-    .flatten()?;
-    Some(line.trim().to_string())
-}
-
-/// Gates every tool call behind interactive human approval.
-///
-/// The gate is **fail-closed**: anything other than an explicit approval (an
-/// empty line, an unrecognized choice, or closed stdin) denies or aborts rather
-/// than running the tool. An approval prompt that guards side-effecting tools
-/// must never run them on ambiguous input — and note that the prompt is a UX
-/// affordance, not a security boundary; real authorization belongs inside the
-/// tool itself.
-struct ApprovalHook;
-
-impl<M: CompletionModel> AgentHook<M> for ApprovalHook {
-    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCallEvent<'_>) -> ToolCallAction {
-        let tool_name = event.tool_name;
-        let args = event.args;
-
-        println!("\n⏸  The agent wants to run a tool — your approval is required:");
-        println!("     tool: {tool_name}");
-        println!("     args: {args}");
-
-        // No input at all (closed stdin) → abort the run; there is no reviewer.
-        let Some(choice) = ask("     [a]pprove / [d]eny / [e]dit args / a[b]ort run? ").await
-        else {
-            println!("     → no input (stdin closed); aborting (fail-closed)");
-            return ToolCallAction::stop("no reviewer input available (stdin closed)");
-        };
-
-        // Match the whole (lowercased) answer, accepting either the hotkey or the
-        // full word, so typing "abort" can never be mistaken for "approve".
-        match choice.to_ascii_lowercase().as_str() {
-            "a" | "approve" => {
-                println!("     → approved");
-                ToolCallAction::run()
-            }
-            // Deny: the tool does not run; the reason is fed back to the model as
-            // the tool result so it can choose another course of action.
-            "d" | "deny" | "n" | "no" => {
-                let reason = ask("     reason (shown to the model): ")
-                    .await
-                    .filter(|r| !r.is_empty())
-                    .unwrap_or_else(|| "denied by the human reviewer".to_string());
-                println!("     → denied");
-                ToolCallAction::skip(reason)
-            }
-            // Edit: run the tool with human-supplied JSON arguments instead.
-            "e" | "edit" => {
-                match ask("     replacement JSON args (single line): ")
-                    .await
-                    .as_deref()
-                    .map(serde_json::from_str::<serde_json::Value>)
-                {
-                    Some(Ok(value)) => {
-                        println!("     → running with edited arguments");
-                        ToolCallAction::rewrite(value)
-                    }
-                    other => {
-                        println!("     ! no valid JSON ({other:?}); denying instead");
-                        ToolCallAction::skip(
-                            "the reviewer tried to edit the arguments but supplied no valid JSON",
-                        )
-                    }
-                }
-            }
-            // Abort: stop the whole run.
-            "b" | "abort" | "q" | "quit" => {
-                println!("     → aborting the run");
-                ToolCallAction::stop("run aborted by the human reviewer")
-            }
-            // Fail closed: empty or unrecognized input denies rather than runs.
-            "" => {
-                println!("     → empty input; denying (fail-closed)");
-                ToolCallAction::skip("denied: the reviewer gave no decision")
-            }
-            other => {
-                println!("     ! unrecognized choice '{other}'; denying (fail-closed)");
-                ToolCallAction::skip(format!("denied: unrecognized reviewer input '{other}'"))
-            }
-        }
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line.trim().to_owned()),
     }
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+fn review(input: &ToolEffectInput) -> ReviewerDecision {
+    println!("\nThe agent wants to run `{}`", input.decision.name);
+    println!("arguments: {}", input.arguments);
+    let Some(choice) = ask("[a]pprove / [d]eny / [e]dit arguments / a[b]ort? ") else {
+        return ReviewerDecision::Stop("no reviewer input was available".to_owned());
+    };
+    match choice.to_ascii_lowercase().as_str() {
+        "a" | "approve" => ReviewerDecision::Run,
+        "d" | "deny" | "n" | "no" => ReviewerDecision::Skip(
+            ask("reason shown to the model: ")
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or_else(|| "denied by the human reviewer".to_owned()),
+        ),
+        "e" | "edit" => ask("replacement JSON arguments: ")
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .map_or_else(
+                || ReviewerDecision::Skip("reviewer supplied invalid JSON".to_owned()),
+                ReviewerDecision::Rewrite,
+            ),
+        "b" | "abort" | "q" | "quit" => {
+            ReviewerDecision::Stop("run aborted by the human reviewer".to_owned())
+        }
+        other => ReviewerDecision::Skip(format!("denied: unrecognized reviewer input `{other}`")),
+    }
+}
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let agent = openai::Client::from_env()?
-        .agent(openai::GPT_4O)
-        .preamble(
-            "You are an operations assistant. Use the available tools to carry out the user's \
-             request. Call one tool at a time and wait for its result before the next step.",
-        )
-        .tool(SendEmail)
-        .tool(DeleteFile)
-        .build();
+fn install_tool(
+    runtime: &mut rig::runtime::Runtime,
+    agent: rig::runtime::AgentHandle,
+    id: &str,
+    name: &str,
+    order: u32,
+) -> Result<()> {
+    let tool = runtime.spawn_tool(
+        ecs_demo::id(id)?,
+        ecs_demo::tenant()?,
+        ToolCapability {
+            name: name.to_owned(),
+            description: format!("Side-effecting {name} operation"),
+            parameters: serde_json::json!({"type":"object"}),
+            order,
+            revision: 1,
+            retired: false,
+        },
+    )?;
+    runtime.grant_tool(
+        ecs_demo::id(&format!("{id}-grant"))?,
+        ecs_demo::tenant()?,
+        ToolGrant {
+            order,
+            enabled: true,
+        },
+        agent,
+        tool,
+    )?;
+    Ok(())
+}
 
-    let prompt = "Email alice@example.com a reminder that the budget review is at 3pm, \
-                  then delete the stale file /tmp/old_report.csv.";
-    println!("User: {prompt}");
+fn complete_call(
+    runtime: &rig::runtime::Runtime,
+    model: &rig::runtime::EffectRequest,
+    id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Result<()> {
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: model.operation,
+            generation: model.generation,
+            result: Ok(EffectOutput::Model(ModelEffectOutput {
+                assistant_message: None,
+                text: String::new(),
+                usage: Usage::default(),
+                tool_calls: vec![ModelToolCall {
+                    id: id.to_owned(),
+                    provider_result_id: id.to_owned(),
+                    provider_call_id: None,
+                    name: name.to_owned(),
+                    arguments,
+                }],
+            })),
+        })?;
+    Ok(())
+}
 
-    // Attach the approval hook for this run. It fires before every tool call;
-    // the run pauses for your decision each time.
-    let response = agent
-        .prompt(prompt)
-        .max_turns(10)
-        .add_hook(ApprovalHook)
-        .await?;
+fn service_review(
+    runtime: &mut rig::runtime::Runtime,
+    decision_policy: rig::bevy_ecs::prelude::Entity,
+) -> Result<Option<rig::runtime::EffectRequest>> {
+    let approval = ecs_demo::next_effect(runtime)?;
+    let call = {
+        let world = runtime.world_mut();
+        let mut evaluations = world.query::<&ToolCallPolicyEvaluation>();
+        evaluations
+            .iter(world)
+            .find_map(|evaluation| match evaluation.phase {
+                ToolCallPolicyEvaluationPhase::WaitingApproval { operation, .. }
+                    if operation == approval.operation =>
+                {
+                    Some(evaluation.effective.clone())
+                }
+                _ => None,
+            })
+            .context("approval operation was not tied to a tool-call evaluation")?
+    };
+    let decision = review(&call);
+    runtime
+        .world_mut()
+        .entity_mut(decision_policy)
+        .insert(decision);
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: approval.operation,
+            generation: approval.generation,
+            result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                approved: true,
+                reason: Some("reviewer decision captured in typed ECS state".to_owned()),
+            })),
+        })?;
+    runtime.run_until_stalled()?;
+    Ok(runtime.effects().try_recv()?)
+}
 
-    println!("\nFinal response:\n{response}");
+fn main() -> Result<()> {
+    let (mut runtime, agent) = ecs_demo::runtime(false)?;
+    install_tool(&mut runtime, agent, "email-tool", SEND_EMAIL, 0)?;
+    install_tool(&mut runtime, agent, "delete-tool", DELETE_FILE, 1)?;
+    runtime.spawn_policy(
+        ecs_demo::id("human-approval-gate")?,
+        ecs_demo::tenant()?,
+        Policy {
+            order: 0,
+            revision: 1,
+            rule: PolicyRule::RequireApproval {
+                point: PolicyPoint::ToolCall,
+                prompt: "A human reviewer must decide this tool call".to_owned(),
+            },
+        },
+        agent,
+    )?;
+    let decision_policy = runtime.spawn_policy(
+        ecs_demo::id("apply-human-decision")?,
+        ecs_demo::tenant()?,
+        Policy {
+            order: 1,
+            revision: 1,
+            rule: PolicyRule::Custom(PolicyPoint::ToolCall),
+        },
+        agent,
+    )?;
+    runtime.register_tool_call_policy_responder(
+        decision_policy,
+        PolicyResponderId::new("apply-human-decision")?,
+        apply_reviewer_decision,
+    )?;
 
+    let pending = runtime.handle().prompt(
+        agent,
+        "Email Alice about the budget review, then delete the stale report",
+    )?;
+    let first_model = ecs_demo::next_effect(&mut runtime)?;
+    complete_call(
+        &runtime,
+        &first_model,
+        "email-call",
+        SEND_EMAIL,
+        serde_json::json!({
+            "to": "alice@example.com",
+            "subject": "Budget review",
+            "body": "Reminder: the review is at 3pm"
+        }),
+    )?;
+    let Some(after_email_review) = service_review(&mut runtime, decision_policy)? else {
+        return finish_stopped(&mut runtime, &pending);
+    };
+    let second_model = if after_email_review.tool_input().is_some() {
+        println!(
+            "executing approved call with arguments {}",
+            after_email_review
+                .tool_input()
+                .context("checked tool input")?
+                .arguments
+        );
+        ecs_demo::complete_tool(&runtime, &after_email_review, "email sent")?;
+        ecs_demo::next_effect(&mut runtime)?
+    } else {
+        after_email_review
+    };
+    complete_call(
+        &runtime,
+        &second_model,
+        "delete-call",
+        DELETE_FILE,
+        serde_json::json!({"path": "/tmp/old_report.csv"}),
+    )?;
+    let Some(after_delete_review) = service_review(&mut runtime, decision_policy)? else {
+        return finish_stopped(&mut runtime, &pending);
+    };
+    let final_model = if after_delete_review.tool_input().is_some() {
+        println!(
+            "executing approved call with arguments {}",
+            after_delete_review
+                .tool_input()
+                .context("checked tool input")?
+                .arguments
+        );
+        ecs_demo::complete_tool(&runtime, &after_delete_review, "file deleted")?;
+        ecs_demo::next_effect(&mut runtime)?
+    } else {
+        after_delete_review
+    };
+    ecs_demo::complete_text(&runtime, &final_model, "operations review completed")?;
+    runtime.run_until_stalled()?;
+    let run = runtime
+        .resolve_run(&pending)
+        .context("the prompt should resolve to a run")?;
+    match runtime.observe_run(run)? {
+        Some(RunState::Completed(output)) => println!("final response: {}", output.text),
+        state => println!("run ended without completion: {state:?}"),
+    }
+    Ok(())
+}
+
+fn finish_stopped(
+    runtime: &mut rig::runtime::Runtime,
+    pending: &rig::runtime::PendingRunHandle,
+) -> Result<()> {
+    let run = runtime
+        .resolve_run(pending)
+        .context("the stopped prompt should resolve to a run")?;
+    println!("run stopped: {:?}", runtime.observe_run(run)?);
     Ok(())
 }

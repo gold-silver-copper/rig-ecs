@@ -3,7 +3,6 @@ use crate::{
     http_client::{self, HttpClientExt},
     model::{Model, ModelList, ModelListingError},
     providers::gemini::{Client, InteractionsClient},
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 use serde::Deserialize;
 use std::{convert::TryFrom, fmt};
@@ -113,8 +112,8 @@ async fn list_all_models<Ext, H>(
     client: &client::Client<Ext, H>,
 ) -> Result<ModelList, ModelListingError>
 where
-    Ext: Provider + WasmCompatSend + WasmCompatSync + 'static,
-    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
+    Ext: Provider + Send + Sync + 'static,
+    H: HttpClientExt + Send + Sync + 'static,
 {
     let mut all_models = Vec::new();
     let mut next_page_token: Option<String> = None;
@@ -157,7 +156,7 @@ pub struct GeminiModelLister<H = reqwest::Client> {
 
 impl<H> ModelLister<H> for GeminiModelLister<H>
 where
-    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
+    H: HttpClientExt + Send + Sync + 'static,
 {
     type Client = Client<H>;
 
@@ -283,7 +282,7 @@ pub struct GeminiInteractionsModelLister<H = reqwest::Client> {
 
 impl<H> ModelLister<H> for GeminiInteractionsModelLister<H>
 where
-    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
+    H: HttpClientExt + Send + Sync + 'static,
 {
     type Client = InteractionsClient<H>;
 

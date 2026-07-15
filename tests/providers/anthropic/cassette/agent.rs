@@ -1,7 +1,6 @@
 //! Anthropic agent completion smoke test.
 
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::providers::anthropic;
 
 use super::super::support::with_anthropic_cassette;

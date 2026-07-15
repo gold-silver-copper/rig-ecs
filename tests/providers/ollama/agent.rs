@@ -2,7 +2,6 @@
 
 use rig::client::CompletionClient;
 use rig::client::Nothing;
-use rig::completion::Prompt;
 use rig::providers::ollama;
 
 use crate::support::assert_nonempty_response;

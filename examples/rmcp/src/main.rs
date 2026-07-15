@@ -1,242 +1,101 @@
-//! An example of how you can use `rmcp` with Rig to create an MCP friendly agent.
+//! Discover and execute a real RMCP tool through the ECS effect boundary.
 //!
-//! This example demonstrates two approaches:
-//! - **Basic**: Fetch tools once and build an agent (tools are static).
-//! - **Auto-updating**: Use [`McpClientHandler`] so the agent automatically
-//!   picks up tool changes when the MCP server sends
-//!   `notifications/tools/list_changed`.
-use std::sync::Arc;
+//! The MCP endpoint owns protocol I/O, not a parallel registry. A complete
+//! tool-list generation is reconciled into capability entities; the accepted
+//! revision is then executed from an immutable `ToolEffectInput`. MCP
+//! `tools/list_changed` notifications increment a coalescing refresh counter
+//! that hosts translate into `RefreshDiscovery` commands.
 
-use rig::{
-    client::{CompletionClient, ProviderClient},
-    completion::Prompt,
-    providers::openai,
-    tool::{rmcp::McpClientHandler, server::ToolServer},
-};
-use rmcp::{
-    RoleServer, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::*,
-    schemars,
-    service::RequestContext,
-    tool, tool_handler, tool_router,
-};
-use serde_json::json;
-use tokio::sync::Mutex;
-
+use anyhow::{Context, Result};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
+use rig::bevy_ecs::prelude::Entity;
+use rig::runtime::{
+    Agent, DiscoveryKey, EffectCompletion, EffectOutput, ModelCapability, ModelEffectOutput,
+    ModelToolCall, Runtime, RuntimeConfig, StableId, TenantId, ToolCapability, ToolGrant, Usage,
+    adapters::DiscoveryAdapter,
+};
+use rig::tool::rmcp::McpClientHandler;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager,
 };
+use rmcp::{
+    ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::*,
+    schemars, tool, tool_handler, tool_router,
+};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct StructRequest {
-    pub a: i32,
-    pub b: i32,
+struct SumRequest {
+    a: i32,
+    b: i32,
 }
 
 #[derive(Clone)]
-pub struct Counter {
-    pub counter: Arc<Mutex<i32>>,
-    tool_router: ToolRouter<Counter>,
+struct Calculator {
+    tool_router: ToolRouter<Self>,
 }
 
-impl Default for Counter {
-    fn default() -> Self {
-        Self::new()
+impl Calculator {
+    fn new() -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+        }
     }
 }
 
 #[tool_router]
-impl Counter {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self {
-            counter: Arc::new(Mutex::new(0)),
-            tool_router: Self::tool_router(),
-        }
-    }
-
-    fn _create_resource_text(&self, uri: &str, name: &str) -> Resource {
-        Resource::new(uri, name.to_string())
-    }
-
-    // #[tool(description = "Increment the counter by 1")]
-    // async fn increment(&self) -> Result<CallToolResult, ErrorData> {
-    //     let mut counter = self.counter.lock().await;
-    //     *counter += 1;
-    //     Ok(CallToolResult::success(vec![ContentBlock::text(
-    //         counter.to_string(),
-    //     )]))
-    // }
-
-    // #[tool(description = "Decrement the counter by 1")]
-    // async fn decrement(&self) -> Result<CallToolResult, ErrorData> {
-    //     let mut counter = self.counter.lock().await;
-    //     *counter -= 1;
-    //     Ok(CallToolResult::success(vec![ContentBlock::text(
-    //         counter.to_string(),
-    //     )]))
-    // }
-
-    // #[tool(description = "Get the current counter value")]
-    // async fn get_value(&self) -> Result<CallToolResult, ErrorData> {
-    //     let counter = self.counter.lock().await;
-    //     Ok(CallToolResult::success(vec![ContentBlock::text(
-    //         counter.to_string(),
-    //     )]))
-    // }
-
-    // #[tool(description = "Say hello to the client")]
-    // fn say_hello(&self) -> Result<CallToolResult, ErrorData> {
-    //     Ok(CallToolResult::success(vec![ContentBlock::text("hello")]))
-    // }
-
-    // #[tool(description = "Repeat what you say")]
-    // fn echo(&self, Parameters(object): Parameters<JsonObject>) -> Result<CallToolResult, ErrorData> {
-    //     Ok(CallToolResult::success(vec![ContentBlock::text(
-    //         serde_json::Value::Object(object).to_string(),
-    //     )]))
-    // }
-
-    #[tool(description = "Calculate the sum of two numbers")]
+impl Calculator {
+    #[tool(description = "Calculate the sum of two integers")]
     fn sum(
         &self,
-        Parameters(StructRequest { a, b }): Parameters<StructRequest>,
-    ) -> Result<CallToolResult, ErrorData> {
+        Parameters(SumRequest { a, b }): Parameters<SumRequest>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         Ok(CallToolResult::success(vec![ContentBlock::text(
             (a + b).to_string(),
         )]))
     }
 }
+
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for Counter {
+impl ServerHandler for Calculator {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_resources()
-                .enable_tools()
-                .build(),
-        )
-        .with_protocol_version(ProtocolVersion::LATEST)
-        .with_server_info(Implementation::from_build_env())
-        .with_instructions("This server provides a counter tool that can increment and decrement values. The counter starts at 0 and can be modified using the 'increment' and 'decrement' tools. Use 'get_value' to check the current count.")
-    }
-
-    async fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                self._create_resource_text("str:////Users/to/some/path/", "cwd"),
-                self._create_resource_text("memo://insights", "memo-name"),
-            ],
-            next_cursor: None,
-            meta: None,
-        })
-    }
-
-    async fn read_resource(
-        &self,
-        ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
-        match uri.as_str() {
-            "str:////Users/to/some/path/" => {
-                let cwd = "/Users/to/some/path/";
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    cwd, uri,
-                )]))
-            }
-            "memo://insights" => {
-                let memo = "Business Intelligence Memo\n\nAnalysis has revealed 5 key insights ...";
-                Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    memo, uri,
-                )]))
-            }
-            _ => Err(ErrorData::resource_not_found(
-                "resource_not_found",
-                Some(json!({
-                    "uri": uri
-                })),
-            )),
-        }
-    }
-
-    async fn list_resource_templates(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult {
-            next_cursor: None,
-            resource_templates: Vec::new(),
-            meta: None,
-        })
-    }
-
-    async fn initialize(
-        &self,
-        _request: InitializeRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<InitializeResult, ErrorData> {
-        if let Some(http_request_part) = context.extensions.get::<axum::http::request::Parts>() {
-            let initialize_headers = &http_request_part.headers;
-            let initialize_uri = &http_request_part.uri;
-            tracing::info!(?initialize_headers, %initialize_uri, "initialize from http server");
-        }
-        Ok(self.get_info())
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_server_info(Implementation::new("rig-ecs-rmcp-example", "1.0.0"))
+            .with_instructions("Use sum for integer addition")
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+fn id(value: &str) -> Result<StableId> {
+    Ok(StableId::new(value)?)
+}
 
+fn tenant() -> Result<TenantId> {
+    Ok(TenantId::new("rmcp-example")?)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let service = TowerToHyperService::new(StreamableHttpService::new(
-        || Ok(Counter::new()),
+        || Ok(Calculator::new()),
         LocalSessionManager::default().into(),
         Default::default(),
     ));
-    let listener = tokio::net::TcpListener::bind("localhost:8080").await?;
-
-    tokio::spawn({
-        let service = service.clone();
-        async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        println!("Received Ctrl+C, shutting down");
-                        break;
-                    }
-                    accept = listener.accept() => {
-                        match accept {
-                            Ok((stream, _addr)) => {
-                                let io = TokioIo::new(stream);
-                                let service = service.clone();
-
-                                tokio::spawn(async move {
-                                    if let Err(e) = Builder::new(TokioExecutor::default())
-                                        .serve_connection(io, service)
-                                        .await
-                                    {
-                                        eprintln!("Connection error: {e:?}");
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                eprintln!("Accept error: {e:?}");
-                            }
-                        }
-                    }
-                }
-            }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let service = service.clone();
+            tokio::spawn(async move {
+                let _ = Builder::new(TokioExecutor::default())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
         }
     });
 
@@ -244,34 +103,149 @@ async fn main() -> anyhow::Result<()> {
         ClientCapabilities::default(),
         Implementation::new("rig-core", env!("CARGO_PKG_VERSION")),
     );
-
-    // Create a shared ToolServer so the MCP handler can update tools at runtime.
-    let tool_server_handle = ToolServer::new().run();
-
-    // McpClientHandler connects to the MCP server and auto-refreshes tools
-    // whenever the server sends `notifications/tools/list_changed`.
-    let handler = McpClientHandler::new(client_info, tool_server_handle.clone());
-
     let transport =
-        rmcp::transport::StreamableHttpClientTransport::from_uri("http://localhost:8080");
+        rmcp::transport::StreamableHttpClientTransport::from_uri(format!("http://{address}"));
+    let connection = McpClientHandler::new(client_info)
+        .connect(transport)
+        .await?;
+    let endpoint = connection.clone_endpoint();
+    println!(
+        "connected to MCP server: {:#?}",
+        connection.service().peer_info()
+    );
 
-    let mcp_service = handler.connect(transport).await.inspect_err(|e| {
-        tracing::error!("MCP client error: {:?}", e);
-    })?;
+    let mut runtime = Runtime::new(RuntimeConfig::default())?;
+    let source_id = id("calculator-mcp")?;
+    let source = runtime.spawn_discovery_source(source_id.clone(), tenant()?, "mcp")?;
+    runtime.handle().refresh_discovery(source)?;
+    runtime.run_until_stalled()?;
+    let refresh = runtime
+        .effects()
+        .try_recv()?
+        .context("expected an MCP discovery effect")?;
+    let refresh_input = refresh
+        .discovery_input()
+        .cloned()
+        .context("expected typed discovery input")?;
+    let discovery = DiscoveryAdapter::new(source_id, endpoint.clone());
+    let discovered = discovery.execute(refresh_input).await?;
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: refresh.operation,
+            generation: refresh.generation,
+            result: Ok(EffectOutput::Discovery(discovered)),
+        })?;
+    runtime.run_until_stalled()?;
 
-    let server_info = mcp_service.peer_info();
-    tracing::info!("Connected to server: {server_info:#?}");
+    let sum_tool = {
+        let world = runtime.world_mut();
+        let mut tools = world.query::<(Entity, &DiscoveryKey, &ToolCapability)>();
+        tools
+            .iter(world)
+            .find_map(|(entity, _, tool)| (tool.name == "sum").then_some(entity))
+            .context("MCP discovery did not reconcile the sum tool")?
+    };
+    let model = runtime.spawn_model(
+        id("model")?,
+        tenant()?,
+        ModelCapability {
+            provider: "example".to_owned(),
+            model: "deterministic".to_owned(),
+            revision: 1,
+            retired: false,
+        },
+    )?;
+    let agent = runtime.spawn_agent(
+        id("agent")?,
+        tenant()?,
+        Agent {
+            instructions: "Use the discovered MCP calculator".to_owned(),
+            ..Agent::default()
+        },
+        model,
+    )?;
+    runtime.grant_tool(
+        id("sum-grant")?,
+        tenant()?,
+        ToolGrant {
+            order: 0,
+            enabled: true,
+        },
+        agent,
+        sum_tool,
+    )?;
 
-    let openai_client = openai::Client::from_env()?;
-    let agent = openai_client
-        .agent(openai::GPT_4O)
-        .preamble("You are a helpful assistant who has access to a number of tools from an MCP server designed to be used for incrementing and decrementing a counter.")
-        .tool_server_handle(tool_server_handle)
-        .build();
+    runtime.handle().prompt(agent, "What is 2 + 5?")?;
+    runtime.run_until_stalled()?;
+    let model_request = runtime
+        .effects()
+        .try_recv()?
+        .context("expected a model effect")?;
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: model_request.operation,
+            generation: model_request.generation,
+            result: Ok(EffectOutput::Model(ModelEffectOutput {
+                assistant_message: None,
+                text: String::new(),
+                usage: Usage::default(),
+                tool_calls: vec![ModelToolCall {
+                    id: "sum-call".to_owned(),
+                    provider_result_id: "sum-call".to_owned(),
+                    provider_call_id: None,
+                    name: "sum".to_owned(),
+                    arguments: serde_json::json!({"a": 2, "b": 5}),
+                }],
+            })),
+        })?;
+    runtime.run_until_stalled()?;
+    let tool_request = runtime
+        .effects()
+        .try_recv()?
+        .context("expected the reconciled MCP tool effect")?;
+    let tool_input = tool_request
+        .tool_input()
+        .cloned()
+        .context("expected typed MCP tool input")?;
+    let tool_output = endpoint.execute(tool_input).await?;
+    println!("MCP sum result: {}", tool_output.presentation);
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: tool_request.operation,
+            generation: tool_request.generation,
+            result: Ok(EffectOutput::Tool(tool_output)),
+        })?;
+    runtime.run_until_stalled()?;
+    let final_model = runtime
+        .effects()
+        .try_recv()?
+        .context("expected a post-tool model effect")?;
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: final_model.operation,
+            generation: final_model.generation,
+            result: Ok(EffectOutput::Model(ModelEffectOutput {
+                assistant_message: None,
+                text: "2 + 5 = 7".to_owned(),
+                usage: Usage::default(),
+                tool_calls: Vec::new(),
+            })),
+        })?;
+    runtime.run_until_stalled()?;
 
-    let res = agent.prompt("What is 2+5?").max_turns(2).await?;
-
-    println!("GPT-4o: {res}");
-
+    println!(
+        "list_changed refresh generation: {} (submit one refresh when this advances)",
+        endpoint.refresh_signal()
+    );
+    drop(connection);
+    server.abort();
     Ok(())
 }

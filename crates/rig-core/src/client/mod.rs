@@ -40,7 +40,6 @@ use crate::{
     prelude::TranscriptionClient,
     rerank::RerankModel,
     transcription::TranscriptionModel,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 
 #[derive(Debug, Error)]
@@ -370,16 +369,16 @@ impl<Ext, H> Client<Ext, H> {
 impl<Ext, H> HttpClientExt for Client<Ext, H>
 where
     H: HttpClientExt + 'static,
-    Ext: WasmCompatSend + WasmCompatSync + 'static,
+    Ext: Send + Sync + 'static,
 {
     fn send<T, U>(
         &self,
         mut req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        T: Into<Bytes> + WasmCompatSend,
+        T: Into<Bytes> + Send,
         U: From<Bytes>,
-        U: WasmCompatSend + 'static,
+        U: Send + 'static,
     {
         req.headers_mut().insert(
             http::header::CONTENT_TYPE,
@@ -392,10 +391,10 @@ where
     fn send_multipart<U>(
         &self,
         req: Request<MultipartForm>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
         U: From<Bytes>,
-        U: WasmCompatSend + 'static,
+        U: Send + 'static,
     {
         self.http_client.send_multipart(req)
     }
@@ -403,9 +402,9 @@ where
     fn send_streaming<T>(
         &self,
         mut req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + WasmCompatSend
+    ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + Send
     where
-        T: Into<Bytes> + WasmCompatSend,
+        T: Into<Bytes> + Send,
     {
         req.headers_mut().insert(
             http::header::CONTENT_TYPE,
@@ -512,7 +511,7 @@ where
 impl<Ext, H> VerifyClient for Client<Ext, H>
 where
     H: HttpClientExt,
-    Ext: DebugExt + Provider + WasmCompatSync,
+    Ext: DebugExt + Provider + Sync,
 {
     async fn verify(&self) -> Result<(), VerifyError> {
         use http::StatusCode;
@@ -801,7 +800,7 @@ where
 impl<M, Ext, H> TranscriptionClient for Client<Ext, H>
 where
     Ext: Capabilities<H, Transcription = Capable<M>>,
-    M: TranscriptionModel<Client = Self> + WasmCompatSend,
+    M: TranscriptionModel<Client = Self> + Send,
 {
     type TranscriptionModel = M;
 
@@ -839,14 +838,14 @@ where
 impl<M, Ext, H> ModelListingClient for Client<Ext, H>
 where
     Ext: Capabilities<H, ModelListing = Capable<M>> + Clone,
-    M: ModelLister<H, Client = Self> + WasmCompatSend + WasmCompatSync + Clone + 'static,
-    H: WasmCompatSend + WasmCompatSync + Clone,
+    M: ModelLister<H, Client = Self> + Send + Sync + Clone + 'static,
+    H: Send + Sync + Clone,
 {
     fn list_models(
         &self,
     ) -> impl std::future::Future<
         Output = Result<crate::model::ModelList, crate::model::ModelListingError>,
-    > + WasmCompatSend {
+    > + Send {
         let lister = M::new(self.clone());
         async move { lister.list_all().await }
     }
@@ -858,28 +857,27 @@ mod wasm_model_listing_compile_checks {
     use crate::{
         http_client::{self, HttpClientExt, LazyBody, MultipartForm, Request, Response},
         providers::{anthropic, deepseek, mistral, ollama, openai, openrouter},
-        wasm_compat::WasmCompatSend,
     };
     use bytes::Bytes;
     use std::{
         future::{self, Future},
         marker::PhantomData,
-        rc::Rc,
+        sync::Arc,
     };
 
     #[derive(Clone, Default)]
     struct WasmOnlyHttpClient {
-        _not_send_sync: PhantomData<Rc<()>>,
+        _portable: PhantomData<Arc<()>>,
     }
 
     impl HttpClientExt for WasmOnlyHttpClient {
         fn send<T, U>(
             &self,
             _req: Request<T>,
-        ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+        ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
         where
-            T: Into<Bytes> + WasmCompatSend,
-            U: From<Bytes> + WasmCompatSend + 'static,
+            T: Into<Bytes> + Send,
+            U: From<Bytes> + Send + 'static,
         {
             future::ready(Err(http_client::Error::StreamEnded))
         }
@@ -887,9 +885,9 @@ mod wasm_model_listing_compile_checks {
         fn send_multipart<U>(
             &self,
             _req: Request<MultipartForm>,
-        ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+        ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
         where
-            U: From<Bytes> + WasmCompatSend + 'static,
+            U: From<Bytes> + Send + 'static,
         {
             future::ready(Err(http_client::Error::StreamEnded))
         }
@@ -897,9 +895,9 @@ mod wasm_model_listing_compile_checks {
         fn send_streaming<T>(
             &self,
             _req: Request<T>,
-        ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + WasmCompatSend
+        ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + Send
         where
-            T: Into<Bytes> + WasmCompatSend,
+            T: Into<Bytes> + Send,
         {
             future::ready(Err(http_client::Error::StreamEnded))
         }

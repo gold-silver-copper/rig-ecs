@@ -150,11 +150,12 @@ impl CompletionModel {
                     aws_bedrock::ConverseStreamOutput::ContentBlockDelta(event) => {
                         let delta = event.delta.ok_or(CompletionError::ProviderError("The delta for a content block is missing".into()))?;
                         match delta {
-                            aws_bedrock::ContentBlockDelta::Text(text) => {
-                                if current_tool_call.is_none() {
-                                    yield Ok(RawStreamingChoice::Message(text))
-                                }
+                            aws_bedrock::ContentBlockDelta::Text(text)
+                                if current_tool_call.is_none() =>
+                            {
+                                yield Ok(RawStreamingChoice::Message(text))
                             },
+                            aws_bedrock::ContentBlockDelta::Text(_) => {},
                             aws_bedrock::ContentBlockDelta::ToolUse(tool) => {
                                 if let Some(ref mut tool_call) = current_tool_call {
                                     let delta = tool.input().to_string();

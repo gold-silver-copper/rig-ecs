@@ -17,7 +17,6 @@ use rig::message::{
 };
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent};
 use rig::tool::Tool;
-use rig::wasm_compat::WasmCompatSend;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -54,7 +53,7 @@ where
 pub(crate) async fn run_reasoning_roundtrip_streaming<M>(agent: ReasoningRoundtripAgent<M>)
 where
     M: CompletionModel,
-    M::StreamingResponse: WasmCompatSend,
+    M::StreamingResponse: Send,
 {
     run_reasoning_roundtrip_streaming_with_final(agent, |_| {}).await;
 }
@@ -64,7 +63,7 @@ pub(crate) async fn run_reasoning_roundtrip_streaming_with_final<M, F>(
     mut inspect_final: F,
 ) where
     M: CompletionModel,
-    M::StreamingResponse: WasmCompatSend,
+    M::StreamingResponse: Send,
     F: FnMut(&M::StreamingResponse),
 {
     let turn1_prompt = Message::User {
@@ -313,11 +312,7 @@ impl Tool for WeatherTool {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         Ok(format!(
             "Weather in {}: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW",

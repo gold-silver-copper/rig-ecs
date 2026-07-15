@@ -3,7 +3,6 @@
 use rig::OneOrMany;
 use rig::client::CompletionClient;
 use rig::completion::CompletionModel;
-use rig::completion::Prompt;
 use rig::message::{AssistantContent, Message, ToolChoice};
 use rig::providers::openai;
 use rig::streaming::StreamingPrompt;

@@ -33,18 +33,39 @@ use std::marker::PhantomData;
 
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::{
-    agent::{Agent, AgentBuilder, WithBuilderTools},
-    completion::{Completion, CompletionError, CompletionModel, Usage},
-    message::{AssistantContent, Message, ToolCall, ToolChoice, ToolFunction},
+    agent::{Agent, AgentBuilder},
+    completion::{CompletionModel, Usage},
+    message::{Message, ToolChoice},
+    runtime::adapters::LocalAgentError,
     tool::Tool,
     vector_store::VectorStoreIndexDyn,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 
-const SUBMIT_TOOL_NAME: &str = "submit";
+struct SubmitTool<T>(PhantomData<fn() -> T>);
+
+impl<T> Tool for SubmitTool<T>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+{
+    const NAME: &'static str = "submit";
+    type Error = serde_json::Error;
+    type Args = T;
+    type Output = serde_json::Value;
+
+    fn description(&self) -> String {
+        "Submit the structured data you extracted from the provided text.".to_owned()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schema_for!(T)).unwrap_or(serde_json::Value::Bool(false))
+    }
+
+    async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
+        serde_json::to_value(arguments)
+    }
+}
 
 /// Response from an extraction operation containing the extracted data and usage information.
 #[derive(Debug, Clone)]
@@ -63,15 +84,15 @@ pub enum ExtractionError {
     #[error("Failed to deserialize the extracted data: {0}")]
     DeserializationError(#[from] serde_json::Error),
 
-    #[error("CompletionError: {0}")]
-    CompletionError(#[from] CompletionError),
+    #[error("AgentError: {0}")]
+    AgentError(#[from] LocalAgentError),
 }
 
 /// Extractor for structured data from text
 pub struct Extractor<M, T>
 where
     M: CompletionModel,
-    T: JsonSchema + for<'a> Deserialize<'a> + WasmCompatSend + WasmCompatSync,
+    T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync,
 {
     agent: Agent<M>,
     _t: PhantomData<T>,
@@ -81,7 +102,7 @@ where
 impl<M, T> Extractor<M, T>
 where
     M: CompletionModel,
-    T: JsonSchema + for<'a> Deserialize<'a> + WasmCompatSend + WasmCompatSync,
+    T: JsonSchema + for<'a> Deserialize<'a> + Send + Sync,
 {
     /// Attempts to extract data from the given text with a number of retries.
     ///
@@ -89,10 +110,7 @@ where
     /// if the model does not call the `submit` tool.
     ///
     /// The number of retries is determined by the `retries` field on the Extractor struct.
-    pub async fn extract(
-        &self,
-        text: impl Into<Message> + WasmCompatSend,
-    ) -> Result<T, ExtractionError> {
+    pub async fn extract(&self, text: impl Into<Message> + Send) -> Result<T, ExtractionError> {
         let (data, _usage) = self.retry_extract(text.into(), vec![]).await?;
         Ok(data)
     }
@@ -105,7 +123,7 @@ where
     /// The number of retries is determined by the `retries` field on the Extractor struct.
     pub async fn extract_with_chat_history(
         &self,
-        text: impl Into<Message> + WasmCompatSend,
+        text: impl Into<Message> + Send,
         chat_history: Vec<Message>,
     ) -> Result<T, ExtractionError> {
         let (data, _usage) = self.retry_extract(text.into(), chat_history).await?;
@@ -127,7 +145,7 @@ where
     /// fails the returned error carries no usage information at all.
     pub async fn extract_with_usage(
         &self,
-        text: impl Into<Message> + WasmCompatSend,
+        text: impl Into<Message> + Send,
     ) -> Result<ExtractionResponse<T>, ExtractionError> {
         let (data, usage) = self.retry_extract(text.into(), vec![]).await?;
         Ok(ExtractionResponse { data, usage })
@@ -149,7 +167,7 @@ where
     /// fails the returned error carries no usage information at all.
     pub async fn extract_with_chat_history_with_usage(
         &self,
-        text: impl Into<Message> + WasmCompatSend,
+        text: impl Into<Message> + Send,
         chat_history: Vec<Message>,
     ) -> Result<ExtractionResponse<T>, ExtractionError> {
         let (data, usage) = self.retry_extract(text.into(), chat_history).await?;
@@ -201,62 +219,31 @@ where
         text: &Message,
         messages: &[Message],
     ) -> (Result<T, ExtractionError>, Usage) {
-        let completion = async { self.agent.completion(text, messages).await?.send().await };
-        let response = match completion.await {
+        let schema = serde_json::to_value(schema_for!(T));
+        let schema = match schema {
+            Ok(schema) => schema,
+            Err(error) => return (Err(error.into()), Usage::new()),
+        };
+        let response = match self
+            .agent
+            .run_prompt_configured(text.clone(), messages.to_vec(), Some(schema))
+            .await
+        {
             Ok(response) => response,
             Err(e) => return (Err(e.into()), Usage::new()),
         };
-        let usage = response.usage;
-
-        if !response.choice.iter().any(|x| {
-            let AssistantContent::ToolCall(ToolCall {
-                function: ToolFunction { name, .. },
-                ..
-            }) = x
-            else {
-                return false;
-            };
-
-            name == SUBMIT_TOOL_NAME
-        }) {
-            tracing::warn!(
-                "The submit tool was not called. If this happens more than once, please ensure the model you are using is powerful enough to reliably call tools."
-            );
-        }
-
-        let arguments = response
-            .choice
-            .into_iter()
-            // We filter tool calls to look for submit tool calls
-            .filter_map(|content| {
-                if let AssistantContent::ToolCall(ToolCall {
-                    function: ToolFunction { arguments, name },
-                    ..
-                }) = content
-                {
-                    if name == SUBMIT_TOOL_NAME {
-                        Some(arguments)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if arguments.len() > 1 {
-            tracing::warn!(
-                "Multiple submit calls detected, using the first one. Providers / agents should only ensure one submit call."
-            );
-        }
-
-        let Some(raw_data) = arguments.into_iter().next() else {
-            return (Err(ExtractionError::NoData), usage);
+        let usage = Usage {
+            input_tokens: response.usage.input_tokens,
+            output_tokens: response.usage.output_tokens,
+            total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+            ..Usage::new()
         };
+        if response.text.is_empty() {
+            return (Err(ExtractionError::NoData), usage);
+        }
 
         (
-            serde_json::from_value(raw_data).map_err(ExtractionError::from),
+            serde_json::from_str(&response.text).map_err(ExtractionError::from),
             usage,
         )
     }
@@ -266,9 +253,9 @@ where
 pub struct ExtractorBuilder<M, T>
 where
     M: CompletionModel,
-    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync + 'static,
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
 {
-    agent_builder: AgentBuilder<M, WithBuilderTools>,
+    agent_builder: AgentBuilder<M>,
     _t: PhantomData<T>,
     retries: Option<u64>,
 }
@@ -276,22 +263,33 @@ where
 impl<M, T> ExtractorBuilder<M, T>
 where
     M: CompletionModel,
-    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync + 'static,
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
 {
     pub fn new(model: M) -> Self {
+        Self::with_agent_builder(AgentBuilder::new(model))
+    }
+
+    pub(crate) fn with_identity(
+        model: M,
+        provider: impl Into<String>,
+        model_name: impl Into<String>,
+    ) -> Self {
+        Self::with_agent_builder(AgentBuilder::with_identity(model, provider, model_name))
+    }
+
+    fn with_agent_builder(agent_builder: AgentBuilder<M>) -> Self {
         Self {
-            agent_builder: AgentBuilder::new(model)
+            agent_builder: agent_builder
                 .preamble("\
                     You are an AI assistant whose purpose is to extract structured data from the provided text.\n\
                     You will have access to a `submit` function that defines the structure of the data to extract from the provided text.\n\
                     Use the `submit` function to submit the structured data.\n\
                     Be sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.
                 ")
-                .tool(SubmitTool::<T> {_t: PhantomData})
+                .tool(SubmitTool::<T>(PhantomData))
+                .terminal_tool("submit")
                 .tool_choice(ToolChoice::Required)
-                // The extractor already implements its own tool-based output via
-                // `SubmitTool`; opt out of the agent's OutputMode routing (#1928).
-                .output_mode(crate::agent::OutputMode::Native),
+                .output_schema::<T>(),
             retries: None,
             _t: PhantomData,
         }
@@ -299,7 +297,7 @@ where
 
     /// Add additional preamble to the extractor
     pub fn preamble(mut self, preamble: &str) -> Self {
-        self.agent_builder = self.agent_builder.append_preamble(&format!(
+        self.agent_builder = self.agent_builder.append_preamble(format!(
             "\n=============== ADDITIONAL INSTRUCTIONS ===============\n{preamble}"
         ));
         self
@@ -350,48 +348,10 @@ where
     pub fn dynamic_context(
         mut self,
         sample: usize,
-        dynamic_context: impl VectorStoreIndexDyn + Send + Sync + 'static,
+        dynamic_context: impl VectorStoreIndexDyn + 'static,
     ) -> Self {
         self.agent_builder = self.agent_builder.dynamic_context(sample, dynamic_context);
         self
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-struct SubmitTool<T>
-where
-    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync,
-{
-    _t: PhantomData<T>,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("SubmitError")]
-struct SubmitError;
-
-impl<T> Tool for SubmitTool<T>
-where
-    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync + 'static,
-{
-    const NAME: &'static str = SUBMIT_TOOL_NAME;
-    type Error = SubmitError;
-    type Args = T;
-    type Output = T;
-
-    fn description(&self) -> String {
-        "Submit the structured data you extracted from the provided text.".to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!(schema_for!(T))
-    }
-
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        data: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        Ok(data)
     }
 }
 
@@ -422,7 +382,7 @@ mod tests {
     }
 
     fn submit_turn(name: &str) -> MockTurn {
-        MockTurn::tool_call("id1", SUBMIT_TOOL_NAME, json!({ "name": name }))
+        MockTurn::tool_call("submit-call", "submit", json!({ "name": name }))
     }
 
     #[tokio::test]
@@ -497,8 +457,9 @@ mod tests {
 
         assert!(matches!(
             err,
-            ExtractionError::CompletionError(CompletionError::ProviderError(message))
-                if message == "second"
+            ExtractionError::AgentError(LocalAgentError::Canonical(
+                crate::runtime::CanonicalError::Provider { message, .. }
+            )) if message == "ProviderError: second"
         ));
     }
 }

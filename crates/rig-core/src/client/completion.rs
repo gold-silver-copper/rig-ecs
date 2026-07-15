@@ -1,6 +1,6 @@
-use crate::agent::AgentBuilder;
 use crate::completion::CompletionModel;
 use crate::extractor::ExtractorBuilder;
+use crate::runtime::adapters::AgentBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +48,12 @@ pub trait CompletionClient {
     /// # }
     /// ```
     fn agent(&self, model: impl Into<String>) -> AgentBuilder<Self::CompletionModel> {
-        AgentBuilder::new(self.completion_model(model))
+        let model = model.into();
+        AgentBuilder::with_identity(
+            self.completion_model(model.clone()),
+            std::any::type_name::<Self>(),
+            model,
+        )
     }
 
     /// Create an extractor builder with the given completion model.
@@ -56,6 +61,11 @@ pub trait CompletionClient {
     where
         T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync,
     {
-        ExtractorBuilder::new(self.completion_model(model))
+        let model = model.into();
+        ExtractorBuilder::with_identity(
+            self.completion_model(model.clone()),
+            std::any::type_name::<Self>(),
+            model,
+        )
     }
 }

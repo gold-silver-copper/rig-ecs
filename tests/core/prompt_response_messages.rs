@@ -2,7 +2,7 @@
 //! Exercises the real agent loop code path with mocked LLM responses.
 
 use rig::agent::AgentBuilder;
-use rig::completion::{Chat, Message, Prompt, Usage};
+use rig::completion::{Chat, Message, Usage};
 use rig::message::{AssistantContent, UserContent};
 use rig::test_utils::{MockAddTool, MockCompletionModel, MockTurn};
 

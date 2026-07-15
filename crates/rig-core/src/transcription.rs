@@ -2,7 +2,6 @@
 //! It provides traits, structs, and enums for generating audio transcription requests,
 //! handling transcription responses, and defining transcription models.
 use crate::markers::{Missing, Provided};
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use crate::{http_client, json_utils, provider_response};
 use std::io;
 use std::{fs, path::Path};
@@ -24,15 +23,9 @@ pub enum TranscriptionError {
     #[error("JsonError: {0}")]
     JsonError(#[from] serde_json::Error),
 
-    #[cfg(not(target_family = "wasm"))]
     /// Error building the transcription request
     #[error("RequestError: {0}")]
     RequestError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
-
-    #[cfg(target_family = "wasm")]
-    /// Error building the transcription request
-    #[error("RequestError: {0}")]
-    RequestError(#[from] Box<dyn std::error::Error + 'static>),
 
     /// Error parsing the transcription response
     #[error("ResponseError: {0}")]
@@ -59,9 +52,9 @@ pub struct TranscriptionResponse<T> {
 /// Trait defining a transcription model that can be used to generate transcription requests.
 /// This trait is meant to be implemented by the user to define a custom transcription model,
 /// either from a third-party provider (e.g: OpenAI) or a local model.
-pub trait TranscriptionModel: Clone + WasmCompatSend + WasmCompatSync {
+pub trait TranscriptionModel: Clone + Send + Sync {
     /// The raw response type returned by the underlying model.
-    type Response: WasmCompatSend + WasmCompatSync;
+    type Response: Send + Sync;
     type Client;
 
     fn make(client: &Self::Client, model: impl Into<String>) -> Self;
@@ -72,7 +65,7 @@ pub trait TranscriptionModel: Clone + WasmCompatSend + WasmCompatSync {
         request: TranscriptionRequest,
     ) -> impl std::future::Future<
         Output = Result<TranscriptionResponse<Self::Response>, TranscriptionError>,
-    > + WasmCompatSend;
+    > + Send;
 
     /// Generates a transcription request builder for the given `file`
     fn transcription_request(&self) -> TranscriptionRequestBuilder<Self, Missing> {

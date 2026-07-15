@@ -1,7 +1,6 @@
 //! Xiaomi MiMo OpenAI-compatible completion smoke test.
 
 use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::providers::xiaomimimo;
 
 use crate::support::{BASIC_PREAMBLE, BASIC_PROMPT, assert_nonempty_response};

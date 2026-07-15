@@ -9,6 +9,7 @@ license = "MIT"
 workspace = true
 
 [dependencies]
+futures = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rig-core = { path = "../rig-core", version = "0.40.0", default-features = false }
 serde = { workspace = true }

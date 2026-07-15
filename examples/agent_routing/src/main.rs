@@ -4,7 +4,6 @@
 
 use anyhow::{Result, bail};
 use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::providers::openai;
 use rig::providers::openai::client::Client;
 

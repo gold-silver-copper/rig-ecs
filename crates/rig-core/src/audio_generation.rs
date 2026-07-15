@@ -1,10 +1,7 @@
 //! Everything related to audio generation (ie, Text To Speech).
 //! Rig abstracts over a number of different providers using the [AudioGenerationModel] trait.
 use crate::markers::{Missing, Provided};
-use crate::{
-    http_client, provider_response,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
-};
+use crate::{http_client, provider_response};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -52,7 +49,7 @@ pub struct AudioGenerationResponse<T> {
     pub response: T,
 }
 
-pub trait AudioGenerationModel: Sized + Clone + WasmCompatSend + WasmCompatSync {
+pub trait AudioGenerationModel: Sized + Clone + Send + Sync {
     type Response: Send + Sync;
 
     type Client;

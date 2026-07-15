@@ -6,7 +6,6 @@ use crate::http_client::multipart::Part;
 use crate::http_client::{HttpClientExt, MultipartForm};
 use crate::providers::mistral::Client;
 use crate::transcription::{self, TranscriptionError};
-use crate::wasm_compat::WasmCompatSend;
 
 // ================================================================
 // Mistral Transcription API
@@ -98,7 +97,7 @@ pub struct TranscriptionModel<T = reqwest::Client> {
 
 impl<T> transcription::TranscriptionModel for TranscriptionModel<T>
 where
-    T: HttpClientExt + Clone + std::fmt::Debug + Default + WasmCompatSend + 'static,
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
 {
     type Response = MistralTranscriptionResponse;
     type Client = Client<T>;

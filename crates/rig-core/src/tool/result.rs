@@ -2,13 +2,12 @@
 
 use std::{error::Error, sync::Arc};
 
-use crate::{
-    tool::ToolOutput,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
-};
+use serde::{Deserialize, Serialize};
+
+use crate::tool::ToolOutput;
 
 /// Normalized classification for a tool execution error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[non_exhaustive]
 pub enum ToolErrorKind {
     /// Arguments could not be decoded or validated.
@@ -97,10 +96,7 @@ pub struct ToolExecutionError {
     code: Option<String>,
     http_status: Option<u16>,
     refusal: bool,
-    #[cfg(not(target_family = "wasm"))]
     source: Option<Arc<dyn Error + Send + Sync + 'static>>,
-    #[cfg(target_family = "wasm")]
-    source: Option<Arc<dyn Error + 'static>>,
 }
 
 impl ToolExecutionError {
@@ -186,32 +182,16 @@ impl ToolExecutionError {
     /// `ToolExecutionError` preserves its classification and presentation.
     pub fn from_error<E>(error: E) -> Self
     where
-        E: Error + WasmCompatSend + WasmCompatSync + 'static,
+        E: Error + Send + Sync + 'static,
     {
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let source: Box<dyn Error + Send + Sync + 'static> = Box::new(error);
-            return match source.downcast::<Self>() {
-                Ok(error) => *error,
-                Err(source) => {
-                    let message = source.to_string();
-                    let mut error = Self::other(message).redact_model_feedback();
-                    error.source = Some(Arc::from(source));
-                    error
-                }
-            };
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            let source: Box<dyn Error + 'static> = Box::new(error);
-            match source.downcast::<Self>() {
-                Ok(error) => *error,
-                Err(source) => {
-                    let message = source.to_string();
-                    let mut error = Self::other(message).redact_model_feedback();
-                    error.source = Some(Arc::from(source));
-                    error
-                }
+        let source: Box<dyn Error + Send + Sync + 'static> = Box::new(error);
+        match source.downcast::<Self>() {
+            Ok(error) => *error,
+            Err(source) => {
+                let message = source.to_string();
+                let mut error = Self::other(message).redact_model_feedback();
+                error.source = Some(Arc::from(source));
+                error
             }
         }
     }
@@ -262,7 +242,7 @@ impl ToolExecutionError {
     /// Preserve a concrete source for later downcasting.
     pub fn with_source<E>(mut self, source: E) -> Self
     where
-        E: Error + WasmCompatSend + WasmCompatSync + 'static,
+        E: Error + Send + Sync + 'static,
     {
         self.source = Some(Arc::new(source));
         self
@@ -314,7 +294,7 @@ impl ToolExecutionError {
     /// Downcast the concrete source to `E`.
     pub fn downcast_ref<E>(&self) -> Option<&E>
     where
-        E: Error + WasmCompatSend + WasmCompatSync + 'static,
+        E: Error + Send + Sync + 'static,
     {
         self.source.as_ref()?.downcast_ref::<E>()
     }
@@ -322,7 +302,7 @@ impl ToolExecutionError {
     /// Whether the concrete source has type `E`.
     pub fn is<E>(&self) -> bool
     where
-        E: Error + WasmCompatSend + WasmCompatSync + 'static,
+        E: Error + Send + Sync + 'static,
     {
         self.downcast_ref::<E>().is_some()
     }
@@ -377,13 +357,15 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    pub(crate) fn success(output: ToolOutput) -> Self {
+    /// Creates a successful normalized result.
+    pub fn success(output: ToolOutput) -> Self {
         Self {
             disposition: ToolDisposition::Success(output),
         }
     }
 
-    pub(crate) fn failed(error: ToolExecutionError) -> Self {
+    /// Creates a failed or refused normalized result.
+    pub fn failed(error: ToolExecutionError) -> Self {
         let disposition = if error.is_refusal() {
             ToolDisposition::Refused(error)
         } else {
@@ -392,7 +374,8 @@ impl ToolResult {
         Self { disposition }
     }
 
-    pub(crate) fn skipped(reason: impl Into<String>) -> Self {
+    /// Creates a policy-skipped normalized result.
+    pub fn skipped(reason: impl Into<String>) -> Self {
         Self {
             disposition: ToolDisposition::Skipped(ToolOutput::text(reason)),
         }
@@ -461,7 +444,8 @@ impl ToolResult {
         self.error().is_some_and(|error| error.kind == kind)
     }
 
-    pub(crate) fn status_name(&self) -> &'static str {
+    /// Stable disposition label for telemetry.
+    pub fn status_name(&self) -> &'static str {
         match &self.disposition {
             ToolDisposition::Success(_) => "success",
             ToolDisposition::Error(_) => "error",

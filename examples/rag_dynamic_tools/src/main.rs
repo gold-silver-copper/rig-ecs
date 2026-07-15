@@ -2,10 +2,9 @@ use anyhow::Result;
 use rig::prelude::*;
 use rig::providers::openai;
 use rig::{
-    completion::Prompt,
-    embeddings::EmbeddingsBuilder,
+    embeddings::{EmbeddingsBuilder, ToolSchema},
     providers::openai::Client,
-    tool::{Tool, ToolEmbedding, ToolSet},
+    tool::{Tool, ToolEmbedding},
     vector_store::in_memory_store::InMemoryVectorStore,
 };
 use serde::{Deserialize, Serialize};
@@ -53,11 +52,7 @@ impl Tool for Add {
             }
         })
     }
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x + args.y;
         Ok(result)
     }
@@ -101,11 +96,7 @@ impl Tool for Subtract {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x - args.y;
         Ok(result)
     }
@@ -138,29 +129,28 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
     let openai_client = Client::from_env()?;
     let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
-    let toolset = ToolSet::builder()
-        .retrieved_tool(Add)
-        .retrieved_tool(Subtract)
-        .build();
+    let add = Add;
+    let subtract = Subtract;
+    let schemas = vec![
+        ToolSchema::try_from(&add)?,
+        ToolSchema::try_from(&subtract)?,
+    ];
     let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
-        .documents(toolset.schemas()?)?
+        .documents(schemas)?
         .build()
         .await?;
-
-    // Create vector store with the embeddings
     let vector_store =
         InMemoryVectorStore::from_documents_with_id_f(embeddings, |tool| tool.name.clone());
-
-    // Create vector store index
     let index = vector_store.index(embedding_model);
 
-    // Create RAG agent with a single context prompt and a dynamic tool source
+    // Candidate tools remain executable ECS capability entities, while a
+    // scheduled store operation selects one immutable per-turn tool snapshot.
     let calculator_rag = openai_client
         .agent(openai::GPT_4)
         .preamble("You are a calculator here to help the user perform arithmetic operations.")
-        // Add a dynamic tool source with a sample rate of 1 (i.e.: only
-        // 1 additional tool will be added to prompts)
-        .retrieved_tools(1, index, toolset)
+        .retrieved_tool(add)
+        .retrieved_tool(subtract)
+        .retrieved_tools(1, index)
         .default_max_turns(2)
         .build();
 

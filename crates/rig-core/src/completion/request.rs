@@ -38,7 +38,6 @@ use super::message::{AssistantContent, DocumentMediaType};
 use crate::message::ToolChoice;
 use crate::provider_response;
 use crate::streaming::StreamingCompletionResponse;
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use crate::{OneOrMany, http_client};
 use crate::{
     json_utils,
@@ -97,15 +96,9 @@ pub enum CompletionError {
     #[error("UrlError: {0}")]
     UrlError(#[from] url::ParseError),
 
-    #[cfg(not(target_family = "wasm"))]
     /// Error building the completion request
     #[error("RequestError: {0}")]
     RequestError(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
-
-    #[cfg(target_family = "wasm")]
-    /// Error building the completion request
-    #[error("RequestError: {0}")]
-    RequestError(#[from] Box<dyn std::error::Error + 'static>),
 
     /// Error parsing the completion response
     #[error("ResponseError: {0}")]
@@ -211,16 +204,6 @@ impl PromptError {
         match self {
             Self::CompletionError(error) => error.provider_response_status(),
             _ => None,
-        }
-    }
-
-    pub(crate) fn prompt_cancelled(
-        chat_history: impl IntoIterator<Item = Message>,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self::PromptCancelled {
-            chat_history: chat_history.into_iter().collect(),
-            reason: reason.into(),
         }
     }
 }
@@ -355,7 +338,7 @@ impl ProviderToolDefinition {
 // Implementations
 // ================================================================
 /// Trait defining a high-level LLM simple prompt interface (i.e.: prompt in, response out).
-pub trait Prompt: WasmCompatSend + WasmCompatSync {
+pub trait Prompt: Send + Sync {
     /// Send a simple prompt to the underlying completion model.
     ///
     /// If the completion model's response is a message, then it is returned as a string.
@@ -366,12 +349,12 @@ pub trait Prompt: WasmCompatSend + WasmCompatSync {
     /// If the tool does not exist, or the tool call fails, then an error is returned.
     fn prompt(
         &self,
-        prompt: impl Into<Message> + WasmCompatSend,
-    ) -> impl std::future::IntoFuture<Output = Result<String, PromptError>, IntoFuture: WasmCompatSend>;
+        prompt: impl Into<Message> + Send,
+    ) -> impl std::future::IntoFuture<Output = Result<String, PromptError>, IntoFuture: Send>;
 }
 
 /// Trait defining a high-level LLM chat interface (i.e.: prompt and chat history in, response out).
-pub trait Chat: WasmCompatSend + WasmCompatSync {
+pub trait Chat: Send + Sync {
     /// Send a prompt with optional chat history to the underlying completion model.
     ///
     /// If the completion model's response is a message, then it is returned as a string.
@@ -387,9 +370,9 @@ pub trait Chat: WasmCompatSend + WasmCompatSync {
     /// before calling this method.
     fn chat(
         &self,
-        prompt: impl Into<Message> + WasmCompatSend,
+        prompt: impl Into<Message> + Send,
         chat_history: &mut Vec<Message>,
-    ) -> impl std::future::Future<Output = Result<String, PromptError>> + WasmCompatSend;
+    ) -> impl std::future::Future<Output = Result<String, PromptError>> + Send;
 }
 
 /// Trait defining a high-level typed prompt interface for structured output.
@@ -415,11 +398,11 @@ pub trait Chat: WasmCompatSend + WasmCompatSync {
 ///     .prompt_typed("What's the weather in NYC?")
 ///     .await?;
 /// ```
-pub trait TypedPrompt: WasmCompatSend + WasmCompatSync {
+pub trait TypedPrompt: Send + Sync {
     /// The type of the typed prompt request returned by `prompt_typed`.
     type TypedRequest<T>: std::future::IntoFuture<Output = Result<T, StructuredOutputError>>
     where
-        T: schemars::JsonSchema + DeserializeOwned + WasmCompatSend + 'static;
+        T: schemars::JsonSchema + DeserializeOwned + Send + 'static;
 
     /// Send a prompt and receive a typed structured response.
     ///
@@ -430,7 +413,7 @@ pub trait TypedPrompt: WasmCompatSend + WasmCompatSync {
     /// # Type Parameters
     /// * `T` - The target type to deserialize the response into. Must implement
     ///   `JsonSchema` (for schema generation), `DeserializeOwned` (for deserialization),
-    ///   and `WasmCompatSend` (for async compatibility).
+    ///   and `Send` (for async compatibility).
     ///
     /// # Example
     /// ```rust,ignore
@@ -440,9 +423,9 @@ pub trait TypedPrompt: WasmCompatSend + WasmCompatSync {
     /// // Or specified explicitly with turbofish
     /// let forecast = agent.prompt_typed::<WeatherForecast>("What's the weather?").await?;
     /// ```
-    fn prompt_typed<T>(&self, prompt: impl Into<Message> + WasmCompatSend) -> Self::TypedRequest<T>
+    fn prompt_typed<T>(&self, prompt: impl Into<Message> + Send) -> Self::TypedRequest<T>
     where
-        T: schemars::JsonSchema + DeserializeOwned + WasmCompatSend;
+        T: schemars::JsonSchema + DeserializeOwned + Send;
 }
 
 /// Trait defining a low-level LLM completion interface
@@ -456,16 +439,15 @@ pub trait Completion<M: CompletionModel> {
     /// For fields that have already been set by the model, calling the corresponding
     /// method on the builder will overwrite the value set by the model.
     ///
-    /// For example, the request builder returned by [`Agent::completion`](crate::agent::Agent::completion) will already
-    /// contain the `preamble` provided when creating the agent.
+    /// For example, an agent-backed implementation can populate the request with
+    /// the preamble provided when creating that agent.
     fn completion<I, T>(
         &self,
-        prompt: impl Into<Message> + WasmCompatSend,
+        prompt: impl Into<Message> + Send,
         chat_history: I,
-    ) -> impl std::future::Future<Output = Result<CompletionRequestBuilder<M>, CompletionError>>
-    + WasmCompatSend
+    ) -> impl std::future::Future<Output = Result<CompletionRequestBuilder<M>, CompletionError>> + Send
     where
-        I: IntoIterator<Item = T> + WasmCompatSend,
+        I: IntoIterator<Item = T> + Send,
         T: Into<Message>;
 }
 
@@ -597,17 +579,18 @@ impl AddAssign for Usage {
 /// Trait defining a completion model that can be used to generate completion responses.
 /// This trait is meant to be implemented by the user to define a custom completion model,
 /// either from a third party provider (e.g.: OpenAI) or a local model.
-pub trait CompletionModel: Clone + WasmCompatSend + WasmCompatSync {
+pub trait CompletionModel: Clone + Send + Sync {
     /// The raw response type returned by the underlying completion model.
-    type Response: WasmCompatSend + WasmCompatSync + Serialize + DeserializeOwned;
+    type Response: Send + Sync + Serialize + DeserializeOwned + 'static;
     /// The raw response type returned by the underlying completion model when streaming.
     type StreamingResponse: Clone
         + Unpin
-        + WasmCompatSend
-        + WasmCompatSync
+        + Send
+        + Sync
         + Serialize
         + DeserializeOwned
-        + GetTokenUsage;
+        + GetTokenUsage
+        + 'static;
 
     /// Provider client type used to construct this model.
     type Client;
@@ -621,14 +604,14 @@ pub trait CompletionModel: Clone + WasmCompatSend + WasmCompatSync {
         request: CompletionRequest,
     ) -> impl std::future::Future<
         Output = Result<CompletionResponse<Self::Response>, CompletionError>,
-    > + WasmCompatSend;
+    > + Send;
 
     fn stream(
         &self,
         request: CompletionRequest,
     ) -> impl std::future::Future<
         Output = Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>,
-    > + WasmCompatSend;
+    > + Send;
 
     /// Generates a completion request builder for the given `prompt`.
     fn completion_request(&self, prompt: impl Into<Message>) -> CompletionRequestBuilder<Self> {
@@ -641,10 +624,8 @@ pub trait CompletionModel: Clone + WasmCompatSend + WasmCompatSync {
     ///
     /// Defaults to `false` (the safe assumption: the native constraint may make
     /// the model emit schema JSON instead of calling its tools — see issue
-    /// #1928). Providers that enforce structured output *and* tool use together
-    /// (e.g. OpenAI, Anthropic) override this to `true`, which lets the agent's
-    /// [`OutputMode::Auto`](crate::agent::OutputMode::Auto) keep using guaranteed
-    /// native structured output even when the agent has tools.
+    /// #1928). Providers that enforce structured output and tool use together
+    /// override this to `true`.
     fn composes_native_output_with_tools(&self) -> bool {
         false
     }

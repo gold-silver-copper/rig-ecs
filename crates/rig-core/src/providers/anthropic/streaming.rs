@@ -17,7 +17,6 @@ use crate::streaming::{
     self, RawStreamingChoice, RawStreamingToolCall, StreamingResult, ToolCallDeltaContent,
 };
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder, SpanCombinator};
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use std::collections::HashMap;
 
 /// Build the Anthropic streaming request body.
@@ -217,7 +216,7 @@ impl GetTokenUsage for StreamingCompletionResponse {
 impl<Ext, T> GenericCompletionModel<Ext, T>
 where
     T: HttpClientExt + Clone + Default + 'static,
-    Ext: AnthropicCompatibleProvider + Clone + WasmCompatSend + WasmCompatSync + 'static,
+    Ext: AnthropicCompatibleProvider + Clone + Send + Sync + 'static,
 {
     pub(crate) async fn stream(
         &self,
@@ -298,23 +297,23 @@ where
                                         span.record("gen_ai.response.id", &message.id);
                                         span.record("gen_ai.response.model", &message.model);
                                     },
-                                    StreamingEvent::MessageDelta { delta, usage } => {
-                                        if delta.stop_reason.is_some() {
-                                            // cache_creation_input_tokens and cache_read_input_tokens
-                                            // are cumulative totals on message_delta.usage per the
-                                            // Anthropic streaming API spec — use them directly.
-                                            let usage = PartialUsage {
-                                                 output_tokens: usage.output_tokens,
-                                                 input_tokens: usize::try_from(input_tokens).ok(),
-                                                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                                 cache_read_input_tokens: usage.cache_read_input_tokens
-                                            };
+                                    StreamingEvent::MessageDelta { delta, usage }
+                                        if delta.stop_reason.is_some() =>
+                                    {
+                                        // cache_creation_input_tokens and cache_read_input_tokens
+                                        // are cumulative totals on message_delta.usage per the
+                                        // Anthropic streaming API spec — use them directly.
+                                        let usage = PartialUsage {
+                                             output_tokens: usage.output_tokens,
+                                             input_tokens: usize::try_from(input_tokens).ok(),
+                                             cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                                             cache_read_input_tokens: usage.cache_read_input_tokens
+                                        };
 
-                                            let span = tracing::Span::current();
-                                            span.record_token_usage(&usage);
-                                            final_usage = Some(usage);
-                                            break;
-                                        }
+                                        let span = tracing::Span::current();
+                                        span.record_token_usage(&usage);
+                                        final_usage = Some(usage);
+                                        break;
                                     }
                                     _ => {}
                                 }

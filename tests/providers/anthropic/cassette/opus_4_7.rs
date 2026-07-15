@@ -3,7 +3,7 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
 use rig::client::CompletionClient;
 use rig::completion::message::Image;
-use rig::completion::{Chat, Message, Prompt};
+use rig::completion::{Chat, Message};
 use rig::message::{DocumentSourceKind, ImageMediaType};
 use rig::providers::anthropic::completion::CLAUDE_OPUS_4_7;
 use rig::streaming::{StreamingChat, StreamingPrompt};

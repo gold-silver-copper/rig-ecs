@@ -10,7 +10,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: 1.94.0
+  RUST_VERSION: 1.95.0
 
 # ensure that the workflow is only triggered once per PR, subsequent pushes to the PR will cancel
 # and restart the workflow. See https://docs.github.com/en/actions/using-jobs/using-concurrency
@@ -25,6 +25,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check merge-base example inventory
+        run: |
+          missing=0
+          while IFS= read -r manifest; do
+            if [[ ! -f "$manifest" ]]; then
+              echo "::error file=$manifest::Example present at the migration merge base was removed"
+              missing=1
+            fi
+          done < .github/example-inventory.txt
+          exit "$missing"
 
       - name: Install Rust stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -65,13 +76,23 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
 
       - name: Run cargo check wasm target
-        run: cargo check --package rig-core --features wasm --target wasm32-unknown-unknown
+        run: cargo check --package rig-core --no-default-features --features wasm --target wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen test runner
+        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
+
+      - name: Run ECS runtime smoke test in Chrome
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          WASM_BINDGEN_TEST_ONLY_WEB: "1"
+        run: cargo test --package rig-core --target wasm32-unknown-unknown --no-default-features --features wasm --test wasm_runtime -- --nocapture
 
   clippy:
     name: stable / clippy
     runs-on: ubuntu-latest
     permissions:
       checks: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -119,20 +140,57 @@ jobs:
       - name: Compile default-feature root test targets
         run: cargo test -p rig --tests --no-run
 
-      - name: Test rig-core agent unit tests with all features
-        run: cargo nextest run -p rig-core --all-features -E 'test(agent::)' --retries 2
+      - name: Test rig-core runtime unit tests with all features
+        run: cargo nextest run -p rig-core --all-features -E 'test(runtime::)' --retries 2
 
-      - name: Test with latest nextest release
-        uses: actions-rs/cargo@v1
-        with:
-          command: nextest
-          args: run --all-features --retries 2
+      # Run Docker-backed integrations on separate runners below. Pulling every
+      # service image into one runner exhausts the hosted runner's disk before
+      # the integration target can finish.
+      - name: Test workspace with latest nextest release
+        run: >-
+          cargo nextest run --all-features
+          -E 'not (test(mongodb::) | test(neo4j::) | test(postgres::) | test(qdrant::))'
+          --retries 2
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+
+  integration:
+    name: stable / integration (${{ matrix.integration }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        integration:
+          - mongodb
+          - neo4j
+          - postgres
+          - qdrant
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # Required to compile rig-lancedb.
+      - name: Install Protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Test integration module
+        run: >-
+          cargo nextest run -p rig --all-features --test integrations
+          -E 'test(${{ matrix.integration }}::)' --retries 2
 
   # `cargo nextest` (used by the `test` job) does NOT run doctests, and the
   # `doc` job only builds documentation — so without this job nothing executes

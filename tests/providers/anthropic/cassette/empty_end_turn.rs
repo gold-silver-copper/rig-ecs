@@ -10,7 +10,7 @@ use std::sync::{
 
 use rig::{
     client::CompletionClient,
-    completion::{CompletionModel, Prompt, ToolDefinition},
+    completion::{CompletionModel, ToolDefinition},
     message::{AssistantContent, Message, UserContent},
     providers::anthropic::completion::CLAUDE_SONNET_4_6,
     tool::Tool,
@@ -80,11 +80,7 @@ impl Tool for Notify {
         notify_tool_definition().parameters
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         Ok(format!("sent: {}", args.msg))
     }

@@ -7,11 +7,8 @@ use std::{
 
 use bytes::Bytes;
 
-use crate::{
-    http_client::{
-        self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
-    },
-    wasm_compat::WasmCompatSend,
+use crate::http_client::{
+    self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 
 /// Request data captured by [`RecordingHttpClient`].
@@ -125,7 +122,7 @@ impl RecordingHttpClient {
         response: MockHttpResponse,
     ) -> http_client::Result<Response<LazyBody<U>>>
     where
-        U: From<Bytes> + WasmCompatSend + 'static,
+        U: From<Bytes> + Send + 'static,
     {
         let (status, response_body) = match response {
             MockHttpResponse::Success(response_body) => (http::StatusCode::OK, response_body),
@@ -148,10 +145,10 @@ impl HttpClientExt for RecordingHttpClient {
     fn send<T, U>(
         &self,
         req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        T: Into<Bytes> + WasmCompatSend,
-        U: From<Bytes> + WasmCompatSend + 'static,
+        T: Into<Bytes> + Send,
+        U: From<Bytes> + Send + 'static,
     {
         let response = self.response_guard().clone();
         let (parts, body) = req.into_parts();
@@ -163,9 +160,9 @@ impl HttpClientExt for RecordingHttpClient {
     fn send_multipart<U>(
         &self,
         req: Request<MultipartForm>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        U: From<Bytes> + WasmCompatSend + 'static,
+        U: From<Bytes> + Send + 'static,
     {
         let response = self.response_guard().clone();
         let (parts, _body) = req.into_parts();
@@ -177,9 +174,9 @@ impl HttpClientExt for RecordingHttpClient {
     fn send_streaming<T>(
         &self,
         _req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + WasmCompatSend
+    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send
     where
-        T: Into<Bytes> + WasmCompatSend,
+        T: Into<Bytes> + Send,
     {
         future::ready(Err(http_client::Error::InvalidStatusCode(
             http::StatusCode::NOT_IMPLEMENTED,
@@ -200,10 +197,10 @@ impl HttpClientExt for MockStreamingClient {
     fn send<T, U>(
         &self,
         _req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        T: Into<Bytes> + WasmCompatSend,
-        U: From<Bytes> + WasmCompatSend + 'static,
+        T: Into<Bytes> + Send,
+        U: From<Bytes> + Send + 'static,
     {
         future::ready(Err(http_client::Error::InvalidStatusCode(
             http::StatusCode::NOT_IMPLEMENTED,
@@ -213,9 +210,9 @@ impl HttpClientExt for MockStreamingClient {
     fn send_multipart<U>(
         &self,
         _req: Request<MultipartForm>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        U: From<Bytes> + WasmCompatSend + 'static,
+        U: From<Bytes> + Send + 'static,
     {
         future::ready(Err(http_client::Error::InvalidStatusCode(
             http::StatusCode::NOT_IMPLEMENTED,
@@ -225,9 +222,9 @@ impl HttpClientExt for MockStreamingClient {
     fn send_streaming<T>(
         &self,
         _req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + WasmCompatSend
+    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send
     where
-        T: Into<Bytes> + WasmCompatSend,
+        T: Into<Bytes> + Send,
     {
         let sse_bytes = self.sse_bytes.clone();
         async move {
@@ -274,10 +271,10 @@ impl HttpClientExt for HttpErrorStreamingClient {
     fn send<T, U>(
         &self,
         _req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        T: Into<Bytes> + WasmCompatSend,
-        U: From<Bytes> + WasmCompatSend + 'static,
+        T: Into<Bytes> + Send,
+        U: From<Bytes> + Send + 'static,
     {
         future::ready(Err(http_client::Error::InvalidStatusCode(
             http::StatusCode::NOT_IMPLEMENTED,
@@ -287,9 +284,9 @@ impl HttpClientExt for HttpErrorStreamingClient {
     fn send_multipart<U>(
         &self,
         _req: Request<MultipartForm>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        U: From<Bytes> + WasmCompatSend + 'static,
+        U: From<Bytes> + Send + 'static,
     {
         future::ready(Err(http_client::Error::InvalidStatusCode(
             http::StatusCode::NOT_IMPLEMENTED,
@@ -299,9 +296,9 @@ impl HttpClientExt for HttpErrorStreamingClient {
     fn send_streaming<T>(
         &self,
         _req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + WasmCompatSend
+    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send
     where
-        T: Into<Bytes> + WasmCompatSend,
+        T: Into<Bytes> + Send,
     {
         let status = self.status;
         let body = self.body.clone();
@@ -333,10 +330,10 @@ impl HttpClientExt for SequencedStreamingHttpClient {
     fn send<T, U>(
         &self,
         _req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        T: Into<Bytes> + WasmCompatSend,
-        U: From<Bytes> + WasmCompatSend + 'static,
+        T: Into<Bytes> + Send,
+        U: From<Bytes> + Send + 'static,
     {
         future::ready(Err(http_client::Error::InvalidStatusCode(
             http::StatusCode::NOT_IMPLEMENTED,
@@ -346,9 +343,9 @@ impl HttpClientExt for SequencedStreamingHttpClient {
     fn send_multipart<U>(
         &self,
         _req: Request<MultipartForm>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
     where
-        U: From<Bytes> + WasmCompatSend + 'static,
+        U: From<Bytes> + Send + 'static,
     {
         future::ready(Err(http_client::Error::InvalidStatusCode(
             http::StatusCode::NOT_IMPLEMENTED,
@@ -358,9 +355,9 @@ impl HttpClientExt for SequencedStreamingHttpClient {
     fn send_streaming<T>(
         &self,
         _req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + WasmCompatSend
+    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + Send
     where
-        T: Into<Bytes> + WasmCompatSend,
+        T: Into<Bytes> + Send,
     {
         let chunks = match self.chunks.lock() {
             Ok(mut guard) => guard.take(),
