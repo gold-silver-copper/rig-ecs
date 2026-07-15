@@ -15,7 +15,7 @@ use rig::client::CompletionClient;
 use rig::providers::gemini;
 use rig::runtime::{
     Agent as RuntimeAgent, CompletionRequestPrepared, ModelTurnFinished, PolicyRule, RequestPatch,
-    RetrievedDocument, ToolCallPrepared, ToolResultPresentationFinalized,
+    RetrievedDocument, ToolCallPrepared, ToolEffectInput, ToolResultPresentationFinalized,
 };
 
 use super::super::support::with_gemini_cassette;
@@ -126,16 +126,20 @@ pub(super) fn install_tap(
                         .push(event.call.call_id.clone());
                 });
             let result_tap = tap.clone();
-            runtime
-                .world_mut()
-                .add_observer(move |event: On<ToolResultPresentationFinalized>| {
+            runtime.world_mut().add_observer(
+                move |event: On<ToolResultPresentationFinalized>,
+                      inputs: Query<&ToolEffectInput>| {
                     result_tap.record(event.run, "ToolResult", 1);
+                    let input = inputs
+                        .get(event.operation)
+                        .expect("finalized tool operation should retain its immutable input");
                     result_tap
                         .result_ids
                         .lock()
                         .expect("result ids")
-                        .push(event.raw.call_id.clone());
-                });
+                        .push(input.call_id.clone());
+                },
+            );
             runtime
                 .world_mut()
                 .add_observer(move |event: On<ModelTurnFinished>| {

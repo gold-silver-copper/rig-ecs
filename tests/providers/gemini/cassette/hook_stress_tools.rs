@@ -3,12 +3,13 @@
 //! stopping from a tool result (post-execution), and model-driven recovery
 //! from a tool error. Recorded against real Gemini.
 
-use rig::bevy_ecs::prelude::On;
+use rig::bevy_ecs::prelude::{On, Query};
 use rig::client::CompletionClient;
 use rig::providers::gemini;
 use rig::runtime::{
     PolicyPoint, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation, ToolCallPrepared,
-    ToolResultPolicyDecision, ToolResultPolicyInvocation, ToolResultPresentationFinalized,
+    ToolEffectInput, ToolResultPolicyDecision, ToolResultPolicyInvocation,
+    ToolResultPresentationFinalized,
 };
 use rig::tool::Tool;
 use serde_json::json;
@@ -101,25 +102,29 @@ pub(super) fn install_recorder(
                             event.call.arguments.to_string(),
                         ));
                 });
-            runtime
-                .world_mut()
-                .add_observer(move |event: On<ToolResultPresentationFinalized>| {
+            runtime.world_mut().add_observer(
+                move |event: On<ToolResultPresentationFinalized>,
+                      inputs: Query<&ToolEffectInput>| {
                     let arguments = recorder
                         .calls
                         .lock()
                         .expect("calls lock should not be poisoned")
                         .last()
                         .map_or_else(String::new, |(_, arguments)| arguments.clone());
+                    let input = inputs
+                        .get(event.operation)
+                        .expect("finalized tool operation should retain its immutable input");
                     recorder
                         .results
                         .lock()
                         .expect("results lock should not be poisoned")
                         .push((
-                            event.raw.name.clone(),
+                            input.decision.name.clone(),
                             arguments,
-                            event.raw.presentation.clone(),
+                            event.presentation.clone(),
                         ));
-                });
+                },
+            );
         })
         .expect("recorder observers should install");
 }

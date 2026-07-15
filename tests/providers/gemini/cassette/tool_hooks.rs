@@ -1,12 +1,12 @@
 //! ECS policy dispatch on the tool execution path: skip-with-reason,
 //! stop-before-dispatch, and observation of every call/result pair.
 
-use rig::bevy_ecs::prelude::On;
+use rig::bevy_ecs::prelude::{On, Query};
 use rig::client::CompletionClient;
 use rig::providers::gemini;
 use rig::runtime::{
     PolicyPoint, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation, ToolCallPrepared,
-    ToolResultPresentationFinalized,
+    ToolEffectInput, ToolResultPresentationFinalized,
 };
 use rig::tool::Tool;
 
@@ -156,19 +156,23 @@ async fn hooks_observe_every_tool_call_and_result() {
                                 ));
                         });
                     runtime.world_mut().add_observer(
-                        move |event: On<ToolResultPresentationFinalized>| {
+                        move |event: On<ToolResultPresentationFinalized>,
+                              inputs: Query<&ToolEffectInput>| {
                             let arguments = result_recorder
                                 .calls
                                 .lock()
                                 .expect("calls lock should not be poisoned")
                                 .last()
                                 .map_or_else(String::new, |(_, arguments)| arguments.clone());
+                            let input = inputs.get(event.operation).expect(
+                                "finalized tool operation should retain its immutable input",
+                            );
                             result_recorder
                                 .results
                                 .lock()
                                 .expect("results lock should not be poisoned")
                                 .push((
-                                    event.raw.name.clone(),
+                                    input.decision.name.clone(),
                                     arguments,
                                     event.presentation.clone(),
                                 ));
