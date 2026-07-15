@@ -1891,9 +1891,29 @@ fn remap_store_decision(
 
 fn remap_policies(
     policies: &[PersistedAcceptedPolicy],
+    expected_point: PolicyPoint,
     domain: &DomainRefs,
     tenant: &TenantId,
 ) -> Result<Vec<AcceptedPolicy>, ActiveRunSnapshotError> {
+    let mut previous: Option<(u32, &str)> = None;
+    for policy in policies {
+        if policy.point != expected_point {
+            return Err(ActiveRunSnapshotError::InvalidSnapshot(format!(
+                "accepted policy `{}` has {:?} capability in a {:?} policy container",
+                policy.id.as_str(),
+                policy.point,
+                expected_point
+            )));
+        }
+        let key = (policy.order, policy.id.as_str());
+        if previous.is_some_and(|previous| previous >= key) {
+            return Err(ActiveRunSnapshotError::InvalidSnapshot(format!(
+                "accepted {:?} policies are not uniquely ordered by (order, stable ID)",
+                expected_point
+            )));
+        }
+        previous = Some(key);
+    }
     policies
         .iter()
         .map(|policy| {
@@ -1930,6 +1950,12 @@ fn validate_operation(
     tenant: &TenantId,
     operation_ids: &HashSet<String>,
 ) -> Result<(), ActiveRunSnapshotError> {
+    if operation.generation == u64::MAX {
+        return Err(ActiveRunSnapshotError::InvalidSnapshot(format!(
+            "operation `{}` has no successor generation",
+            operation.id
+        )));
+    }
     let mut model_decision = operation.model_decision.clone();
     if let Some(value) = &mut model_decision {
         remap_model_decision(value, domain, tenant)?;
@@ -1961,17 +1987,28 @@ fn validate_operation(
         let mut input = input.clone();
         remap_store_decision(&mut input.decision, domain, tenant)?;
     }
-    for policies in [
-        operation.request_policies.as_deref(),
-        operation.tool_call_policies.as_deref(),
-        operation.invalid_tool_policies.as_deref(),
-        operation.tool_result_policies.as_deref(),
-        operation.response_policies.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        remap_policies(policies, domain, tenant)?;
+    for (policies, point) in [
+        (operation.request_policies.as_deref(), PolicyPoint::Request),
+        (
+            operation.tool_call_policies.as_deref(),
+            PolicyPoint::ToolCall,
+        ),
+        (
+            operation.invalid_tool_policies.as_deref(),
+            PolicyPoint::InvalidToolCall,
+        ),
+        (
+            operation.tool_result_policies.as_deref(),
+            PolicyPoint::ToolResult,
+        ),
+        (
+            operation.response_policies.as_deref(),
+            PolicyPoint::CompletionResponse,
+        ),
+    ] {
+        if let Some(policies) = policies {
+            remap_policies(policies, point, domain, tenant)?;
+        }
     }
     let valid_kind = match operation.kind {
         PersistedOperationKind::Model => {
@@ -2076,34 +2113,51 @@ fn restore_operation_components(
     if let Some(value) = &persisted.request_policies {
         world
             .entity_mut(entity)
-            .insert(AcceptedPolicies(remap_policies(value, domain, tenant)?));
+            .insert(AcceptedPolicies(remap_policies(
+                value,
+                PolicyPoint::Request,
+                domain,
+                tenant,
+            )?));
     }
     if let Some(value) = &persisted.tool_call_policies {
         world
             .entity_mut(entity)
             .insert(AcceptedToolCallPolicies(remap_policies(
-                value, domain, tenant,
+                value,
+                PolicyPoint::ToolCall,
+                domain,
+                tenant,
             )?));
     }
     if let Some(value) = &persisted.invalid_tool_policies {
         world
             .entity_mut(entity)
             .insert(AcceptedInvalidToolCallPolicies(remap_policies(
-                value, domain, tenant,
+                value,
+                PolicyPoint::InvalidToolCall,
+                domain,
+                tenant,
             )?));
     }
     if let Some(value) = &persisted.tool_result_policies {
         world
             .entity_mut(entity)
             .insert(AcceptedToolResultPolicies(remap_policies(
-                value, domain, tenant,
+                value,
+                PolicyPoint::ToolResult,
+                domain,
+                tenant,
             )?));
     }
     if let Some(value) = &persisted.response_policies {
         world
             .entity_mut(entity)
             .insert(AcceptedCompletionResponsePolicies(remap_policies(
-                value, domain, tenant,
+                value,
+                PolicyPoint::CompletionResponse,
+                domain,
+                tenant,
             )?));
     }
     if let Some(value) = &persisted.effective_tool_output {
@@ -2185,17 +2239,22 @@ fn validate_evaluation(
 ) -> Result<(), ActiveRunSnapshotError> {
     match evaluation {
         PersistedPolicyEvaluation::Request(value) => {
-            remap_policies(&value.policies, domain, tenant)?;
+            remap_policies(&value.policies, PolicyPoint::Request, domain, tenant)?;
             let mut effective = value.effective.clone();
             remap_model_input(&mut effective, domain, tenant)?;
         }
         PersistedPolicyEvaluation::ToolCall(value) => {
-            remap_policies(&value.policies, domain, tenant)?;
+            remap_policies(&value.policies, PolicyPoint::ToolCall, domain, tenant)?;
             let mut effective = value.effective.clone();
             remap_tool_input(&mut effective, domain, tenant)?;
         }
         PersistedPolicyEvaluation::InvalidToolCall(value) => {
-            remap_policies(&value.policies, domain, tenant)?;
+            remap_policies(
+                &value.policies,
+                PolicyPoint::InvalidToolCall,
+                domain,
+                tenant,
+            )?;
             require_local(operations, &value.invalid.source_model_operation)?;
             for tool in &value.invalid.available_tools {
                 let mut tool = tool.clone();
@@ -2203,17 +2262,22 @@ fn validate_evaluation(
             }
         }
         PersistedPolicyEvaluation::ToolResult(value) => {
-            remap_policies(&value.policies, domain, tenant)?;
+            remap_policies(&value.policies, PolicyPoint::ToolResult, domain, tenant)?;
             let mut input = value.input.clone();
             remap_tool_input(&mut input, domain, tenant)?;
         }
         PersistedPolicyEvaluation::CompletionResponse(value) => {
-            remap_policies(&value.policies, domain, tenant)?;
+            remap_policies(
+                &value.policies,
+                PolicyPoint::CompletionResponse,
+                domain,
+                tenant,
+            )?;
             let mut request = value.request.clone();
             remap_model_input(&mut request, domain, tenant)?;
         }
         PersistedPolicyEvaluation::TextDelta(value) => {
-            remap_policies(&value.policies, domain, tenant)?;
+            remap_policies(&value.policies, PolicyPoint::TextDelta, domain, tenant)?;
         }
     }
     validate_evaluation_approval_ref(evaluation, operations)
@@ -2279,7 +2343,7 @@ fn restore_evaluation_components(
             remap_model_input(&mut effective, domain, &tenant)?;
             world.entity_mut(entity).insert(RequestPolicyEvaluation {
                 run,
-                policies: remap_policies(&value.policies, domain, &tenant)?,
+                policies: remap_policies(&value.policies, PolicyPoint::Request, domain, &tenant)?,
                 cursor: value.cursor,
                 effective,
                 accumulated: value.accumulated.clone(),
@@ -2308,7 +2372,7 @@ fn restore_evaluation_components(
             remap_tool_input(&mut effective, domain, &tenant)?;
             world.entity_mut(entity).insert(ToolCallPolicyEvaluation {
                 run,
-                policies: remap_policies(&value.policies, domain, &tenant)?,
+                policies: remap_policies(&value.policies, PolicyPoint::ToolCall, domain, &tenant)?,
                 cursor: value.cursor,
                 effective,
                 phase: match &value.phase {
@@ -2345,7 +2409,12 @@ fn restore_evaluation_components(
                 .entity_mut(entity)
                 .insert(InvalidToolCallPolicyEvaluation {
                     run,
-                    policies: remap_policies(&value.policies, domain, &tenant)?,
+                    policies: remap_policies(
+                        &value.policies,
+                        PolicyPoint::InvalidToolCall,
+                        domain,
+                        &tenant,
+                    )?,
                     cursor: value.cursor,
                     invalid: PendingInvalidToolCall {
                         call: value.invalid.call.clone(),
@@ -2393,7 +2462,12 @@ fn restore_evaluation_components(
             remap_tool_input(&mut input, domain, &tenant)?;
             world.entity_mut(entity).insert(ToolResultPolicyEvaluation {
                 run,
-                policies: remap_policies(&value.policies, domain, &tenant)?,
+                policies: remap_policies(
+                    &value.policies,
+                    PolicyPoint::ToolResult,
+                    domain,
+                    &tenant,
+                )?,
                 cursor: value.cursor,
                 input,
                 effective: value.effective.clone(),
@@ -2426,7 +2500,12 @@ fn restore_evaluation_components(
                 .entity_mut(entity)
                 .insert(CompletionResponsePolicyEvaluation {
                     run,
-                    policies: remap_policies(&value.policies, domain, &tenant)?,
+                    policies: remap_policies(
+                        &value.policies,
+                        PolicyPoint::CompletionResponse,
+                        domain,
+                        &tenant,
+                    )?,
                     cursor: value.cursor,
                     request,
                     effective: value.effective.clone(),
@@ -2454,7 +2533,8 @@ fn restore_evaluation_components(
                 });
         }
         PersistedPolicyEvaluation::TextDelta(value) => {
-            let policies = remap_policies(&value.policies, domain, &tenant)?;
+            let policies =
+                remap_policies(&value.policies, PolicyPoint::TextDelta, domain, &tenant)?;
             world.entity_mut(entity).insert((
                 AcceptedTextDeltaPolicies(policies.clone()),
                 TextDeltaPolicyEvaluation {

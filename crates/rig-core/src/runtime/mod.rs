@@ -17331,6 +17331,21 @@ mod tests {
             )
             .unwrap();
         source
+            .spawn_run_policy(
+                id("run-rewrite-later"),
+                tenant("a"),
+                Policy {
+                    order: 1,
+                    revision: 7,
+                    rule: PolicyRule::RewriteToolArguments {
+                        tool: Some("lookup".to_owned()),
+                        arguments: serde_json::json!({"restored": true}),
+                    },
+                },
+                run,
+            )
+            .unwrap();
+        source
             .effects()
             .completion_sender()
             .try_send(EffectCompletion {
@@ -17366,7 +17381,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(snapshot.version, 4);
-        assert_eq!(snapshot.run_policies.len(), 1);
+        assert_eq!(snapshot.run_policies.len(), 2);
         assert_eq!(snapshot.run_policies[0].id, id("run-rewrite"));
         assert_eq!(snapshot.run_policies[0].run_id, *pending.stable_id());
         let accepted = snapshot
@@ -17393,6 +17408,44 @@ mod tests {
             Err(ActiveRunSnapshotError::InvalidSnapshot(_))
         ));
 
+        let mut wrong_point = snapshot.clone();
+        wrong_point
+            .operations
+            .iter_mut()
+            .find_map(|operation| operation.tool_call_policies.as_mut())
+            .and_then(|policies| policies.first_mut())
+            .unwrap()
+            .point = PolicyPoint::Request;
+        let mut rejected = runtime();
+        rejected.restore(domain.clone()).unwrap();
+        assert!(matches!(
+            rejected.restore_active_run(wrong_point),
+            Err(ActiveRunSnapshotError::InvalidSnapshot(_))
+        ));
+
+        let mut reordered = snapshot.clone();
+        reordered
+            .operations
+            .iter_mut()
+            .find_map(|operation| operation.tool_call_policies.as_mut())
+            .unwrap()
+            .reverse();
+        let mut rejected = runtime();
+        rejected.restore(domain.clone()).unwrap();
+        assert!(matches!(
+            rejected.restore_active_run(reordered),
+            Err(ActiveRunSnapshotError::InvalidSnapshot(_))
+        ));
+
+        let mut exhausted_generation = snapshot.clone();
+        exhausted_generation.operations[0].generation = u64::MAX;
+        let mut rejected = runtime();
+        rejected.restore(domain.clone()).unwrap();
+        assert!(matches!(
+            rejected.restore_active_run(exhausted_generation),
+            Err(ActiveRunSnapshotError::InvalidSnapshot(_))
+        ));
+
         let mut restored = runtime();
         restored.restore(domain).unwrap();
         let runs = restored.restore_active_run(snapshot).unwrap();
@@ -17407,6 +17460,16 @@ mod tests {
                 entity
                     .get::<StableId>()
                     .is_some_and(|stable_id| stable_id == &id("run-rewrite"))
+            })
+            .map(|entity| entity.id())
+            .unwrap();
+        let restored_later_policy = restored
+            .world()
+            .iter_entities()
+            .find(|entity| {
+                entity
+                    .get::<StableId>()
+                    .is_some_and(|stable_id| stable_id == &id("run-rewrite-later"))
             })
             .map(|entity| entity.id())
             .unwrap();
@@ -17437,13 +17500,22 @@ mod tests {
             restored
                 .world()
                 .get::<AcceptedToolCallPolicies>(tool.operation),
-            Some(&AcceptedToolCallPolicies(vec![AcceptedPolicy {
-                id: id("run-rewrite"),
-                entity: restored_policy,
-                revision: 6,
-                order: 0,
-                point: PolicyPoint::ToolCall,
-            }]))
+            Some(&AcceptedToolCallPolicies(vec![
+                AcceptedPolicy {
+                    id: id("run-rewrite"),
+                    entity: restored_policy,
+                    revision: 6,
+                    order: 0,
+                    point: PolicyPoint::ToolCall,
+                },
+                AcceptedPolicy {
+                    id: id("run-rewrite-later"),
+                    entity: restored_later_policy,
+                    revision: 7,
+                    order: 1,
+                    point: PolicyPoint::ToolCall,
+                },
+            ]))
         );
     }
 
