@@ -1,20 +1,48 @@
-//! Hook-system stress suite: `RequestPatch` steering on `CompletionCall` —
-//! preamble override, `tool_choice`, per-turn `history` replacement, and
+//! ECS request-policy stress suite: `RequestPatch` steering —
+//! instruction override, `tool_choice`, per-turn `history` replacement, and
 //! multi-field patches. Recorded against real Gemini; each patch effect is
 //! proven by a downstream-observable change (the model can't echo settings).
 
-use rig::agent::RequestPatch;
+use rig::bevy_ecs::prelude::{Commands, On};
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
-use rig::message::{Message, ToolChoice};
 use rig::providers::gemini;
+use rig::runtime::{
+    CompletionRequestPrepared, ModelToolChoice, PolicyRule, PolicyStatus, RequestPatch,
+    RetrievedDocument, TranscriptEntry,
+};
 
-use super::super::hook_stress_support::{ApplyPatch, FirstTurnPatch, fact_doc};
 use super::super::support::with_gemini_cassette;
 use super::super::tools_support::CountingAdd;
-use crate::support::assert_nonempty_response;
+use crate::support::{assert_nonempty_response, install_policy};
 
 const CODEWORD: &str = "ZULU-99";
+
+fn install_request_patch(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    id: &str,
+    patch: RequestPatch,
+) {
+    install_policy(agent, id, 0, 1, PolicyRule::PatchRequest(patch))
+        .expect("request policy should install");
+}
+
+fn install_first_request_patch(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    id: &str,
+    patch: RequestPatch,
+) {
+    let policy = install_policy(agent, id, 0, 1, PolicyRule::PatchRequest(patch))
+        .expect("request policy should install");
+    agent
+        .with_runtime_mut(move |runtime| {
+            runtime.world_mut().add_observer(
+                move |_event: On<CompletionRequestPrepared>, mut commands: Commands| {
+                    commands.entity(policy).insert(PolicyStatus::Retired);
+                },
+            );
+        })
+        .expect("retirement observer should install");
+}
 
 #[tokio::test]
 async fn preamble_override_forces_codeword_blocking() {
@@ -28,19 +56,22 @@ async fn preamble_override_forces_codeword_blocking() {
                 .preamble("You are a terse assistant.")
                 .build();
 
+            install_request_patch(
+                &agent,
+                "override-instructions",
+                RequestPatch::new()
+                    .instructions(format!(
+                        "You are a terse assistant. End every reply with the exact token \
+                         {CODEWORD} on its own, verbatim."
+                    ))
+                    .temperature(0.0),
+            );
+
             // A hook overrides the preamble for this turn to require a codeword
             // suffix — a behavior change only the injected preamble can cause.
             let response = agent
                 .prompt("Greet me in one short sentence.")
                 .max_turns(2)
-                .add_hook(ApplyPatch(
-                    RequestPatch::new()
-                        .preamble(format!(
-                            "You are a terse assistant. End every reply with the exact token \
-                             {CODEWORD} on its own, verbatim."
-                        ))
-                        .temperature(0.0),
-                ))
                 .await
                 .expect("preamble-override run should succeed");
 
@@ -67,6 +98,14 @@ async fn tool_choice_required_forces_a_tool_call_blocking() {
                 .tool(add)
                 .build();
 
+            install_first_request_patch(
+                &agent,
+                "require-first-tool",
+                RequestPatch::new()
+                    .tool_choice(ModelToolChoice::Required)
+                    .temperature(0.0),
+            );
+
             // Force tool_choice = Required on the FIRST turn only, so the model
             // must call the tool up front. (Forcing it every turn would force a
             // tool call on every turn and loop until max_turns — a real footgun
@@ -74,11 +113,6 @@ async fn tool_choice_required_forces_a_tool_call_blocking() {
             let response = agent
                 .prompt("Use the add tool to compute 12 plus 30, then report the number.")
                 .max_turns(4)
-                .add_hook(FirstTurnPatch(
-                    RequestPatch::new()
-                        .tool_choice(ToolChoice::Required)
-                        .temperature(0.0),
-                ))
                 .await
                 .expect("tool_choice=Required run should succeed");
 
@@ -103,18 +137,22 @@ async fn history_replacement_injects_prior_fact_blocking() {
                 .preamble("You are a helpful assistant. Use the conversation so far to answer.")
                 .build();
 
+            install_request_patch(
+                &agent,
+                "replace-history",
+                RequestPatch::new()
+                    .history([TranscriptEntry::User(
+                        "For this session, the passphrase is OMEGA-7. Acknowledge and remember it."
+                            .to_owned(),
+                    )])
+                    .temperature(0.0),
+            );
+
             // A hook replaces the messages sent this turn with a synthetic prior
             // exchange that establishes a fact — the model answers from it.
             let response = agent
                 .prompt("What is the passphrase?")
                 .max_turns(2)
-                .add_hook(ApplyPatch(
-                    RequestPatch::new()
-                        .history([Message::user(
-                            "For this session, the passphrase is OMEGA-7. Acknowledge and remember it.",
-                        )])
-                        .temperature(0.0),
-                ))
                 .await
                 .expect("history-replacement run should succeed");
 
@@ -138,20 +176,27 @@ async fn multi_field_patch_applies_preamble_and_context_blocking() {
                 .preamble("You are a terse assistant.")
                 .build();
 
+            install_request_patch(
+                &agent,
+                "instructions-and-context",
+                RequestPatch::new()
+                    .instructions(format!(
+                        "You are a terse assistant. End every reply with the exact token \
+                         {CODEWORD}."
+                    ))
+                    .extra_context([RetrievedDocument {
+                        id: "depot".to_owned(),
+                        text: "The depot code is GAMMA-33.".to_owned(),
+                        metadata: Default::default(),
+                    }])
+                    .temperature(0.0),
+            );
+
             // One patch sets BOTH the preamble and an extra_context document; both
             // fields must take effect.
             let response = agent
                 .prompt("What is the depot code? Keep it short.")
                 .max_turns(2)
-                .add_hook(ApplyPatch(
-                    RequestPatch::new()
-                        .preamble(format!(
-                            "You are a terse assistant. End every reply with the exact token \
-                             {CODEWORD}."
-                        ))
-                        .context(fact_doc("depot", "The depot code is GAMMA-33."))
-                        .temperature(0.0),
-                ))
                 .await
                 .expect("multi-field patch run should succeed");
 

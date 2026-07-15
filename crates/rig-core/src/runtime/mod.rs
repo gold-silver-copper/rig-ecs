@@ -608,7 +608,7 @@ pub struct RequestPatch {
     pub additional_params: Option<serde_json::Value>,
     /// Context documents appended to the request.
     pub extra_context: Vec<RetrievedDocument>,
-    /// Replacement canonical history.
+    /// Replacement canonical history preceding the current prompt.
     pub history: Option<Vec<TranscriptEntry>>,
 }
 
@@ -667,7 +667,7 @@ impl RequestPatch {
         self
     }
 
-    /// Replaces canonical history for this operation.
+    /// Replaces canonical prior history while retaining the current prompt.
     pub fn history<I>(mut self, values: I) -> Self
     where
         I: IntoIterator<Item = TranscriptEntry>,
@@ -6572,7 +6572,8 @@ fn apply_request_patch(input: &mut ModelEffectInput, patch: RequestPatch) {
         };
     }
     input.documents.extend(patch.extra_context);
-    if let Some(history) = patch.history {
+    if let Some(mut history) = patch.history {
+        history.push(TranscriptEntry::Message(input.prompt.clone()));
         input.history = history;
     }
 }
@@ -11185,6 +11186,7 @@ mod tests {
                     rule: PolicyRule::PatchRequest(
                         RequestPatch::new()
                             .instructions("last")
+                            .history([TranscriptEntry::Assistant("prior".to_owned())])
                             .additional_params(serde_json::json!({"winner": 2, "z": true})),
                     ),
                 },
@@ -11214,6 +11216,13 @@ mod tests {
         let input = effect.model_input().unwrap();
         assert_eq!(input.instructions, "last");
         assert_eq!(
+            input.history,
+            vec![
+                TranscriptEntry::Assistant("prior".to_owned()),
+                TranscriptEntry::Message(input.prompt.clone()),
+            ]
+        );
+        assert_eq!(
             input.additional_params,
             Some(serde_json::json!({
                 "a": true,
@@ -11230,6 +11239,10 @@ mod tests {
             .find_map(|entity| runtime.world().get::<RequestPolicyEvaluation>(entity))
             .unwrap();
         assert_eq!(evaluation.accumulated.instructions.as_deref(), Some("last"));
+        assert_eq!(
+            evaluation.accumulated.history,
+            Some(vec![TranscriptEntry::Assistant("prior".to_owned())])
+        );
         assert_eq!(
             evaluation.accumulated.additional_params,
             Some(serde_json::json!({"a": true, "winner": 2, "z": true}))
