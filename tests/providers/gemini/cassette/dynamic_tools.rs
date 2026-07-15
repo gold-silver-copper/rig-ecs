@@ -1,17 +1,18 @@
-//! Dynamic (RAG) tools: `ToolEmbedding` toolsets sampled from a vector store
-//! per prompt and merged with static tools. This capability has no rmcp
-//! equivalent today, so these cassettes are the contract any migration has to
-//! consciously satisfy or supersede.
+//! Dynamic (RAG) tools sampled through an ECS store operation per prompt and
+//! merged with static tool entities.
 //!
 //! Each cassette records the Gemini embedding calls (toolset embedding at
 //! build time, query embedding at prompt time) alongside the completion
 //! turns.
 
+use std::sync::{Arc, Mutex};
+
+use rig::bevy_ecs::prelude::On;
 use rig::client::{CompletionClient, EmbeddingsClient};
 use rig::completion::{Chat, Message};
-use rig::embeddings::EmbeddingsBuilder;
+use rig::embeddings::{EmbeddingsBuilder, ToolSchema};
 use rig::providers::gemini;
-use rig::tool::ToolSet;
+use rig::runtime::{PolicyPoint, PolicyRule, RequestPolicyDecision, RequestPolicyInvocation};
 use rig::vector_store::in_memory_store::InMemoryVectorStore;
 
 use super::super::agent_run_support::{history_has_assistant_tool_call, tool_result_texts};
@@ -19,21 +20,19 @@ use super::super::support::with_gemini_cassette;
 use super::super::tools_support::{
     CountingAdd, EmbedAdd, EmbedMultiply, EmbedSubtract, FORCE_TOOLS_PREAMBLE,
 };
-use crate::support::assert_mentions_expected_number;
+use crate::support::{assert_mentions_expected_number, install_policy};
 
 /// Build an in-memory index over the toolset's embeddable schemas.
 async fn build_tool_index(
     client: &gemini::Client,
-    toolset: &ToolSet,
+    schemas: Vec<ToolSchema>,
 ) -> rig::vector_store::in_memory_store::InMemoryVectorIndex<
     gemini::embedding::EmbeddingModel,
     rig::embeddings::ToolSchema,
 > {
     let embedding_model = client.embedding_model(gemini::embedding::EMBEDDING_001);
-    // ToolSet::schemas() returns registration order, so the recorded
-    // embedding batch replays deterministically.
     let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
-        .documents(toolset.schemas().expect("tool schemas should build"))
+        .documents(schemas)
         .expect("documents should be added")
         .build()
         .await
@@ -53,18 +52,21 @@ async fn dynamic_tool_retrieved_and_merged_with_static() {
     with_gemini_cassette(
         "dynamic_tools/dynamic_tool_retrieved_and_merged_with_static",
         |client| async move {
-            let toolset = ToolSet::builder()
-                .retrieved_tool(subtract)
-                .retrieved_tool(EmbedMultiply::default())
-                .build();
-            let index = build_tool_index(&client, &toolset).await;
+            let multiply = EmbedMultiply::default();
+            let schemas = vec![
+                ToolSchema::try_from(&subtract).expect("subtract schema should build"),
+                ToolSchema::try_from(&multiply).expect("multiply schema should build"),
+            ];
+            let index = build_tool_index(&client, schemas).await;
 
             let agent = client
                 .agent(gemini::completion::GEMINI_2_5_FLASH)
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .temperature(0.0)
                 .tool(add)
-                .retrieved_tools(1, index, toolset)
+                .retrieved_tool(subtract)
+                .retrieved_tool(multiply)
+                .retrieved_tools(1, index)
                 .default_max_turns(3)
                 .build();
 
@@ -96,17 +98,20 @@ async fn dynamic_only_agent_retrieves_tool_per_prompt() {
     with_gemini_cassette(
         "dynamic_tools/dynamic_only_agent_retrieves_tool_per_prompt",
         |client| async move {
-            let toolset = ToolSet::builder()
-                .retrieved_tool(add)
-                .retrieved_tool(EmbedSubtract::default())
-                .build();
-            let index = build_tool_index(&client, &toolset).await;
+            let subtract = EmbedSubtract::default();
+            let schemas = vec![
+                ToolSchema::try_from(&add).expect("add schema should build"),
+                ToolSchema::try_from(&subtract).expect("subtract schema should build"),
+            ];
+            let index = build_tool_index(&client, schemas).await;
 
             let agent = client
                 .agent(gemini::completion::GEMINI_2_5_FLASH)
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .temperature(0.0)
-                .retrieved_tools(1, index, toolset)
+                .retrieved_tool(add)
+                .retrieved_tool(subtract)
+                .retrieved_tools(1, index)
                 .default_max_turns(3)
                 .build();
 
@@ -134,38 +139,70 @@ async fn sample_caps_retrieved_definitions() {
     with_gemini_cassette(
         "dynamic_tools/sample_caps_retrieved_definitions",
         |client| async move {
-            let toolset = ToolSet::builder()
-                .retrieved_tool(EmbedAdd::default())
-                .retrieved_tool(EmbedSubtract::default())
-                .retrieved_tool(EmbedMultiply::default())
-                .build();
-            let index = build_tool_index(&client, &toolset).await;
+            let add = EmbedAdd::default();
+            let subtract = EmbedSubtract::default();
+            let multiply = EmbedMultiply::default();
+            let schemas = vec![
+                ToolSchema::try_from(&add).expect("add schema should build"),
+                ToolSchema::try_from(&subtract).expect("subtract schema should build"),
+                ToolSchema::try_from(&multiply).expect("multiply schema should build"),
+            ];
+            let index = build_tool_index(&client, schemas).await;
 
             let agent = client
                 .agent(gemini::completion::GEMINI_2_5_FLASH)
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .temperature(0.0)
-                .retrieved_tools(2, index, toolset)
+                .retrieved_tool(add)
+                .retrieved_tool(subtract)
+                .retrieved_tool(multiply)
+                .retrieved_tools(2, index)
                 .build();
 
-            let defs = agent
-                .tool_server_handle
-                .get_tool_defs(Some(
-                    "Multiply two numbers together to get their product.".to_string(),
-                ))
+            let policy = install_policy(
+                &agent,
+                "capture-retrieved-tools",
+                0,
+                1,
+                PolicyRule::Custom(PolicyPoint::Request),
+            )
+            .expect("capture policy should install");
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_policy = Arc::clone(&captured);
+            agent
+                .with_runtime_mut(move |runtime| {
+                    runtime.world_mut().entity_mut(policy).observe(
+                        move |mut event: On<RequestPolicyInvocation>| {
+                            *captured_for_policy.lock().expect("captured tools") = event
+                                .request
+                                .tools
+                                .iter()
+                                .map(|tool| tool.name.clone())
+                                .collect();
+                            event.decision = Some(RequestPolicyDecision::Stop(
+                                "captured retrieved definitions".to_owned(),
+                            ));
+                        },
+                    );
+                })
+                .expect("capture observer should install");
+
+            agent
+                .prompt("Multiply two numbers together to get their product.")
                 .await
-                .expect("dynamic definitions should resolve");
+                .expect_err("capture policy should stop before model dispatch");
+            let defs = captured.lock().expect("captured tools").clone();
 
             assert_eq!(
                 defs.len(),
                 2,
                 "the sample size should cap how many dynamic definitions are returned: {:?}",
-                defs.iter().map(|def| def.name.as_str()).collect::<Vec<_>>()
+                defs
             );
             assert!(
-                defs.iter().any(|def| def.name == "multiply"),
+                defs.iter().any(|name| name == "multiply"),
                 "the best-matching tool should be retrieved: {:?}",
-                defs.iter().map(|def| def.name.as_str()).collect::<Vec<_>>()
+                defs
             );
         },
     )

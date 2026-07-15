@@ -164,6 +164,15 @@ pub struct RetrievalRequirement {
     pub limit: usize,
 }
 
+/// Per-run semantic selection of a subset of otherwise executable tool entities.
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ToolRetrievalRequirement {
+    /// Maximum tool names requested from the configured tool-search store.
+    pub limit: usize,
+    /// Provider-facing names eligible for semantic selection.
+    pub candidates: Vec<String>,
+}
+
 /// A configured model capability.
 #[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelCapability {
@@ -1928,6 +1937,15 @@ pub struct RunRecord {
     pub retrieval_store: Option<StoreDecision>,
     /// Ordered documents returned by the accepted retrieval operation.
     pub retrieved_documents: Vec<RetrievedDocument>,
+    /// Prevents repeated semantic tool selection.
+    #[serde(default)]
+    pub tool_retrieval_loaded: bool,
+    /// Immutable tool-search store choice accepted for this run.
+    #[serde(default)]
+    pub tool_retrieval_store: Option<StoreDecision>,
+    /// Provider-facing tool names selected for this run.
+    #[serde(default)]
+    pub retrieved_tool_names: Vec<String>,
     /// Output retained while required persistence settles.
     pub pending_output: Option<RunOutput>,
     /// Most recently committed logical batch forwarded to the next model operation.
@@ -3837,6 +3855,9 @@ pub struct PersistedAgent {
     pub output_requirement: Option<OutputRequirement>,
     /// Optional vector retrieval configuration.
     pub retrieval_requirement: Option<RetrievalRequirement>,
+    /// Optional semantic tool-selection configuration for future runs.
+    #[serde(default)]
+    pub tool_retrieval_requirement: Option<ToolRetrievalRequirement>,
 }
 
 /// Persisted policy record.
@@ -3984,6 +4005,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
         &UsesModel,
         Option<&OutputRequirement>,
         Option<&RetrievalRequirement>,
+        Option<&ToolRetrievalRequirement>,
     )>();
     let agent_rows = agent_query
         .iter(world)
@@ -3999,6 +4021,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
                 model,
                 output_requirement,
                 retrieval_requirement,
+                tool_retrieval_requirement,
             )| {
                 let model_id = model_ids
                     .get(&model.get())
@@ -4016,6 +4039,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
                         model_id,
                         output_requirement: output_requirement.cloned(),
                         retrieval_requirement: retrieval_requirement.cloned(),
+                        tool_retrieval_requirement: tool_retrieval_requirement.cloned(),
                     },
                 ))
             },
@@ -4415,6 +4439,9 @@ pub fn restore_domain(
         }
         if let Some(retrieval_requirement) = record.retrieval_requirement {
             entity.insert(retrieval_requirement);
+        }
+        if let Some(tool_retrieval_requirement) = record.tool_retrieval_requirement {
+            entity.insert(tool_retrieval_requirement);
         }
         let entity = entity.id();
         mapped.insert(record.id, entity);
@@ -5030,6 +5057,25 @@ impl Runtime {
         Ok(())
     }
 
+    /// Sets semantic tool retrieval for future runs of an agent.
+    pub fn set_tool_retrieval_requirement(
+        &mut self,
+        agent: AgentHandle,
+        requirement: ToolRetrievalRequirement,
+    ) -> Result<(), SpawnError> {
+        if agent.runtime_id != self.handle.runtime_id {
+            return Err(SpawnError::ForeignRuntime);
+        }
+        let Some(mut entity) = self.world.get_entity_mut(agent.entity).ok() else {
+            return Err(SpawnError::StaleEntity(agent.entity));
+        };
+        if !entity.contains::<Agent>() {
+            return Err(SpawnError::StaleEntity(agent.entity));
+        }
+        entity.insert(requirement);
+        Ok(())
+    }
+
     /// Spawns an executable tool capability entity.
     pub fn spawn_tool(
         &mut self,
@@ -5430,6 +5476,9 @@ fn ingest_commands(
                     retrieval_loaded: false,
                     retrieval_store: None,
                     retrieved_documents: Vec::new(),
+                    tool_retrieval_loaded: false,
+                    tool_retrieval_store: None,
+                    retrieved_tool_names: Vec::new(),
                     pending_output: None,
                     pending_tool_results: Vec::new(),
                 };
@@ -5918,7 +5967,11 @@ fn prepare_store_operations(
         ),
         Without<WaitingForChildren>,
     >,
-    agents: Query<(Option<&AgentStoreGrants>, Option<&RetrievalRequirement>)>,
+    agents: Query<(
+        Option<&AgentStoreGrants>,
+        Option<&RetrievalRequirement>,
+        Option<&ToolRetrievalRequirement>,
+    )>,
     grants: Query<(&StableId, &TenantId, &StoreGrant, &StoreGrantForStore)>,
     stores: Query<(&StableId, &TenantId, &StoreCapability)>,
     mut progress: ResMut<Progress>,
@@ -5927,7 +5980,9 @@ fn prepare_store_operations(
         if !matches!(*control, RunControl::Running) || !matches!(*run_state, RunState::Queued) {
             continue;
         }
-        let Ok((agent_grants, retrieval_requirement)) = agents.get(run_of.get()) else {
+        let Ok((agent_grants, retrieval_requirement, tool_retrieval_requirement)) =
+            agents.get(run_of.get())
+        else {
             continue;
         };
         let select_store = |kind: &str| {
@@ -6025,6 +6080,36 @@ fn prepare_store_operations(
             record.retrieval_loaded = true;
             mark_progress(&mut progress);
         }
+
+        if !record.tool_retrieval_loaded {
+            if let Some(requirement) = tool_retrieval_requirement
+                && let Some(decision) = select_store("tool-vector-search")
+            {
+                let operation = commands
+                    .spawn((
+                        OperationOf(run_entity),
+                        OperationKind::Store,
+                        OperationState {
+                            generation: 0,
+                            phase: OperationPhase::Prepared,
+                        },
+                        StoreEffectInput {
+                            decision: decision.clone(),
+                            operation: StoreOperation::Retrieve {
+                                query: record.prompt_text.clone(),
+                                limit: requirement.limit,
+                            },
+                        },
+                    ))
+                    .id();
+                record.tool_retrieval_store = Some(decision);
+                *run_state = RunState::WaitingStore { operation };
+                mark_progress(&mut progress);
+                continue;
+            }
+            record.tool_retrieval_loaded = true;
+            mark_progress(&mut progress);
+        }
     }
 }
 
@@ -6048,6 +6133,7 @@ fn prepare_model_operations(
         &UsesModel,
         Option<&AgentToolGrants>,
         Option<&OutputRequirement>,
+        Option<&ToolRetrievalRequirement>,
     )>,
     models: Query<(&StableId, &TenantId, &ModelCapability)>,
     grants: Query<(&StableId, &TenantId, &ToolGrant, &GrantForTool)>,
@@ -6059,11 +6145,18 @@ fn prepare_model_operations(
             || !matches!(*run_state, RunState::Queued)
             || !record.memory_loaded
             || !record.retrieval_loaded
+            || !record.tool_retrieval_loaded
         {
             continue;
         }
-        let Ok((agent_tenant, agent, model_relation, agent_grants, output_requirement)) =
-            agents.get(run_of.get())
+        let Ok((
+            agent_tenant,
+            agent,
+            model_relation,
+            agent_grants,
+            output_requirement,
+            tool_retrieval_requirement,
+        )) = agents.get(run_of.get())
         else {
             *run_state = RunState::Failed(CanonicalError::StaleEntity("agent".to_owned()));
             mark_progress(&mut progress);
@@ -6116,7 +6209,19 @@ fn prepare_model_operations(
                 if tool_tenant != run_tenant || tool.retired {
                     continue;
                 }
+                let retrieved_candidate = tool_retrieval_requirement.is_some_and(|requirement| {
+                    requirement.candidates.iter().any(|name| name == &tool.name)
+                });
+                if retrieved_candidate
+                    && !record
+                        .retrieved_tool_names
+                        .iter()
+                        .any(|name| name == &tool.name)
+                {
+                    continue;
+                }
                 candidates.push((
+                    !retrieved_candidate,
                     grant.order,
                     tool.order,
                     tool.name.clone(),
@@ -6134,10 +6239,11 @@ fn prepare_model_operations(
             }
         }
         candidates.sort_by(
-            |(left_grant, left_tool, left_name, left_id, _),
-             (right_grant, right_tool, right_name, right_id, _)| {
-                left_grant
-                    .cmp(right_grant)
+            |(left_static, left_grant, left_tool, left_name, left_id, _),
+             (right_static, right_grant, right_tool, right_name, right_id, _)| {
+                left_static
+                    .cmp(right_static)
+                    .then_with(|| left_grant.cmp(right_grant))
                     .then_with(|| left_tool.cmp(right_tool))
                     .then_with(|| left_name.cmp(right_name))
                     .then_with(|| left_id.cmp(right_id))
@@ -6146,7 +6252,7 @@ fn prepare_model_operations(
         let mut names = HashSet::new();
         let tools = candidates
             .into_iter()
-            .filter_map(|(_, _, name, _, mut decision)| {
+            .filter_map(|(_, _, _, name, _, mut decision)| {
                 if !names.insert(name) {
                     return None;
                 }
@@ -6197,6 +6303,11 @@ fn prepare_model_operations(
                 }),
             ))
             .id();
+        if tool_retrieval_requirement.is_some() {
+            record.tool_retrieval_loaded = false;
+            record.tool_retrieval_store = None;
+            record.retrieved_tool_names.clear();
+        }
         *run_state = RunState::WaitingModel { operation };
         mark_progress(&mut progress);
     }
@@ -9204,6 +9315,13 @@ fn commit_store_operations(
                         ),
                         retryable: false,
                     });
+                } else if input.decision.kind == "tool-vector-search" {
+                    record.retrieved_tool_names = documents
+                        .iter()
+                        .map(|document| document.id.clone())
+                        .collect();
+                    record.tool_retrieval_loaded = true;
+                    *run_state = RunState::Queued;
                 } else {
                     record.retrieved_documents = documents.clone();
                     record.retrieval_loaded = true;
@@ -10547,6 +10665,177 @@ mod tests {
         let model = runtime.effects().try_recv().unwrap().unwrap();
         assert_eq!(model.model_input().unwrap().documents, vec![document]);
         assert_eq!(model.model_input().unwrap().decision.revision, 1);
+    }
+
+    #[test]
+    fn semantic_tool_retrieval_filters_and_refreshes_each_model_operation() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        for (order, (tool_id, name)) in [
+            ("static", "static"),
+            ("candidate-alpha", "alpha"),
+            ("candidate-beta", "beta"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tool = runtime
+                .spawn_tool(
+                    id(tool_id),
+                    tenant("a"),
+                    ToolCapability {
+                        name: name.to_owned(),
+                        description: name.to_owned(),
+                        parameters: serde_json::json!({"type": "object"}),
+                        order: u32::try_from(order).unwrap(),
+                        revision: 1,
+                        retired: false,
+                    },
+                )
+                .unwrap();
+            runtime
+                .grant_tool(
+                    id(&format!("grant-{name}")),
+                    tenant("a"),
+                    ToolGrant {
+                        order: u32::try_from(order).unwrap(),
+                        enabled: true,
+                    },
+                    agent,
+                    tool,
+                )
+                .unwrap();
+        }
+        let store = runtime
+            .spawn_store(
+                id("tool-index"),
+                tenant("a"),
+                StoreCapability {
+                    kind: "tool-vector-search".to_owned(),
+                    revision: 7,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        runtime
+            .grant_store(
+                id("tool-index-grant"),
+                tenant("a"),
+                StoreGrant {
+                    order: 0,
+                    enabled: true,
+                },
+                agent,
+                store,
+            )
+            .unwrap();
+        runtime
+            .set_tool_retrieval_requirement(
+                agent,
+                ToolRetrievalRequirement {
+                    limit: 1,
+                    candidates: vec!["alpha".to_owned(), "beta".to_owned()],
+                },
+            )
+            .unwrap();
+
+        runtime.handle().prompt(agent, "select beta").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let retrieval = runtime.effects().try_recv().unwrap().unwrap();
+        let retrieval_input = retrieval.store_input().unwrap();
+        assert_eq!(retrieval_input.decision.kind, "tool-vector-search");
+        assert_eq!(retrieval_input.decision.revision, 7);
+        assert!(matches!(
+            &retrieval_input.operation,
+            StoreOperation::Retrieve { query, limit } if query == "select beta" && *limit == 1
+        ));
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: retrieval.operation,
+                generation: retrieval.generation,
+                result: Ok(EffectOutput::Store(StoreEffectOutput::Retrieved(vec![
+                    RetrievedDocument {
+                        id: "beta".to_owned(),
+                        text: String::new(),
+                        metadata: BTreeMap::new(),
+                    },
+                ]))),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model_request = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            model_request
+                .model_input()
+                .unwrap()
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta", "static"]
+        );
+
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model_request.operation,
+                generation: model_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "beta-call".to_owned(),
+                        provider_result_id: "beta-call".to_owned(),
+                        provider_call_id: None,
+                        name: "beta".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let tool_request = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: tool_request.operation,
+                generation: tool_request.generation,
+                result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                    call_id: "beta-call".to_owned(),
+                    provider_result_id: "beta-call".to_owned(),
+                    provider_call_id: None,
+                    name: "beta".to_owned(),
+                    raw: serde_json::json!("ok"),
+                    presentation: "ok".to_owned(),
+                    failure: None,
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let next_retrieval = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            next_retrieval.store_input().unwrap().decision.kind,
+            "tool-vector-search"
+        );
     }
 
     #[test]
@@ -14320,6 +14609,7 @@ mod tests {
                 model_id: id("missing"),
                 output_requirement: None,
                 retrieval_requirement: None,
+                tool_retrieval_requirement: None,
             }],
             ..DomainSnapshot::default()
         };

@@ -20,8 +20,8 @@ use crate::{
         RetrievalRequirement, RetrievedDocument, RigExtension, RunOf, RunOutput, RunState, Runtime,
         RuntimeConfig, SpawnError, StableId, StoreCapability, StoreEffectInput, StoreEffectOutput,
         StoreGrant, StoreOperation, StreamItem, StreamReceiveError, StreamTerminal, SubmitError,
-        TenantId, ToolCapability, ToolEffectInput, ToolEffectOutput, ToolGrant, TranscriptEntry,
-        Usage,
+        TenantId, ToolCapability, ToolEffectInput, ToolEffectOutput, ToolGrant,
+        ToolRetrievalRequirement, TranscriptEntry, Usage,
     },
     streaming::{StreamedAssistantContent, ToolCallDeltaContent},
     tool::IntoToolOutput,
@@ -402,6 +402,10 @@ struct VectorIndexStore {
     index: Arc<dyn VectorStoreIndexDyn>,
 }
 
+struct ToolIndexStore {
+    index: Arc<dyn VectorStoreIndexDyn>,
+}
+
 struct ConversationStore<B> {
     backend: B,
 }
@@ -480,6 +484,32 @@ impl EcsStore for VectorIndexStore {
     }
 }
 
+impl EcsStore for ToolIndexStore {
+    type Error = VectorIndexStoreError;
+
+    async fn execute(&self, operation: StoreOperation) -> Result<StoreEffectOutput, Self::Error> {
+        let StoreOperation::Retrieve { query, limit } = operation else {
+            return Err(VectorIndexStoreError::UnsupportedOperation);
+        };
+        let request = VectorSearchRequest::builder()
+            .query(query)
+            .samples(u64::try_from(limit).unwrap_or(u64::MAX))
+            .build();
+        let documents = self
+            .index
+            .top_n_ids(request)
+            .await?
+            .into_iter()
+            .map(|(_, id)| RetrievedDocument {
+                id,
+                text: String::new(),
+                metadata: Default::default(),
+            })
+            .collect();
+        Ok(StoreEffectOutput::Retrieved(documents))
+    }
+}
+
 /// Construction helper that spawns a standalone ECS agent composition.
 pub struct LocalModelAgentBuilder<M> {
     model: M,
@@ -499,6 +529,8 @@ pub struct LocalModelAgentBuilder<M> {
     structured_output_mode: StructuredOutputMode,
     terminal_tool: Option<String>,
     retrieval_limit: Option<usize>,
+    tool_retrieval_limit: Option<usize>,
+    retrieved_tool_names: Vec<String>,
     tools: Vec<LocalToolRegistration>,
     stores: Vec<LocalStoreRegistration>,
 }
@@ -663,6 +695,26 @@ where
         self
     }
 
+    /// Adds one executable tool candidate selected semantically per prompt.
+    pub fn retrieved_tool<T>(mut self, tool: T) -> Self
+    where
+        T: crate::tool::Tool + 'static,
+        T::Output: Send,
+    {
+        self.inner = self.inner.retrieved_tool(tool);
+        self
+    }
+
+    /// Configures the ECS store operation used to select retrieved tools.
+    pub fn retrieved_tools(
+        mut self,
+        limit: usize,
+        index: impl VectorStoreIndexDyn + 'static,
+    ) -> Self {
+        self.inner = self.inner.retrieved_tools(limit, index);
+        self
+    }
+
     /// Requires terminal text to conform to the schema generated for `T`.
     pub fn output_schema<T>(mut self) -> Self
     where
@@ -740,6 +792,8 @@ where
             structured_output_mode: StructuredOutputMode::Auto,
             terminal_tool: None,
             retrieval_limit: None,
+            tool_retrieval_limit: None,
+            retrieved_tool_names: Vec::new(),
             tools: Vec::new(),
             stores: Vec::new(),
         }
@@ -882,6 +936,42 @@ where
                 enabled: true,
             },
             VectorIndexStore {
+                index: Arc::new(index),
+            },
+        );
+        self
+    }
+
+    /// Adds a tool entity that is advertised only when selected for the run.
+    pub fn retrieved_tool<T>(mut self, tool: T) -> Self
+    where
+        T: crate::tool::Tool + 'static,
+        T::Output: Send,
+    {
+        self.retrieved_tool_names.push(T::NAME.to_owned());
+        self.authored_tool(tool)
+    }
+
+    /// Adds the semantic tool-search store used during scheduled preparation.
+    pub fn retrieved_tools(
+        mut self,
+        limit: usize,
+        index: impl VectorStoreIndexDyn + 'static,
+    ) -> Self {
+        let order = self.stores.len();
+        self.tool_retrieval_limit = Some(limit);
+        self = self.store(
+            StableId::generated(format!("local-tool-vector-store-{order}")),
+            StoreCapability {
+                kind: "tool-vector-search".to_owned(),
+                revision: 1,
+                retired: false,
+            },
+            StoreGrant {
+                order: u32::try_from(order).unwrap_or(u32::MAX),
+                enabled: true,
+            },
+            ToolIndexStore {
                 index: Arc::new(index),
             },
         );
@@ -1052,6 +1142,17 @@ where
         }
         if let Some(limit) = self.retrieval_limit {
             runtime.set_retrieval_requirement(agent, RetrievalRequirement { limit })?;
+        }
+        if let Some(limit) = self.tool_retrieval_limit {
+            self.retrieved_tool_names.sort();
+            self.retrieved_tool_names.dedup();
+            runtime.set_tool_retrieval_requirement(
+                agent,
+                ToolRetrievalRequirement {
+                    limit,
+                    candidates: self.retrieved_tool_names,
+                },
+            )?;
         }
         let mut names = HashSet::new();
         let mut tools = self
