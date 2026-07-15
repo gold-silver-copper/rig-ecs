@@ -2267,6 +2267,14 @@ pub enum CanonicalError {
         /// Whether policy may retry the failure.
         retryable: bool,
     },
+    /// Typed asynchronous approval failed outside the world.
+    #[error("policy approval failure: {message}")]
+    PolicyApproval {
+        /// Operator-facing diagnostic.
+        message: String,
+        /// Whether policy may retry the failure.
+        retryable: bool,
+    },
     /// Ordered policy denied dispatch.
     #[error("policy `{policy}` denied the operation")]
     PolicyDenied {

@@ -17,13 +17,14 @@ use crate::{
         EffectDeltaSender, EffectInput, EffectIoError, EffectOutput, EffectRequest,
         ExtensionInstallError, GrantForAgent, GrantForTool, InstallError, InvalidToolCallBudget,
         ModelCapability, ModelDecision, ModelEffectInput, ModelEffectOutput, ModelToolCall,
-        ModelToolChoice, OutputRequirement, PauseMode, RetiredCapability, RetrievalRequirement,
-        RetrievedDocument, RigExtension, RunOf, RunOutput, RunState, Runtime, RuntimeConfig,
-        SpawnError, StableId, StoreCapability, StoreEffectInput, StoreEffectOutput, StoreGrant,
-        StoreGrantForAgent, StoreGrantForStore, StoreOperation, StreamItem, StreamReceiveError,
-        StreamTerminal, StructuredOutputRetryBudget, SubmitError, TenantId, ToolCapability,
-        ToolEffectInput, ToolEffectOutput, ToolGrant, ToolRetrievalRequirement, TranscriptEntry,
-        Usage,
+        ModelToolChoice, OutputRequirement, PauseMode, PolicyApprovalEffectInput,
+        PolicyApprovalEffectOutput, RetiredCapability, RetrievalRequirement, RetrievedDocument,
+        RigExtension, RunOf, RunOutput, RunState, Runtime, RuntimeConfig, SpawnError, StableId,
+        StoreCapability, StoreEffectInput, StoreEffectOutput, StoreGrant, StoreGrantForAgent,
+        StoreGrantForStore, StoreOperation, StreamItem, StreamReceiveError, StreamTerminal,
+        StructuredOutputRetryBudget, SubmitError, TenantId, ToolApprovalPolicyBundle,
+        ToolCapability, ToolEffectInput, ToolEffectOutput, ToolGrant, ToolRetrievalRequirement,
+        TranscriptEntry, Usage,
     },
     streaming::{StreamedAssistantContent, ToolCallDeltaContent},
     tool::IntoToolOutput,
@@ -65,6 +66,7 @@ pub struct LocalModelAgent<M> {
     model: CompletionModelAdapter<M>,
     tools: SharedLocalToolExecutors,
     stores: Arc<HashMap<(StableId, u64), Arc<dyn LocalStoreExecutor>>>,
+    approvals: Arc<HashMap<(StableId, u64), Arc<dyn LocalApprovalExecutor>>>,
 }
 
 /// ECS-visible membership for hosted agents that share dynamic capability topology.
@@ -331,6 +333,29 @@ trait LocalStoreExecutor: Send + Sync {
     ) -> BoxFuture<'_, Result<StoreEffectOutput, CanonicalError>>;
 }
 
+trait LocalApprovalExecutor: Send + Sync {
+    fn execute(
+        &self,
+        input: PolicyApprovalEffectInput,
+    ) -> BoxFuture<'_, Result<PolicyApprovalEffectOutput, CanonicalError>>;
+}
+
+struct TypedLocalApproval<A> {
+    adapter: PolicyApprovalAdapter<A>,
+}
+
+impl<A> LocalApprovalExecutor for TypedLocalApproval<A>
+where
+    A: EcsPolicyApprover + 'static,
+{
+    fn execute(
+        &self,
+        input: PolicyApprovalEffectInput,
+    ) -> BoxFuture<'_, Result<PolicyApprovalEffectOutput, CanonicalError>> {
+        Box::pin(self.adapter.execute(input))
+    }
+}
+
 struct TypedLocalStore<S> {
     adapter: StoreAdapter<S>,
 }
@@ -412,6 +437,12 @@ struct LocalStoreRegistration {
     capability: StoreCapability,
     grant: StoreGrant,
     executor: Arc<dyn LocalStoreExecutor>,
+}
+
+struct LocalApprovalRegistration {
+    id: StableId,
+    revision: u64,
+    executor: Arc<dyn LocalApprovalExecutor>,
 }
 
 struct VectorIndexStore {
@@ -549,7 +580,13 @@ pub struct LocalModelAgentBuilder<M> {
     retrieved_tool_names: Vec<String>,
     tools: Vec<LocalToolRegistration>,
     stores: Vec<LocalStoreRegistration>,
+    approvals: Vec<LocalApprovalRegistration>,
+    extensions: Vec<LocalExtensionInstaller>,
 }
+
+type LocalExtensionInstaller = Box<
+    dyn FnOnce(&mut Runtime, AgentHandle, TenantId) -> Result<(), ExtensionInstallError> + Send,
+>;
 
 /// Provider-facing strategy used after an output schema is attached.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -762,6 +799,38 @@ where
         self
     }
 
+    /// Installs an ECS-native extension after the facade's agent entity exists.
+    ///
+    /// The factory receives the generated agent handle and tenant identity so
+    /// relationship-bearing bundles can target the facade without guessing raw
+    /// entity IDs.
+    pub fn extension<E, F>(mut self, factory: F) -> Self
+    where
+        E: RigExtension + 'static,
+        F: FnOnce(AgentHandle, TenantId) -> E + Send + 'static,
+    {
+        self.inner = self.inner.extension(factory);
+        self
+    }
+
+    /// Installs an ordered tool-approval policy and its asynchronous executor.
+    pub fn tool_approval_policy<A>(
+        mut self,
+        id: StableId,
+        order: u32,
+        revision: u64,
+        prompt: impl Into<String>,
+        approver: A,
+    ) -> Self
+    where
+        A: EcsPolicyApprover + 'static,
+    {
+        self.inner = self
+            .inner
+            .tool_approval_policy(id, order, revision, prompt, approver);
+        self
+    }
+
     pub(crate) fn terminal_tool(mut self, name: impl Into<String>) -> Self {
         self.inner = self.inner.terminal_tool(name);
         self
@@ -812,6 +881,8 @@ where
             retrieved_tool_names: Vec::new(),
             tools: Vec::new(),
             stores: Vec::new(),
+            approvals: Vec::new(),
+            extensions: Vec::new(),
         }
     }
 
@@ -903,6 +974,54 @@ where
     /// Sets corrective model retries after structured-output validation fails.
     pub fn max_output_retries(mut self, retries: u32) -> Self {
         self.structured_output_retries = retries;
+        self
+    }
+
+    /// Installs an ECS-native extension after this builder spawns its agent.
+    pub fn extension<E, F>(mut self, factory: F) -> Self
+    where
+        E: RigExtension + 'static,
+        F: FnOnce(AgentHandle, TenantId) -> E + Send + 'static,
+    {
+        self.extensions
+            .push(Box::new(move |runtime, agent, tenant| {
+                let extension = factory(agent, tenant);
+                runtime.install_extension(&extension)
+            }));
+        self
+    }
+
+    /// Installs a tool-call approval policy and binds its external executor.
+    pub fn tool_approval_policy<A>(
+        mut self,
+        id: StableId,
+        order: u32,
+        revision: u64,
+        prompt: impl Into<String>,
+        approver: A,
+    ) -> Self
+    where
+        A: EcsPolicyApprover + 'static,
+    {
+        let extension_id = id.clone();
+        let prompt = prompt.into();
+        self = self.extension(move |agent, tenant| {
+            ToolApprovalPolicyBundle::new(
+                extension_id,
+                tenant,
+                agent.entity(),
+                order,
+                revision,
+                prompt,
+            )
+        });
+        self.approvals.push(LocalApprovalRegistration {
+            id: id.clone(),
+            revision,
+            executor: Arc::new(TypedLocalApproval {
+                adapter: PolicyApprovalAdapter::new(id, revision, approver),
+            }),
+        });
         self
     }
 
@@ -1156,6 +1275,9 @@ where
             .world_mut()
             .entity_mut(agent.entity())
             .insert(HostedAgentGroup(StableId::new("local-agent-group")?));
+        for install in self.extensions {
+            install(&mut runtime, agent, tenant.clone())?;
+        }
         if let Some(schema) = self.output_schema {
             runtime.set_output_requirement(agent, OutputRequirement { schema })?;
             runtime.set_structured_output_retry_budget(agent, self.structured_output_retries)?;
@@ -1219,6 +1341,16 @@ where
             )?;
             store_executors.insert((registration.id, revision), registration.executor);
         }
+        let approval_executors = self
+            .approvals
+            .into_iter()
+            .map(|registration| {
+                (
+                    (registration.id, registration.revision),
+                    registration.executor,
+                )
+            })
+            .collect();
         Ok(LocalModelAgent {
             runtime: Arc::new(Mutex::new(runtime)),
             routed_effects: Arc::new(Mutex::new(HashMap::new())),
@@ -1226,6 +1358,7 @@ where
             model: CompletionModelAdapter::bound(self.model, model_binding),
             tools: Arc::new(RwLock::new(executors)),
             stores: Arc::new(store_executors),
+            approvals: Arc::new(approval_executors),
         })
     }
 }
@@ -1424,6 +1557,7 @@ where
             model: self.model.clone(),
             tools: Arc::clone(&self.tools),
             stores: Arc::clone(&self.stores),
+            approvals: Arc::clone(&self.approvals),
         })
     }
 
@@ -1824,9 +1958,26 @@ where
                             ))),
                         }
                     }
-                    EffectInput::Discovery(_) | EffectInput::PolicyApproval(_) => {
-                        Err(CanonicalError::EffectKindMismatch)
+                    EffectInput::PolicyApproval(input) => {
+                        let key = (input.policy_id.clone(), input.revision);
+                        match self.approvals.get(&key) {
+                            Some(executor) => {
+                                catch_executor_panic(async move {
+                                    executor
+                                        .execute(input)
+                                        .await
+                                        .map(EffectOutput::PolicyApproval)
+                                })
+                                .await
+                            }
+                            None => Err(CanonicalError::StaleEntity(format!(
+                                "policy revision {}@{}",
+                                key.0.as_str(),
+                                key.1
+                            ))),
+                        }
                     }
+                    EffectInput::Discovery(_) => Err(CanonicalError::EffectKindMismatch),
                 };
                 self.submit_completion(
                     &completion_sender,
@@ -2327,7 +2478,18 @@ where
                                 ))),
                             }
                         }
-                        EffectInput::Discovery(_) | EffectInput::PolicyApproval(_) => {
+                        EffectInput::PolicyApproval(input) => {
+                            let key = (input.policy_id.clone(), input.revision);
+                            match agent.approvals.get(&key) {
+                                Some(executor) => catch_executor_panic(async move {
+                                    executor.execute(input).await.map(EffectOutput::PolicyApproval)
+                                }).await,
+                                None => Err(CanonicalError::StaleEntity(format!(
+                                    "policy revision {}@{}", key.0.as_str(), key.1
+                                ))),
+                            }
+                        }
+                        EffectInput::Discovery(_) => {
                             Err(CanonicalError::EffectKindMismatch)
                         }
                     };
@@ -2877,6 +3039,61 @@ pub trait EcsDiscovery: Send + Sync {
     ) -> impl Future<Output = Result<DiscoveryEffectOutput, Self::Error>> + Send;
 }
 
+/// Context-free asynchronous approval boundary for ECS policy effects.
+pub trait EcsPolicyApprover: Send + Sync {
+    /// Concrete author-facing error.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Decides one immutable policy-approval request outside the ECS world.
+    fn approve(
+        &self,
+        input: PolicyApprovalEffectInput,
+    ) -> impl Future<Output = Result<PolicyApprovalEffectOutput, Self::Error>> + Send;
+}
+
+/// Binds an asynchronous approver to one immutable policy revision.
+#[derive(Clone, Debug)]
+pub struct PolicyApprovalAdapter<A> {
+    policy_id: StableId,
+    revision: u64,
+    approver: A,
+}
+
+impl<A> PolicyApprovalAdapter<A>
+where
+    A: EcsPolicyApprover,
+{
+    /// Creates a typed approval adapter for the selected policy revision.
+    pub fn new(policy_id: StableId, revision: u64, approver: A) -> Self {
+        Self {
+            policy_id,
+            revision,
+            approver,
+        }
+    }
+
+    /// Executes approval only for the revision accepted by the policy cursor.
+    pub async fn execute(
+        &self,
+        input: PolicyApprovalEffectInput,
+    ) -> Result<PolicyApprovalEffectOutput, CanonicalError> {
+        if input.policy_id != self.policy_id || input.revision != self.revision {
+            return Err(CanonicalError::StaleEntity(format!(
+                "policy revision {}@{}",
+                input.policy_id.as_str(),
+                input.revision
+            )));
+        }
+        self.approver
+            .approve(input)
+            .await
+            .map_err(|error| CanonicalError::PolicyApproval {
+                message: error.to_string(),
+                retryable: false,
+            })
+    }
+}
+
 /// Binds a typed discovery implementation to one stable source identity.
 #[derive(Clone, Debug)]
 pub struct DiscoveryAdapter<D> {
@@ -3395,7 +3612,8 @@ mod tests {
         bevy_ecs::entity::Entity,
         completion::{CompletionResponse, Usage as CompletionUsage},
         runtime::{
-            EffectIngress, ModelDecision, RuntimeWaker, StableId, StoreDecision, TenantId,
+            EffectIngress, ModelDecision, Policy, PolicyFor, RequestPatch,
+            RequestPatchPolicyBundle, RuntimeWaker, StableId, StoreDecision, TenantId,
             ToolDecision,
         },
         streaming::{StreamingCompletionResponse, StreamingResult},
@@ -3420,6 +3638,24 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct PanickingTool;
+
+    #[derive(Clone)]
+    struct CountingApprover(Arc<AtomicUsize>);
+
+    impl EcsPolicyApprover for CountingApprover {
+        type Error = Infallible;
+
+        fn approve(
+            &self,
+            _input: PolicyApprovalEffectInput,
+        ) -> impl Future<Output = Result<PolicyApprovalEffectOutput, Self::Error>> + Send {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(PolicyApprovalEffectOutput {
+                approved: true,
+                reason: Some("approved by test".to_owned()),
+            }))
+        }
+    }
 
     #[derive(Clone, Default)]
     struct ConcurrentModel {
@@ -3855,6 +4091,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn high_level_builder_installs_extension_for_generated_agent() {
+        let agent = AgentBuilder::new(MockCompletionModel::text("unused"))
+            .extension(|agent, tenant| {
+                RequestPatchPolicyBundle::new(
+                    StableId::new("builder-request-policy").unwrap(),
+                    tenant,
+                    agent.entity(),
+                    0,
+                    1,
+                    RequestPatch::new().instructions("installed by builder"),
+                )
+            })
+            .build();
+
+        let installed_for = agent
+            .with_runtime_mut(|runtime| {
+                let mut policies = runtime.world_mut().query::<(&Policy, &PolicyFor)>();
+                policies
+                    .iter(runtime.world())
+                    .map(|(_, policy_for)| policy_for.get())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+
+        assert_eq!(installed_for, [agent.handle().entity()]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocked_streaming_run_does_not_serialize_a_blocking_sibling() {
         let agent = LocalModelAgent::new(
@@ -3956,6 +4220,89 @@ mod tests {
             .unwrap();
         let output = agent.run_prompt("add").await.unwrap();
         assert_eq!(output.text, "five");
+    }
+
+    #[tokio::test]
+    async fn local_facade_executes_asynchronous_approval_effects() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call(
+                "wire-call",
+                "add",
+                serde_json::json!({"left": 2, "right": 3}),
+            ),
+            MockTurn::text("five"),
+        ]);
+        let approvals = Arc::new(AtomicUsize::new(0));
+        let agent = LocalModelAgentBuilder::new(model, "mock", "mock-1")
+            .tool(
+                StableId::new("add").unwrap(),
+                ToolCapability {
+                    name: "add".to_owned(),
+                    description: "adds integers".to_owned(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    order: 0,
+                    revision: 1,
+                    retired: false,
+                },
+                AddTool,
+            )
+            .tool_approval_policy(
+                StableId::new("approve-add").unwrap(),
+                0,
+                1,
+                "Approve this tool call?",
+                CountingApprover(Arc::clone(&approvals)),
+            )
+            .build()
+            .unwrap();
+
+        let output = agent.run_prompt("add").await.unwrap();
+
+        assert_eq!(output.text, "five");
+        assert_eq!(approvals.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_facade_executes_asynchronous_approval_effects() {
+        let model = MockCompletionModel::from_stream_turns([
+            vec![MockStreamEvent::tool_call(
+                "wire-call",
+                "add",
+                serde_json::json!({"left": 2, "right": 3}),
+            )],
+            vec![MockStreamEvent::text("five")],
+        ]);
+        let approvals = Arc::new(AtomicUsize::new(0));
+        let agent = LocalModelAgentBuilder::new(model, "mock", "mock-1")
+            .tool(
+                StableId::new("add").unwrap(),
+                ToolCapability {
+                    name: "add".to_owned(),
+                    description: "adds integers".to_owned(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    order: 0,
+                    revision: 1,
+                    retired: false,
+                },
+                AddTool,
+            )
+            .tool_approval_policy(
+                StableId::new("approve-add").unwrap(),
+                0,
+                1,
+                "Approve this tool call?",
+                CountingApprover(Arc::clone(&approvals)),
+            )
+            .build()
+            .unwrap();
+
+        let events = agent.stream_run("add").collect::<Vec<_>>().await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(LocalStreamEvent::Finished { output, .. }) if output.text == "five"
+        )));
+        assert_eq!(approvals.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

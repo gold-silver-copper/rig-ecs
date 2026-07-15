@@ -735,6 +735,13 @@ Custom behavior may add components and systems at the public `RigSet`
 boundaries or attach one targeted steering observer to a `PolicyRule::Custom`
 entity. Additional audit observers consume the separate observation events.
 
+The high-level `AgentBuilder::extension` accepts a factory after the generated
+agent entity exists, so relationship-bearing bundles can target that entity
+without guessing a raw ID. `AgentBuilder::tool_approval_policy` pairs the
+native policy bundle with an `EcsPolicyApprover`; blocking and streaming facade
+runs execute its owned `PolicyApprovalEffectInput` outside the world and ingest
+the correlated typed result through the same schedule boundary.
+
 ## Schedule and lifecycle diagrams
 
 The public schedule is one ordered progression engine for every agent and run:
