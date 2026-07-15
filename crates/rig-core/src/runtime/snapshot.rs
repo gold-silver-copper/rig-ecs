@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use super::*;
 
-const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 2;
+const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 3;
 
 /// Serializable checkpoint for one run and all of its descendant runs.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -197,6 +197,8 @@ pub struct PersistedRunOperation {
     pub effective_tool_output: Option<ToolEffectOutput>,
     /// Effective model output after response policy.
     pub effective_model_output: Option<ModelEffectOutput>,
+    /// Provider-specific response data retained on the model operation.
+    pub provider_diagnostics: Option<serde_json::Value>,
     /// Initialization and completion markers needed to resume exactly once.
     pub markers: PersistedOperationMarkers,
     /// Evaluation owning this approval operation, when applicable.
@@ -725,6 +727,9 @@ pub fn snapshot_active_run(
                 .map(|value| value.0.clone()),
             effective_model_output: world
                 .get::<EffectiveModelOutput>(entity)
+                .map(|value| value.0.clone()),
+            provider_diagnostics: world
+                .get::<ProviderResponseDiagnostics>(entity)
                 .map(|value| value.0.clone()),
             markers: PersistedOperationMarkers {
                 request_policy_initialized: world.get::<RequestPolicyInitialized>(entity).is_some(),
@@ -2065,6 +2070,11 @@ fn restore_operation_components(
         world
             .entity_mut(entity)
             .insert(EffectiveModelOutput(value.clone()));
+    }
+    if let Some(value) = &persisted.provider_diagnostics {
+        world
+            .entity_mut(entity)
+            .insert(ProviderResponseDiagnostics(value.clone()));
     }
     let markers = persisted.markers;
     if markers.request_policy_initialized {

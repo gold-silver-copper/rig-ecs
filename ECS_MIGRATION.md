@@ -686,7 +686,7 @@ The table below is the audit map for the pre-ECS runtime. Test names refer to
 | active `AgentRun` serialization | stable-ID `ActiveRunSnapshot` | `snapshot_active_run`, `restore_active_run` | every waiting-phase restoration test | `agent_with_durable_approval` |
 | child-agent delegation | `ParentRun`/`ChildRuns`, `WaitingForChildren`, explicit ordinal | `spawn_agent`, `spawn_child_run` | deterministic result and cancellation tests | `agent_with_agent_tool` |
 | telemetry hooks | observe-only entity events and optional typed counters | `LifecycleTelemetryBundle` | lifecycle event ordering and telemetry tests | `agent_with_tools_otel` |
-| provider diagnostics | canonical effect outcome plus provider-owned typed data | effect adapters | provider and adapter suites | provider examples |
+| provider diagnostics | canonical effect outcome plus immutable `ProviderResponseDiagnostics` on the model operation | `CompletionModelAdapter::execute_with_diagnostics` and generation-validated diagnostics ingress | response-policy query, facade retention, streaming ingress, and snapshot tests | provider examples |
 | WASM | identical ECS state with target-specific effect transport only | normal Rust bounds | WASM compile gate | browser-capable core consumers |
 
 ## Hook-to-ECS migration guide
@@ -740,7 +740,11 @@ agent entity exists, so relationship-bearing bundles can target that entity
 without guessing a raw ID. `AgentBuilder::tool_approval_policy` pairs the
 native policy bundle with an `EcsPolicyApprover`; blocking and streaming facade
 runs execute its owned `PolicyApprovalEffectInput` outside the world and ingest
-the correlated typed result through the same schedule boundary.
+the correlated typed result through the same schedule boundary. Run-local
+policies use `AgentPromptRequest::run_policy` for blocking prompts and
+`LocalModelAgent::stream_run_with_policies` for streams; both submit the policy
+definitions in the same hosted command as the run, so no unprotected admission
+window exists before `PolicyForRun` relationships are established.
 
 ## Schedule and lifecycle diagrams
 
@@ -787,14 +791,14 @@ scheduling-shard boundary for distinct trust domains.
 
 ## Active-run snapshot format
 
-`ActiveRunSnapshot` format version 2 contains only stable domain IDs plus opaque
+`ActiveRunSnapshot` format version 3 contains only stable domain IDs plus opaque
 snapshot-local references. It records:
 
 - root and descendant runs, parent identity, child ordinal, and committed-child status;
 - authoritative run phase and orthogonal pause mode;
 - prompt, transcript, usage, turn/model budgets, invalid-tool retries, and structured-output retries;
 - memory/retrieval decisions, conversation state, pending output, and persistence state;
-- operation generation/phase, immutable model/tool/store decisions, stream sequence, and settled output;
+- operation generation/phase, immutable model/tool/store decisions, stream sequence, settled output, and serialized provider diagnostics;
 - tool batches and explicit call order;
 - accepted policy IDs/revisions, evaluation kind/cursor, accumulated request patch, effective arguments/presentation, and pending approvals;
 - run-scoped policy definitions, status, and stable run relationships;

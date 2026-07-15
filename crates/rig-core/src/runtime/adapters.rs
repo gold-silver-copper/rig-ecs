@@ -18,13 +18,13 @@ use crate::{
         ExtensionInstallError, GrantForAgent, GrantForTool, InstallError, InvalidToolCallBudget,
         ModelCapability, ModelDecision, ModelEffectInput, ModelEffectOutput, ModelToolCall,
         ModelToolChoice, OutputRequirement, PauseMode, PolicyApprovalEffectInput,
-        PolicyApprovalEffectOutput, RetiredCapability, RetrievalRequirement, RetrievedDocument,
-        RigExtension, RunOf, RunOutput, RunState, Runtime, RuntimeConfig, SpawnError, StableId,
-        StoreCapability, StoreEffectInput, StoreEffectOutput, StoreGrant, StoreGrantForAgent,
-        StoreGrantForStore, StoreOperation, StreamItem, StreamReceiveError, StreamTerminal,
-        StructuredOutputRetryBudget, SubmitError, TenantId, ToolApprovalPolicyBundle,
-        ToolCapability, ToolEffectInput, ToolEffectOutput, ToolGrant, ToolRetrievalRequirement,
-        TranscriptEntry, Usage,
+        PolicyApprovalEffectOutput, ProviderDiagnosticsIngress, RetiredCapability,
+        RetrievalRequirement, RetrievedDocument, RigExtension, RunOf, RunOutput, RunPolicySpec,
+        RunState, Runtime, RuntimeConfig, SpawnError, StableId, StoreCapability, StoreEffectInput,
+        StoreEffectOutput, StoreGrant, StoreGrantForAgent, StoreGrantForStore, StoreOperation,
+        StreamItem, StreamReceiveError, StreamTerminal, StructuredOutputRetryBudget, SubmitError,
+        TenantId, ToolApprovalPolicyBundle, ToolCapability, ToolEffectInput, ToolEffectOutput,
+        ToolGrant, ToolRetrievalRequirement, TranscriptEntry, Usage,
     },
     streaming::{StreamedAssistantContent, ToolCallDeltaContent},
     tool::IntoToolOutput,
@@ -51,6 +51,15 @@ use thiserror::Error;
 pub struct CompletionModelAdapter<M> {
     model: M,
     binding: Option<ModelDecision>,
+}
+
+/// Canonical model output paired with serialized provider-specific diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelExecutionResult {
+    /// Provider-independent result consumed by core progression.
+    pub output: ModelEffectOutput,
+    /// Raw typed provider response serialized for ECS policy and telemetry queries.
+    pub provider_diagnostics: serde_json::Value,
 }
 
 /// Standalone typed facade that drives the authoritative ECS schedule.
@@ -148,6 +157,7 @@ where
     max_model_calls: Option<u32>,
     tool_concurrency: usize,
     conversation: Result<Option<StableId>, crate::runtime::IdentityError>,
+    run_policies: Vec<RunPolicySpec>,
 }
 
 /// Awaitable prompt command that returns terminal usage and canonical messages.
@@ -162,6 +172,14 @@ struct LocalRunResult {
     output: RunOutput,
     transcript: Vec<TranscriptEntry>,
     completion_calls: Vec<Usage>,
+}
+
+struct LocalPromptOptions {
+    output_schema: Option<serde_json::Value>,
+    conversation: Option<StableId>,
+    max_model_calls: Option<u32>,
+    tool_concurrency: usize,
+    run_policies: Vec<RunPolicySpec>,
 }
 
 fn catch_executor_panic<'a, T, F>(future: F) -> BoxFuture<'a, Result<T, CanonicalError>>
@@ -229,6 +247,12 @@ where
         self.tool_concurrency = concurrency;
         self
     }
+
+    /// Atomically installs a policy scoped to this run at command ingress.
+    pub fn run_policy(mut self, policy: RunPolicySpec) -> Self {
+        self.run_policies.push(policy);
+        self
+    }
 }
 
 impl<M> std::future::IntoFuture for ExtendedAgentPromptRequest<M>
@@ -249,10 +273,13 @@ where
                 .run_prompt_options_detailed(
                     request.prompt,
                     request.history,
-                    None,
-                    conversation,
-                    request.max_model_calls,
-                    request.tool_concurrency,
+                    LocalPromptOptions {
+                        output_schema: None,
+                        conversation,
+                        max_model_calls: request.max_model_calls,
+                        tool_concurrency: request.tool_concurrency,
+                        run_policies: request.run_policies,
+                    },
                 )
                 .await
                 .map_err(local_prompt_error)?;
@@ -304,10 +331,13 @@ where
                 .run_prompt_options(
                     self.prompt,
                     self.history,
-                    None,
-                    conversation,
-                    self.max_model_calls,
-                    self.tool_concurrency,
+                    LocalPromptOptions {
+                        output_schema: None,
+                        conversation,
+                        max_model_calls: self.max_model_calls,
+                        tool_concurrency: self.tool_concurrency,
+                        run_policies: self.run_policies,
+                    },
                 )
                 .await
                 .map(|output| output.text)
@@ -1410,6 +1440,7 @@ where
             max_model_calls: None,
             tool_concurrency: usize::MAX,
             conversation: Ok(None),
+            run_policies: Vec::new(),
         }
     }
 
@@ -1872,55 +1903,53 @@ where
         history: Vec<Message>,
         output_schema: Option<serde_json::Value>,
     ) -> Result<RunOutput, LocalAgentError> {
-        self.run_prompt_options(prompt, history, output_schema, None, None, usize::MAX)
-            .await
+        self.run_prompt_options(
+            prompt,
+            history,
+            LocalPromptOptions {
+                output_schema,
+                conversation: None,
+                max_model_calls: None,
+                tool_concurrency: usize::MAX,
+                run_policies: Vec::new(),
+            },
+        )
+        .await
     }
 
-    pub(crate) async fn run_prompt_options(
+    async fn run_prompt_options(
         &self,
         prompt: Message,
         history: Vec<Message>,
-        output_schema: Option<serde_json::Value>,
-        conversation: Option<StableId>,
-        max_model_calls: Option<u32>,
-        tool_concurrency: usize,
+        options: LocalPromptOptions,
     ) -> Result<RunOutput, LocalAgentError> {
-        self.run_prompt_options_detailed(
-            prompt,
-            history,
-            output_schema,
-            conversation,
-            max_model_calls,
-            tool_concurrency,
-        )
-        .await
-        .map(|result| result.output)
+        self.run_prompt_options_detailed(prompt, history, options)
+            .await
+            .map(|result| result.output)
     }
 
     async fn run_prompt_options_detailed(
         &self,
         prompt: Message,
         history: Vec<Message>,
-        output_schema: Option<serde_json::Value>,
-        conversation: Option<StableId>,
-        max_model_calls: Option<u32>,
-        tool_concurrency: usize,
+        options: LocalPromptOptions,
     ) -> Result<LocalRunResult, LocalAgentError> {
         let pending = {
             let runtime = self
                 .runtime
                 .lock()
                 .map_err(|_| LocalAgentError::RuntimePoisoned)?;
-            runtime.handle().prompt_configured(
+            runtime.handle().prompt_configured_with_run_policies(
                 self.agent,
                 prompt,
                 history,
-                output_schema,
-                max_model_calls,
-                conversation,
+                options.output_schema,
+                options.max_model_calls,
+                options.conversation,
+                options.run_policies,
             )?
         };
-        self.drive_pending(pending, tool_concurrency).await
+        self.drive_pending(pending, options.tool_concurrency).await
     }
 
     async fn drive_pending(
@@ -1935,9 +1964,31 @@ where
                 let operation = request.operation;
                 let generation = request.generation;
                 let result = match request.input {
-                    EffectInput::Model(input) => catch_executor_panic(self.model.execute(input))
-                        .await
-                        .map(EffectOutput::Model),
+                    EffectInput::Model(input) => {
+                        match catch_executor_panic(self.model.execute_with_diagnostics(input)).await
+                        {
+                            Ok(execution) => {
+                                if let Err(error) = self.submit_provider_diagnostics(
+                                    &completion_sender,
+                                    ProviderDiagnosticsIngress {
+                                        operation,
+                                        generation,
+                                        diagnostics: execution.provider_diagnostics,
+                                    },
+                                ) {
+                                    Err(CanonicalError::Provider {
+                                        message: format!(
+                                            "provider diagnostics ingress failed: {error}"
+                                        ),
+                                        retryable: true,
+                                    })
+                                } else {
+                                    Ok(EffectOutput::Model(execution.output))
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
                     EffectInput::Tool(input) => {
                         tool_requests.push((operation, generation, input));
                         continue;
@@ -2042,20 +2093,24 @@ where
         history: Vec<Message>,
         max_model_calls: Option<u32>,
         conversation: Option<StableId>,
+        run_policies: Vec<RunPolicySpec>,
     ) -> Result<(crate::runtime::PendingRunHandle, crate::runtime::RunStream), LocalAgentError>
     {
         let runtime = self
             .runtime
             .lock()
             .map_err(|_| LocalAgentError::RuntimePoisoned)?;
-        Ok(runtime.handle().prompt_stream_configured(
-            self.agent,
-            prompt,
-            history,
-            None,
-            max_model_calls,
-            conversation,
-        )?)
+        Ok(runtime
+            .handle()
+            .prompt_stream_configured_with_run_policies(
+                self.agent,
+                prompt,
+                history,
+                None,
+                max_model_calls,
+                conversation,
+                run_policies,
+            )?)
     }
 
     fn drive_and_take_effects(
@@ -2131,6 +2186,20 @@ where
     ) -> Result<(), LocalAgentError> {
         loop {
             match sender.try_send(completion.clone()) {
+                Ok(()) => return Ok(()),
+                Err(EffectIoError::Backpressure) => self.drive_once()?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn submit_provider_diagnostics(
+        &self,
+        sender: &crate::runtime::EffectCompletionSender,
+        diagnostics: ProviderDiagnosticsIngress,
+    ) -> Result<(), LocalAgentError> {
+        loop {
+            match sender.try_send_provider_diagnostics(diagnostics.clone()) {
                 Ok(()) => return Ok(()),
                 Err(EffectIoError::Backpressure) => self.drive_once()?,
                 Err(error) => return Err(error.into()),
@@ -2228,9 +2297,56 @@ where
     where
         M: 'static,
     {
+        self.stream_run_with_history_and_policies(
+            prompt,
+            history,
+            max_model_calls,
+            conversation,
+            tool_concurrency,
+            Vec::new(),
+        )
+    }
+
+    /// Streams one run with policies installed atomically at command ingress.
+    pub fn stream_run_with_policies(
+        &self,
+        prompt: impl Into<Message>,
+        run_policies: Vec<RunPolicySpec>,
+    ) -> Pin<Box<dyn Stream<Item = Result<LocalStreamEvent, LocalAgentError>> + Send>>
+    where
+        M: 'static,
+    {
+        self.stream_run_with_history_and_policies(
+            prompt.into(),
+            Vec::new(),
+            None,
+            None,
+            usize::MAX,
+            run_policies,
+        )
+    }
+
+    fn stream_run_with_history_and_policies(
+        &self,
+        prompt: Message,
+        history: Vec<Message>,
+        max_model_calls: Option<u32>,
+        conversation: Option<StableId>,
+        tool_concurrency: usize,
+        run_policies: Vec<RunPolicySpec>,
+    ) -> Pin<Box<dyn Stream<Item = Result<LocalStreamEvent, LocalAgentError>> + Send>>
+    where
+        M: 'static,
+    {
         let agent = self.clone();
         Box::pin(async_stream::try_stream! {
-            let (pending, stream) = agent.begin_stream(prompt, history, max_model_calls, conversation)?;
+            let (pending, stream) = agent.begin_stream(
+                prompt,
+                history,
+                max_model_calls,
+                conversation,
+                run_policies,
+            )?;
             let stream = stream;
             let mut internal_call_ids = HashMap::<String, String>::new();
             let mut streamed_tool_calls = HashMap::<String, ToolCall>::new();
@@ -2412,6 +2528,32 @@ where
                             }
                             if let Some(error) = stream_error {
                                 break 'model Err(error);
+                            }
+                            if let Some(response) = provider_stream.response.as_ref() {
+                                let diagnostics = match serde_json::to_value(response) {
+                                    Ok(diagnostics) => diagnostics,
+                                    Err(error) => break 'model Err(CanonicalError::Provider {
+                                        message: format!(
+                                            "failed to serialize provider diagnostics: {error}"
+                                        ),
+                                        retryable: false,
+                                    }),
+                                };
+                                if let Err(error) = agent.submit_provider_diagnostics(
+                                    &completion_sender,
+                                    ProviderDiagnosticsIngress {
+                                        operation,
+                                        generation,
+                                        diagnostics,
+                                    },
+                                ) {
+                                    break 'model Err(CanonicalError::Provider {
+                                        message: format!(
+                                            "provider diagnostics ingress failed: {error}"
+                                        ),
+                                        retryable: true,
+                                    });
+                                }
                             }
                             let output = match normalize_model_output(
                                 provider_stream.choice.iter(),
@@ -2631,6 +2773,7 @@ where
             max_model_calls: None,
             tool_concurrency: usize::MAX,
             conversation: Ok(None),
+            run_policies: Vec::new(),
         }
     }
 }
@@ -2650,10 +2793,13 @@ where
                 .run_prompt_options_detailed(
                     prompt,
                     chat_history.clone(),
-                    None,
-                    None,
-                    None,
-                    usize::MAX,
+                    LocalPromptOptions {
+                        output_schema: None,
+                        conversation: None,
+                        max_model_calls: None,
+                        tool_concurrency: usize::MAX,
+                        run_policies: Vec::new(),
+                    },
                 )
                 .await
                 .map_err(local_prompt_error)?;
@@ -3173,6 +3319,16 @@ where
         &self,
         input: ModelEffectInput,
     ) -> Result<ModelEffectOutput, CanonicalError> {
+        self.execute_with_diagnostics(input)
+            .await
+            .map(|result| result.output)
+    }
+
+    /// Executes one owned model effect while retaining its raw provider response.
+    pub async fn execute_with_diagnostics(
+        &self,
+        input: ModelEffectInput,
+    ) -> Result<ModelExecutionResult, CanonicalError> {
         self.validate_decision(&input)?;
         let request = completion_request(&input)?;
         let response =
@@ -3184,11 +3340,22 @@ where
                     retryable: false,
                 })?;
 
-        normalize_model_output(
+        let provider_diagnostics =
+            serde_json::to_value(&response.raw_response).map_err(|error| {
+                CanonicalError::Provider {
+                    message: format!("failed to serialize provider diagnostics: {error}"),
+                    retryable: false,
+                }
+            })?;
+        let output = normalize_model_output(
             response.choice.iter(),
             response.usage,
             response.message_id.as_ref(),
-        )
+        )?;
+        Ok(ModelExecutionResult {
+            output,
+            provider_diagnostics,
+        })
     }
 
     /// Executes one streaming model effect through the same correlated ECS
@@ -3203,6 +3370,8 @@ where
         request: EffectRequest,
         deltas: &EffectDeltaSender,
     ) -> Result<ModelEffectOutput, CanonicalError> {
+        let operation = request.operation;
+        let generation = request.generation;
         let EffectInput::Model(input) = request.input else {
             return Err(CanonicalError::EffectKindMismatch);
         };
@@ -3266,6 +3435,23 @@ where
                 | StreamedAssistantContent::Final(_)
                 | StreamedAssistantContent::Unknown(_) => {}
             }
+        }
+        if let Some(response) = stream.response.as_ref() {
+            let diagnostics =
+                serde_json::to_value(response).map_err(|error| CanonicalError::Provider {
+                    message: format!("failed to serialize provider diagnostics: {error}"),
+                    retryable: false,
+                })?;
+            deltas
+                .try_send_provider_diagnostics(ProviderDiagnosticsIngress {
+                    operation,
+                    generation,
+                    diagnostics,
+                })
+                .map_err(|error| CanonicalError::Provider {
+                    message: format!("stream diagnostics ingress failed: {error}"),
+                    retryable: true,
+                })?;
         }
         normalize_model_output(
             stream.choice.iter(),
@@ -3612,9 +3798,9 @@ mod tests {
         bevy_ecs::entity::Entity,
         completion::{CompletionResponse, Usage as CompletionUsage},
         runtime::{
-            EffectIngress, ModelDecision, Policy, PolicyFor, RequestPatch,
-            RequestPatchPolicyBundle, RuntimeWaker, StableId, StoreDecision, TenantId,
-            ToolDecision,
+            EffectIngress, ModelDecision, Policy, PolicyFor, PolicyRule,
+            ProviderResponseDiagnostics, RequestPatch, RequestPatchPolicyBundle, RuntimeWaker,
+            StableId, StoreDecision, TenantId, ToolDecision,
         },
         streaming::{StreamingCompletionResponse, StreamingResult},
         test_utils::{MockCompletionModel, MockResponse, MockStreamEvent, MockTurn},
@@ -3944,6 +4130,7 @@ mod tests {
             MockStreamEvent::text("lo"),
             MockStreamEvent::tool_call("wire-id", "lookup", serde_json::json!({"id": 4}))
                 .with_call_id("call-id"),
+            MockStreamEvent::final_response_with_default_usage(),
         ]]);
         let adapter = CompletionModelAdapter::new(model);
         let (ingress, receiver) = sync_channel(4);
@@ -3971,6 +4158,12 @@ mod tests {
                 crate::runtime::EffectDeltaKind::Text(text.to_owned())
             );
         }
+        let EffectIngress::ProviderDiagnostics(diagnostics) = receiver.recv().unwrap() else {
+            panic!("expected provider diagnostics");
+        };
+        assert_eq!(diagnostics.operation, Entity::PLACEHOLDER);
+        assert_eq!(diagnostics.generation, 7);
+        assert!(diagnostics.diagnostics.get("usage").is_some());
     }
 
     #[tokio::test]
@@ -4089,6 +4282,32 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn local_facade_retains_serialized_provider_diagnostics_on_the_operation() {
+        let agent = LocalModelAgent::new(
+            MockCompletionModel::text("diagnostic result"),
+            "mock",
+            "mock-1",
+            "be concise",
+        )
+        .unwrap();
+
+        let output = agent.run_prompt("hello").await.unwrap();
+        assert_eq!(output.text, "diagnostic result");
+        let diagnostics = agent
+            .with_runtime_mut(|runtime| {
+                runtime
+                    .world_mut()
+                    .query::<&ProviderResponseDiagnostics>()
+                    .single(runtime.world())
+                    .unwrap()
+                    .0
+                    .clone()
+            })
+            .unwrap();
+        assert!(diagnostics.get("usage").is_some());
     }
 
     #[test]
@@ -4263,6 +4482,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_installs_run_scoped_policy_at_ingress() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call(
+                "wire-call",
+                "add",
+                serde_json::json!({"left": 2, "right": 3}),
+            ),
+            MockTurn::text("skipped"),
+        ]);
+        let agent = LocalModelAgentBuilder::new(model, "mock", "mock-1")
+            .tool(
+                StableId::new("add").unwrap(),
+                ToolCapability {
+                    name: "add".to_owned(),
+                    description: "adds integers".to_owned(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    order: 0,
+                    revision: 1,
+                    retired: false,
+                },
+                AddTool,
+            )
+            .build()
+            .unwrap();
+
+        let details = agent
+            .prompt("add")
+            .run_policy(RunPolicySpec::new(
+                StableId::new("skip-add-for-this-run").unwrap(),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::SkipToolCall {
+                        tool: Some("add".to_owned()),
+                        reason: "run-local skip".to_owned(),
+                    },
+                },
+            ))
+            .extended_details()
+            .await
+            .unwrap();
+
+        assert_eq!(details.output(), "skipped");
+        let transcript = agent
+            .with_runtime_mut(|runtime| {
+                let run = runtime
+                    .world_mut()
+                    .query_filtered::<Entity, bevy_ecs::query::With<RunState>>()
+                    .single(runtime.world())
+                    .unwrap();
+                runtime
+                    .run_transcript(runtime.run_handle(run).unwrap())
+                    .unwrap()
+            })
+            .unwrap();
+        assert!(transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::ToolResult { content, .. } if content == "run-local skip"
+        )));
+    }
+
+    #[tokio::test]
     async fn streaming_facade_executes_asynchronous_approval_effects() {
         let model = MockCompletionModel::from_stream_turns([
             vec![MockStreamEvent::tool_call(
@@ -4303,6 +4584,65 @@ mod tests {
             Ok(LocalStreamEvent::Finished { output, .. }) if output.text == "five"
         )));
         assert_eq!(approvals.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_prompt_installs_run_scoped_policy_at_ingress() {
+        let model = MockCompletionModel::from_stream_turns([
+            vec![MockStreamEvent::tool_call(
+                "wire-call",
+                "add",
+                serde_json::json!({"left": 2, "right": 3}),
+            )],
+            vec![MockStreamEvent::text("skipped")],
+        ]);
+        let agent = LocalModelAgentBuilder::new(model, "mock", "mock-1")
+            .tool(
+                StableId::new("add").unwrap(),
+                ToolCapability {
+                    name: "add".to_owned(),
+                    description: "adds integers".to_owned(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    order: 0,
+                    revision: 1,
+                    retired: false,
+                },
+                AddTool,
+            )
+            .build()
+            .unwrap();
+
+        let events = agent
+            .stream_run_with_policies(
+                "add",
+                vec![RunPolicySpec::new(
+                    StableId::new("stream-skip-add").unwrap(),
+                    Policy {
+                        order: 0,
+                        revision: 1,
+                        rule: PolicyRule::SkipToolCall {
+                            tool: Some("add".to_owned()),
+                            reason: "stream run-local skip".to_owned(),
+                        },
+                    },
+                )],
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LocalStreamEvent::Finished { output, transcript, .. }
+                if output.text == "skipped"
+                    && transcript.iter().any(|entry| matches!(
+                        entry,
+                        TranscriptEntry::ToolResult { content, .. }
+                            if content == "stream run-local skip"
+                    ))
+        )));
     }
 
     #[tokio::test]

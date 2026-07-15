@@ -18,6 +18,9 @@
 //! Asynchronous approval, model, tool, store, and discovery work always runs on
 //! owned inputs outside the world and returns with operation generations that
 //! reject stale or late completions.
+//! Serialized provider responses are retained as immutable
+//! [`ProviderResponseDiagnostics`] components for response policy and telemetry
+//! queries without coupling core progression to provider types.
 //!
 //! [`RunControl`] and [`AgentControl`] provide independent pause and admission
 //! semantics while multiple agents and sibling runs share one world. Active
@@ -2618,10 +2621,22 @@ pub enum EffectDeltaKind {
     },
 }
 
+/// Raw serialized provider response correlated to one model operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderDiagnosticsIngress {
+    /// Model operation identity.
+    pub operation: Entity,
+    /// Operation generation copied at dispatch.
+    pub generation: u64,
+    /// Provider-specific response serialized by the typed adapter.
+    pub diagnostics: serde_json::Value,
+}
+
 #[derive(Clone, Debug)]
 enum EffectIngress {
     Completion(EffectCompletion),
     Delta(EffectDelta),
+    ProviderDiagnostics(ProviderDiagnosticsIngress),
 }
 
 /// Typed provider-independent effect result.
@@ -2652,6 +2667,14 @@ pub struct ModelEffectOutput {
     /// Ordered tool calls requested by this model operation.
     pub tool_calls: Vec<ModelToolCall>,
 }
+
+/// Immutable provider-specific response data retained for policy and telemetry queries.
+///
+/// Core progression never interprets this value. Typed provider adapters serialize
+/// their raw response into this component before the correlated completion settles.
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[component(immutable)]
+pub struct ProviderResponseDiagnostics(pub serde_json::Value);
 
 /// Provider-independent requested tool call.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3717,6 +3740,21 @@ impl EffectCompletionSender {
         Ok(())
     }
 
+    /// Sends provider-specific diagnostics before the correlated completion.
+    pub fn try_send_provider_diagnostics(
+        &self,
+        diagnostics: ProviderDiagnosticsIngress,
+    ) -> Result<(), EffectIoError> {
+        self.ingress
+            .try_send(EffectIngress::ProviderDiagnostics(diagnostics))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => EffectIoError::Backpressure,
+                TrySendError::Disconnected(_) => EffectIoError::Disconnected,
+            })?;
+        self.waker.notify();
+        Ok(())
+    }
+
     /// Reports a caught executor panic as a canonical completion.
     pub fn try_send_panic(
         &self,
@@ -3744,6 +3782,21 @@ impl EffectDeltaSender {
     pub fn try_send(&self, delta: EffectDelta) -> Result<(), EffectIoError> {
         self.ingress
             .try_send(EffectIngress::Delta(delta))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => EffectIoError::Backpressure,
+                TrySendError::Disconnected(_) => EffectIoError::Disconnected,
+            })?;
+        self.waker.notify();
+        Ok(())
+    }
+
+    /// Sends provider-specific diagnostics through the ordered model ingress.
+    pub fn try_send_provider_diagnostics(
+        &self,
+        diagnostics: ProviderDiagnosticsIngress,
+    ) -> Result<(), EffectIoError> {
+        self.ingress
+            .try_send(EffectIngress::ProviderDiagnostics(diagnostics))
             .map_err(|error| match error {
                 TrySendError::Full(_) => EffectIoError::Backpressure,
                 TrySendError::Disconnected(_) => EffectIoError::Disconnected,
@@ -8319,6 +8372,21 @@ fn apply_effect_ingress(
                 }
                 mark_progress(&mut progress);
             }
+            EffectIngress::ProviderDiagnostics(diagnostics) => {
+                let Ok((kind, _, state, _, _)) = operations.get(diagnostics.operation) else {
+                    continue;
+                };
+                if !matches!(kind, OperationKind::Model)
+                    || state.generation != diagnostics.generation
+                    || !matches!(state.phase, OperationPhase::InFlight)
+                {
+                    continue;
+                }
+                commands
+                    .entity(diagnostics.operation)
+                    .insert(ProviderResponseDiagnostics(diagnostics.diagnostics.clone()));
+                mark_progress(&mut progress);
+            }
             EffectIngress::Delta(delta) => {
                 let Ok((kind, operation_of, state, stream_state, deadline)) =
                     operations.get_mut(delta.operation)
@@ -10172,6 +10240,21 @@ mod tests {
         event.decision = Some(RequestPolicyDecision::Stop("ambiguous".to_owned()));
     }
 
+    fn inspect_provider_diagnostics(
+        mut event: On<CompletionResponsePolicyInvocation>,
+        diagnostics: Query<&ProviderResponseDiagnostics>,
+    ) {
+        event.decision = Some(
+            if diagnostics.get(event.operation).is_ok_and(|diagnostics| {
+                diagnostics.0["provider_request_id"] == "provider-response"
+            }) {
+                CompletionResponsePolicyDecision::RewriteText("diagnostics observed".to_owned())
+            } else {
+                CompletionResponsePolicyDecision::Stop("provider diagnostics missing".to_owned())
+            },
+        );
+    }
+
     fn inspect_tool_policy(
         mut event: On<ToolCallPolicyInvocation>,
         policies: Query<&InspectToolPolicy>,
@@ -10212,6 +10295,14 @@ mod tests {
         event.decision = Some(ToolCallPolicyDecision::Rewrite(
             serde_json::json!({"value": value + 10}),
         ));
+    }
+
+    fn stop_second_tool_call(mut event: On<ToolCallPolicyInvocation>) {
+        event.decision = Some(if event.call.call_id == "second" {
+            ToolCallPolicyDecision::Stop("second call terminates the batch".to_owned())
+        } else {
+            ToolCallPolicyDecision::Run
+        });
     }
 
     fn inspect_tool_result_policy(
@@ -10664,6 +10755,66 @@ mod tests {
             runtime.world().get::<RunState>(run.entity()),
             Some(&RunState::Completed(output))
         );
+    }
+
+    #[test]
+    fn streaming_cancellation_publishes_terminal_and_rejects_late_completion() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let (pending, stream) = runtime.handle().prompt_stream(agent, "cancel").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+
+        runtime.handle().cancel(run).unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.effects().try_recv_cancellation().unwrap(),
+            Some(EffectCancellation {
+                operation: request.operation,
+                generation: request.generation,
+            })
+        );
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "late".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Cancelled)
+        );
+        assert_eq!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::Finished(StreamTerminal::Cancelled))
+        );
+        assert_eq!(stream.try_recv().unwrap(), None);
+        runtime.run_until_stalled().unwrap();
+        assert!(runtime.world().get_entity(run.entity()).is_err());
     }
 
     #[test]
@@ -11247,6 +11398,26 @@ mod tests {
     }
 
     #[test]
+    fn streaming_ingress_reports_backpressure_at_the_configured_bound() {
+        let runtime = Runtime::new(RuntimeConfig {
+            completion_capacity: 1,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let deltas = runtime.effects().delta_sender();
+        let delta = |sequence| EffectDelta {
+            operation: Entity::PLACEHOLDER,
+            generation: 0,
+            sequence,
+            provider_correlation: None,
+            kind: EffectDeltaKind::Text(format!("delta-{sequence}")),
+        };
+
+        assert_eq!(deltas.try_send(delta(0)), Ok(()));
+        assert_eq!(deltas.try_send(delta(1)), Err(EffectIoError::Backpressure));
+    }
+
+    #[test]
     fn text_and_tool_call_deltas_share_sequence_and_observation_pipeline() {
         let mut runtime = runtime();
         runtime
@@ -11363,6 +11534,10 @@ mod tests {
         );
         assert_eq!(observed.tool.first().map(|event| event.sequence), Some(1));
         assert_eq!(observed.tool.get(1).map(|event| event.sequence), Some(2));
+        let mut evaluations = runtime
+            .world_mut()
+            .query_filtered::<Entity, With<TextDeltaPolicyEvaluation>>();
+        assert_eq!(evaluations.iter(runtime.world()).count(), 0);
     }
 
     #[test]
@@ -11382,6 +11557,21 @@ mod tests {
             .unwrap();
         let agent = runtime
             .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("a-pass-first"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::StopTextDeltaContains {
+                        needle: "never present".to_owned(),
+                        reason: "must not stop".to_owned(),
+                    },
+                },
+                agent,
+            )
             .unwrap();
         runtime
             .spawn_policy(
@@ -11429,6 +11619,21 @@ mod tests {
             ))) if policy == "stream-guard"
         ));
         assert_eq!(stream.try_recv().unwrap(), None);
+        let mut evaluations = runtime
+            .world_mut()
+            .query::<(&AcceptedTextDeltaPolicies, &TextDeltaPolicyEvaluation)>();
+        let accepted = evaluations
+            .iter(runtime.world())
+            .find(|(_, evaluation)| evaluation.sequence == 1)
+            .map(|(accepted, _)| {
+                accepted
+                    .0
+                    .iter()
+                    .map(|policy| policy.id.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        assert_eq!(accepted, ["a-pass-first", "stream-guard"]);
     }
 
     #[test]
@@ -12427,6 +12632,71 @@ mod tests {
     }
 
     #[test]
+    fn policy_observer_invocation_advances_only_one_cursor_per_schedule_pass() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        for order in 0..3 {
+            runtime
+                .spawn_policy(
+                    id(&format!("policy-{order}")),
+                    tenant("a"),
+                    Policy {
+                        order,
+                        revision: 1,
+                        rule: PolicyRule::Allow,
+                    },
+                    agent,
+                )
+                .unwrap();
+        }
+        runtime
+            .handle()
+            .prompt(agent, "one cursor per pass")
+            .unwrap();
+
+        let cursor = (0..4)
+            .find_map(|_| {
+                runtime.update();
+                runtime
+                    .world_mut()
+                    .query::<&RequestPolicyEvaluation>()
+                    .iter(runtime.world())
+                    .next()
+                    .map(|evaluation| evaluation.cursor)
+            })
+            .expect("request evaluation must be initialized within bounded schedule passes");
+        assert_eq!(cursor, 1);
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+
+        runtime.update();
+        let cursor = runtime
+            .world_mut()
+            .query::<&RequestPolicyEvaluation>()
+            .single(runtime.world())
+            .unwrap()
+            .cursor;
+        assert_eq!(cursor, 2);
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+
+        runtime.run_until_stalled().unwrap();
+        assert!(runtime.effects().try_recv().unwrap().is_some());
+    }
+
+    #[test]
     fn run_scoped_policy_affects_only_its_target_run_and_cleans_up_with_it() {
         let (mut runtime, agent) = runtime_with_tool();
         let first_pending = runtime.handle().prompt(agent, "first").unwrap();
@@ -12453,6 +12723,11 @@ mod tests {
                 first,
             )
             .unwrap();
+        let run_policy_observer = runtime
+            .world()
+            .get::<BoundPolicyObserver>(run_policy)
+            .expect("run-local policy must bind a targeted observer")
+            .0;
 
         for request in model_requests {
             let run = runtime
@@ -12508,6 +12783,7 @@ mod tests {
 
         runtime.world_mut().despawn(first.entity());
         assert!(runtime.world().get_entity(run_policy).is_err());
+        assert!(runtime.world().get_entity(run_policy_observer).is_err());
     }
 
     #[test]
@@ -12871,6 +13147,75 @@ mod tests {
     }
 
     #[test]
+    fn completion_response_policy_can_query_provider_diagnostics() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let policy = runtime
+            .spawn_policy(
+                id("inspect-provider"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::Custom(PolicyPoint::CompletionResponse),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(policy)
+            .observe(inspect_provider_diagnostics);
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        let sender = runtime.effects().completion_sender();
+        sender
+            .try_send_provider_diagnostics(ProviderDiagnosticsIngress {
+                operation: request.operation,
+                generation: request.generation,
+                diagnostics: serde_json::json!({
+                    "provider_request_id": "provider-response"
+                }),
+            })
+            .unwrap();
+        sender
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "original".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert!(matches!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(RunState::Completed(RunOutput { text, .. }))
+                if text == "diagnostics observed"
+        ));
+    }
+
+    #[test]
     fn stopped_completion_response_never_commits_a_turn() {
         let mut runtime = runtime();
         let model = runtime
@@ -13162,6 +13507,79 @@ mod tests {
         assert_eq!(
             second.tool_input().unwrap().arguments,
             serde_json::json!({"value": 12})
+        );
+    }
+
+    #[test]
+    fn terminating_tool_call_prevents_not_yet_dispatched_batch_siblings() {
+        let (mut runtime, agent) = runtime_with_tool();
+        let policy = runtime
+            .spawn_policy(
+                id("stop-second"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::Custom(PolicyPoint::ToolCall),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(policy)
+            .observe(stop_second_tool_call);
+        let pending = runtime.handle().prompt(agent, "two lookups").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![
+                        ModelToolCall {
+                            id: "first".to_owned(),
+                            provider_result_id: "first".to_owned(),
+                            provider_call_id: None,
+                            name: "lookup".to_owned(),
+                            arguments: serde_json::json!({"value": 1}),
+                        },
+                        ModelToolCall {
+                            id: "second".to_owned(),
+                            provider_result_id: "second".to_owned(),
+                            provider_call_id: None,
+                            name: "lookup".to_owned(),
+                            arguments: serde_json::json!({"value": 2}),
+                        },
+                    ],
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Failed(CanonicalError::PolicyDenied {
+                policy: "stop-second".to_owned(),
+            }))
+        );
+        let mut tools = runtime
+            .world_mut()
+            .query_filtered::<&OperationState, With<ToolEffectInput>>();
+        assert_eq!(
+            tools
+                .iter(runtime.world())
+                .filter(|state| matches!(state.phase, OperationPhase::InFlight))
+                .count(),
+            0
         );
     }
 
@@ -16334,6 +16752,178 @@ mod tests {
     }
 
     #[test]
+    fn resumed_run_matches_uninterrupted_output_transcript_usage_and_policy_decisions() {
+        let mut definition = runtime();
+        let model = definition
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = definition
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        definition
+            .spawn_policy(
+                id("request-patch"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 9,
+                    rule: PolicyRule::PatchRequest(
+                        RequestPatch::new()
+                            .instructions("checkpoint policy")
+                            .temperature(0.25),
+                    ),
+                },
+                agent,
+            )
+            .unwrap();
+        let domain = definition.snapshot().unwrap();
+        let response = ModelEffectOutput {
+            assistant_message: None,
+            text: "identical answer".to_owned(),
+            usage: Usage {
+                input_tokens: 11,
+                output_tokens: 7,
+            },
+            tool_calls: Vec::new(),
+        };
+
+        let mut uninterrupted = runtime();
+        let entities = uninterrupted.restore(domain.clone()).unwrap();
+        let uninterrupted_agent = AgentHandle {
+            runtime_id: uninterrupted.handle.runtime_id,
+            entity: entities.0[&id("agent")],
+        };
+        let uninterrupted_pending = uninterrupted
+            .handle()
+            .prompt(uninterrupted_agent, "compare checkpoint")
+            .unwrap();
+        uninterrupted.run_until_stalled().unwrap();
+        let uninterrupted_request = uninterrupted.effects().try_recv().unwrap().unwrap();
+        let uninterrupted_input = uninterrupted_request.model_input().unwrap().clone();
+        uninterrupted
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: uninterrupted_request.operation,
+                generation: uninterrupted_request.generation,
+                result: Ok(EffectOutput::Model(response.clone())),
+            })
+            .unwrap();
+        uninterrupted.run_until_stalled().unwrap();
+        let uninterrupted_run = uninterrupted.resolve_run(&uninterrupted_pending).unwrap();
+        let uninterrupted_state = uninterrupted
+            .world()
+            .get::<RunState>(uninterrupted_run.entity())
+            .cloned();
+        let uninterrupted_transcript = uninterrupted.run_transcript(uninterrupted_run).unwrap();
+        let uninterrupted_usage = uninterrupted
+            .world()
+            .get::<RunRecord>(uninterrupted_run.entity())
+            .unwrap()
+            .usage;
+        let uninterrupted_turns = uninterrupted.run_committed_turns(uninterrupted_run);
+        let uninterrupted_policies = uninterrupted
+            .world()
+            .get::<AcceptedPolicies>(uninterrupted_request.operation)
+            .unwrap()
+            .0
+            .iter()
+            .map(|policy| (policy.id.clone(), policy.revision))
+            .collect::<Vec<_>>();
+
+        let mut checkpoint_source = runtime();
+        let entities = checkpoint_source.restore(domain.clone()).unwrap();
+        let checkpoint_agent = AgentHandle {
+            runtime_id: checkpoint_source.handle.runtime_id,
+            entity: entities.0[&id("agent")],
+        };
+        let checkpoint_pending = checkpoint_source
+            .handle()
+            .prompt(checkpoint_agent, "compare checkpoint")
+            .unwrap();
+        checkpoint_source.run_until_stalled().unwrap();
+        let original_request = checkpoint_source.effects().try_recv().unwrap().unwrap();
+        assert_eq!(original_request.model_input(), Some(&uninterrupted_input));
+        let checkpoint_run = checkpoint_source.resolve_run(&checkpoint_pending).unwrap();
+        checkpoint_source
+            .handle()
+            .pause_with_mode(checkpoint_run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        checkpoint_source.run_until_stalled().unwrap();
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(
+                &checkpoint_source
+                    .snapshot_active_run(checkpoint_run)
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut resumed = runtime();
+        resumed.restore(domain).unwrap();
+        let restored_runs = resumed.restore_active_run(snapshot).unwrap();
+        let resumed_run = RunHandle {
+            runtime_id: resumed.handle.runtime_id,
+            entity: restored_runs.0[checkpoint_pending.stable_id()],
+        };
+        resumed.handle().resume(resumed_run).unwrap();
+        resumed.run_until_stalled().unwrap();
+        let resumed_request = resumed.effects().try_recv().unwrap().unwrap();
+        assert!(resumed_request.generation > original_request.generation);
+        assert_eq!(resumed_request.model_input(), Some(&uninterrupted_input));
+        let resumed_policies = resumed
+            .world()
+            .get::<AcceptedPolicies>(resumed_request.operation)
+            .unwrap()
+            .0
+            .iter()
+            .map(|policy| (policy.id.clone(), policy.revision))
+            .collect::<Vec<_>>();
+        resumed
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: resumed_request.operation,
+                generation: resumed_request.generation,
+                result: Ok(EffectOutput::Model(response)),
+            })
+            .unwrap();
+        resumed.run_until_stalled().unwrap();
+
+        assert_eq!(
+            resumed.world().get::<RunState>(resumed_run.entity()),
+            uninterrupted_state.as_ref()
+        );
+        assert_eq!(
+            resumed.run_transcript(resumed_run).unwrap(),
+            uninterrupted_transcript
+        );
+        assert_eq!(
+            resumed
+                .world()
+                .get::<RunRecord>(resumed_run.entity())
+                .unwrap()
+                .usage,
+            uninterrupted_usage
+        );
+        assert_eq!(
+            resumed.run_committed_turns(resumed_run),
+            uninterrupted_turns
+        );
+        assert_eq!(resumed_policies, uninterrupted_policies);
+    }
+
+    #[test]
     fn active_run_snapshot_restores_request_policy_cursor_and_pending_approval() {
         let mut source = runtime();
         let model = source
@@ -16586,7 +17176,7 @@ mod tests {
             &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.version, 3);
         assert_eq!(snapshot.run_policies.len(), 1);
         assert_eq!(snapshot.run_policies[0].id, id("run-rewrite"));
         assert_eq!(snapshot.run_policies[0].run_id, *pending.stable_id());
@@ -16671,9 +17261,15 @@ mod tests {
             .pause_with_mode(run, PauseMode::FreezeAfterIngress)
             .unwrap();
         source.run_until_stalled().unwrap();
-        source
-            .effects()
-            .completion_sender()
+        let completion_sender = source.effects().completion_sender();
+        completion_sender
+            .try_send_provider_diagnostics(ProviderDiagnosticsIngress {
+                operation: request.operation,
+                generation: request.generation,
+                diagnostics: serde_json::json!({"provider_request_id": "response-7"}),
+            })
+            .unwrap();
+        completion_sender
             .try_send(EffectCompletion {
                 operation: request.operation,
                 generation: request.generation,
@@ -16704,6 +17300,13 @@ mod tests {
             &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            snapshot
+                .operations
+                .iter()
+                .find_map(|operation| { operation.provider_diagnostics.as_ref() }),
+            Some(&serde_json::json!({"provider_request_id": "response-7"}))
+        );
 
         let mut restored = runtime();
         restored.restore(domain).unwrap();
@@ -16714,6 +17317,12 @@ mod tests {
         };
         restored.handle().resume(run).unwrap();
         restored.run_until_stalled().unwrap();
+
+        let mut diagnostics = restored.world_mut().query::<&ProviderResponseDiagnostics>();
+        assert_eq!(
+            diagnostics.single(restored.world()).unwrap().0,
+            serde_json::json!({"provider_request_id": "response-7"})
+        );
 
         assert_eq!(
             restored.observe_run(run).unwrap(),
