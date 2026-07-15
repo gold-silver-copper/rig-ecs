@@ -675,7 +675,7 @@ The table below is the audit map for the pre-ECS runtime. Test names refer to
 | model-turn-finished hook | observe-only targeted entity event | `ModelTurnFinished` | `completion_response_policy_runs_before_commit_and_emits_turn_event` | `agent_with_tools_otel` |
 | invalid-tool hook | pending-invalid component plus ordered durable evaluation | repair/retry/skip bundles and invocation event | invalid-tool action, budget, streaming, and snapshot tests | `gemini_default_api_recovery` |
 | tool-call hook | per-operation policy evaluation with immutable tool decision | rewrite/approval/skip bundles | rewrite, approval, skip, and snapshot tests | `agent_with_approval_policy` |
-| tool-result hook | immutable raw effect plus mutable presentation evaluation | `ToolResultRedactionPolicyBundle` | raw/presentation separation and stop tests | `tool_result_outcomes` |
+| tool-result hook | immutable raw effect plus mutable presentation evaluation | `ToolResultRedactionPolicyBundle` | raw/presentation separation, content-free settlement telemetry, and stop tests | `tool_result_outcomes` |
 | hook scratchpad/context | extension-owned typed components and relationship queries | `RigOperationContext`, ordinary `Component` | extension/SystemParam test | `ecs_extension`, `tool_result_outcomes` |
 | asynchronous hooks | approval operation entities and owned effect I/O | `PolicyRule::RequireApproval` | request/tool/result/invalid approval snapshot tests | `agent_with_durable_approval` |
 | tools and dynamic tools | capability and grant entities with revisioned immutable snapshots | agent builder tools, `spawn_tool`, `grant_tool` | collision, retirement, batch, and provider suites | `agent_with_tools`, `rag_dynamic_tools` |
@@ -718,6 +718,15 @@ Asynchronous policy behavior creates a `PolicyApproval` operation related to
 the evaluation. The evaluation remains at its cursor while the owned request is
 outside the world. Completion ingress validates operation identity, generation,
 phase, cancellation, and output kind before advancing the cursor.
+
+Tool settlement telemetry deliberately carries only `ToolExecutionStatus`
+(classification, retryability, and refusal flags). Raw output and operator
+diagnostics remain immutable operation audit state and are not copied into
+`ToolExecutionSettled`. `ToolResultPresentationFinalized` carries only the
+policy-approved presentation, while `ToolBatchCommitted` uses
+`PublishedToolResult` values with the same content-safe boundary. Neither event
+is emitted when result policy stops the run, so redaction and stop decisions
+cannot leak raw content through observation payloads or stream publication.
 
 ## Public extension API
 
@@ -791,7 +800,7 @@ scheduling-shard boundary for distinct trust domains.
 
 ## Active-run snapshot format
 
-`ActiveRunSnapshot` format version 3 contains only stable domain IDs plus opaque
+`ActiveRunSnapshot` format version 4 contains only stable domain IDs plus opaque
 snapshot-local references. It records:
 
 - root and descendant runs, parent identity, child ordinal, and committed-child status;
@@ -800,7 +809,7 @@ snapshot-local references. It records:
 - memory/retrieval decisions, conversation state, pending output, and persistence state;
 - operation generation/phase, immutable model/tool/store decisions, stream sequence, settled output, and serialized provider diagnostics;
 - tool batches and explicit call order;
-- accepted policy IDs/revisions, evaluation kind/cursor, accumulated request patch, effective arguments/presentation, and pending approvals;
+- accepted policy IDs/revisions/order/lifecycle capability, evaluation kind/cursor, accumulated request patch, effective arguments/presentation, and pending approvals;
 - run-scoped policy definitions, status, and stable run relationships;
 - committed-turn audit records.
 
@@ -813,6 +822,15 @@ redispatchable prepared generation. Snapshots contain prompts, transcripts,
 tool data, policy decisions, and provider content and must therefore be handled
 as application-sensitive data. Runtime-only custom observers/systems must be
 reinstalled after domain restoration before runs resume.
+
+## Known behavior not yet equivalent
+
+None identified. The merge-base capability, provider, feature, cassette, test,
+and example inventories are retained, and each pre-ECS hook boundary has a
+tested ECS-native replacement in the capability matrix above. Runtime-only
+extension behavior remains intentionally application-owned and must be
+reinstalled after restoration, as documented in the snapshot contract; this is
+an explicit rebinding boundary rather than a lost runtime capability.
 
 ## Restored example inventory
 

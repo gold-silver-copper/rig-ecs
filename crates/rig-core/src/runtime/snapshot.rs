@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use super::*;
 
-const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 3;
+const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable checkpoint for one run and all of its descendant runs.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -163,7 +163,9 @@ pub struct PersistedRunOperation {
     pub batch: Option<String>,
     /// Narrow completion type.
     pub kind: PersistedOperationKind,
-    /// Generation and mutually exclusive operation phase.
+    /// Immutable generation identity.
+    pub generation: u64,
+    /// Mutually exclusive operation phase.
     pub state: OperationState,
     /// Accepted model decision stored independently for preparation queries.
     pub model_decision: Option<ModelDecision>,
@@ -258,6 +260,10 @@ pub struct PersistedAcceptedPolicy {
     pub id: StableId,
     /// Exact accepted revision.
     pub revision: u64,
+    /// Explicit composition order accepted by the operation.
+    pub order: u32,
+    /// Exact lifecycle capability accepted by the operation.
+    pub point: PolicyPoint,
 }
 
 /// Atomic tool batch and its explicit ordering relationships.
@@ -505,17 +511,19 @@ pub fn snapshot_active_run(
         Entity,
         &OperationOf,
         &OperationKind,
+        &OperationGeneration,
         &OperationState,
         Option<&OperationOfBatch>,
     )>();
     let operation_rows = operation_query
         .iter(world)
-        .filter(|(_, operation_of, _, _, _)| selected.contains(&operation_of.get()))
-        .map(|(entity, operation_of, kind, state, batch)| {
+        .filter(|(_, operation_of, _, _, _, _)| selected.contains(&operation_of.get()))
+        .map(|(entity, operation_of, kind, generation, state, batch)| {
             (
                 entity,
                 operation_of.get(),
                 *kind,
+                generation.0,
                 state.clone(),
                 batch.map(Relationship::get),
             )
@@ -636,7 +644,7 @@ pub fn snapshot_active_run(
         let Some(id) = operation_ids.get(&entity) else {
             continue;
         };
-        if matches!(row.3.phase, OperationPhase::InFlight) {
+        if matches!(row.4.phase, OperationPhase::InFlight) {
             return Err(ActiveRunSnapshotError::UnsafeInFlightEffect(id.clone()));
         }
         let run_id = run_ids
@@ -655,7 +663,7 @@ pub fn snapshot_active_run(
             }
         };
         let batch = row
-            .4
+            .5
             .map(|batch| {
                 batch_ids
                     .get(&batch)
@@ -697,7 +705,8 @@ pub fn snapshot_active_run(
             run_id,
             batch,
             kind,
-            state: row.3.clone(),
+            generation: row.3,
+            state: row.4.clone(),
             model_decision,
             pending_model,
             model_input,
@@ -873,6 +882,8 @@ fn persist_policies(policies: &[AcceptedPolicy]) -> Vec<PersistedAcceptedPolicy>
         .map(|policy| PersistedAcceptedPolicy {
             id: policy.id.clone(),
             revision: policy.revision,
+            order: policy.order,
+            point: policy.point,
         })
         .collect()
 }
@@ -1187,6 +1198,8 @@ struct DomainRef {
     entity: Entity,
     tenant: TenantId,
     revision: Option<u64>,
+    policy_order: Option<u32>,
+    policy_point: Option<PolicyPoint>,
 }
 
 #[derive(Default)]
@@ -1273,6 +1286,8 @@ pub fn restore_active_run(
                 entity,
                 tenant: persisted.tenant.clone(),
                 revision: Some(persisted.policy.revision),
+                policy_order: Some(persisted.policy.order),
+                policy_point: Some(persisted.policy.rule.point()),
             },
         );
         restored_run_policies.push((persisted.id.clone(), entity));
@@ -1314,7 +1329,12 @@ pub fn restore_active_run(
                 persisted.id.clone(),
             ));
         }
-        let mut entity = world.spawn((OperationOf(run), kind, state.clone()));
+        let mut entity = world.spawn((
+            OperationOf(run),
+            kind,
+            OperationGeneration(persisted.generation),
+            state.clone(),
+        ));
         if let Some(batch) = batch {
             entity.insert(OperationOfBatch(batch));
         }
@@ -1451,6 +1471,8 @@ fn validate_active_snapshot(
                 entity: Entity::PLACEHOLDER,
                 tenant: policy.tenant.clone(),
                 revision: Some(policy.policy.revision),
+                policy_order: Some(policy.policy.order),
+                policy_point: Some(policy.policy.rule.point()),
             },
         );
         domain.existing_ids.insert(policy.id.clone());
@@ -1575,6 +1597,8 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     entity,
                     tenant: tenant.clone(),
                     revision: None,
+                    policy_order: None,
+                    policy_point: None,
                 },
             )
         })
@@ -1589,6 +1613,8 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     entity,
                     tenant: tenant.clone(),
                     revision: Some(value.revision),
+                    policy_order: None,
+                    policy_point: None,
                 },
             )
         })
@@ -1603,6 +1629,8 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     entity,
                     tenant: tenant.clone(),
                     revision: Some(value.revision),
+                    policy_order: None,
+                    policy_point: None,
                 },
             )
         })
@@ -1617,6 +1645,8 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     entity,
                     tenant: tenant.clone(),
                     revision: Some(value.revision),
+                    policy_order: None,
+                    policy_point: None,
                 },
             )
         })
@@ -1631,6 +1661,8 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     entity,
                     tenant: tenant.clone(),
                     revision: Some(value.revision),
+                    policy_order: Some(value.order),
+                    policy_point: Some(value.rule.point()),
                 },
             )
         })
@@ -1865,6 +1897,17 @@ fn remap_policies(
     policies
         .iter()
         .map(|policy| {
+            let current = domain_ref(&domain.policies, &policy.id)?;
+            if current.policy_order != Some(policy.order)
+                || current.policy_point != Some(policy.point)
+            {
+                return Err(ActiveRunSnapshotError::InvalidSnapshot(format!(
+                    "accepted policy `{}` no longer has order {} and {:?} capability",
+                    policy.id.as_str(),
+                    policy.order,
+                    policy.point
+                )));
+            }
             Ok(AcceptedPolicy {
                 id: policy.id.clone(),
                 entity: validate_domain_ref(
@@ -1874,6 +1917,8 @@ fn remap_policies(
                     Some(policy.revision),
                 )?,
                 revision: policy.revision,
+                order: policy.order,
+                point: policy.point,
             })
         })
         .collect()

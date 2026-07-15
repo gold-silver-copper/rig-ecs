@@ -631,30 +631,26 @@ pub enum PolicyPoint {
 }
 
 impl PolicyRule {
-    fn applies_to(&self, point: PolicyPoint) -> bool {
+    fn point(&self) -> PolicyPoint {
         match self {
             Self::Allow | Self::DenyPromptContains(_) | Self::PatchRequest(_) => {
-                point == PolicyPoint::Request
+                PolicyPoint::Request
             }
-            Self::RewriteToolArguments { .. } | Self::SkipToolCall { .. } => {
-                point == PolicyPoint::ToolCall
-            }
+            Self::RewriteToolArguments { .. } | Self::SkipToolCall { .. } => PolicyPoint::ToolCall,
             Self::RepairInvalidTool { .. }
             | Self::RetryInvalidTool { .. }
-            | Self::SkipInvalidTool { .. } => point == PolicyPoint::InvalidToolCall,
-            Self::RewriteToolResult { .. } | Self::StopToolResult { .. } => {
-                point == PolicyPoint::ToolResult
-            }
+            | Self::SkipInvalidTool { .. } => PolicyPoint::InvalidToolCall,
+            Self::RewriteToolResult { .. } | Self::StopToolResult { .. } => PolicyPoint::ToolResult,
             Self::RewriteCompletionText { .. } | Self::StopCompletionContains { .. } => {
-                point == PolicyPoint::CompletionResponse
+                PolicyPoint::CompletionResponse
             }
-            Self::StopTextDeltaContains { .. } => point == PolicyPoint::TextDelta,
-            Self::RequireApproval {
-                point: approval_point,
-                ..
-            } => *approval_point == point,
-            Self::Custom(custom) => *custom == point,
+            Self::StopTextDeltaContains { .. } => PolicyPoint::TextDelta,
+            Self::RequireApproval { point, .. } | Self::Custom(point) => *point,
         }
+    }
+
+    fn applies_to(&self, point: PolicyPoint) -> bool {
+        self.point() == point
     }
 }
 
@@ -1160,6 +1156,10 @@ pub struct AcceptedPolicy {
     pub entity: Entity,
     /// Exact revision applied.
     pub revision: u64,
+    /// Explicit composition order accepted for this evaluation.
+    pub order: u32,
+    /// Exact lifecycle capability accepted for this evaluation.
+    pub point: PolicyPoint,
 }
 
 /// Relationship from a durable policy evaluation to its operation.
@@ -1737,8 +1737,25 @@ pub struct ToolExecutionSettled {
     pub run: Entity,
     /// Exact operation generation.
     pub generation: u64,
-    /// Immutable raw outcome before result policy.
-    pub outcome: OperationOutcome,
+    /// Content-free execution status safe for telemetry before result policy.
+    pub status: ToolExecutionStatus,
+}
+
+/// Content-free tool settlement metadata safe for telemetry publication.
+///
+/// The immutable [`ToolEffectOutput`] remains on the operation for explicitly
+/// authorized audit and policy queries. Keeping it out of observation events
+/// prevents stopped or redacted results from being copied into telemetry sinks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolExecutionStatus {
+    /// Whether the tool returned without any execution failure metadata.
+    pub succeeded: bool,
+    /// Stable error classification, when one is available.
+    pub failure_kind: Option<crate::tool::ToolErrorKind>,
+    /// Retry classification without an operator-facing diagnostic string.
+    pub retryable: Option<bool>,
+    /// Whether the tool intentionally refused the call.
+    pub refusal: bool,
 }
 
 /// Observe-only notification after tool-result presentation policy finalizes.
@@ -1749,10 +1766,30 @@ pub struct ToolResultPresentationFinalized {
     pub operation: Entity,
     /// Owning run.
     pub run: Entity,
-    /// Immutable raw result.
-    pub raw: ToolEffectOutput,
-    /// Final model-visible presentation.
+    /// Content-free execution status retained alongside the presentation.
+    pub status: ToolExecutionStatus,
+    /// Final policy-approved model and telemetry presentation.
     pub presentation: String,
+}
+
+/// Policy-approved tool result safe to copy into lifecycle telemetry.
+///
+/// Raw result content and operator-facing failure messages remain immutable
+/// operation audit state and are intentionally absent from this value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedToolResult {
+    /// Provider correlation identifier copied from the call.
+    pub call_id: String,
+    /// Provider-facing result identifier.
+    pub provider_result_id: String,
+    /// Separate provider call identifier, when present.
+    pub provider_call_id: Option<String>,
+    /// Provider-facing tool name.
+    pub name: String,
+    /// Final policy-approved presentation.
+    pub presentation: String,
+    /// Content-free execution status.
+    pub status: ToolExecutionStatus,
 }
 
 /// Observe-only notification after an atomic tool batch commits successfully.
@@ -1763,8 +1800,8 @@ pub struct ToolBatchCommitted {
     pub batch: Entity,
     /// Owning run.
     pub run: Entity,
-    /// Results in logical call order.
-    pub results: Vec<ToolEffectOutput>,
+    /// Policy-approved, content-safe results in logical call order.
+    pub results: Vec<PublishedToolResult>,
 }
 
 /// Observe-only notification after a store operation settles and is applied.
@@ -2226,12 +2263,19 @@ pub struct StoreDecision {
 
 /// Authoritative lifecycle of an external operation.
 #[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[require(OperationGeneration)]
 pub struct OperationState {
-    /// Incremented whenever a logical operation is superseded or retried.
-    pub generation: u64,
     /// Mutually exclusive phase/outcome.
     pub phase: OperationPhase,
 }
+
+/// Immutable identity of one dispatchable operation generation.
+///
+/// Cancel-and-suspend and restoration explicitly replace this component before
+/// redispatch so every generation transition crosses Bevy insertion lifecycle.
+#[derive(Component, Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[component(immutable)]
+pub struct OperationGeneration(pub u64);
 
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
 struct EffectDeadline {
@@ -5852,8 +5896,8 @@ fn ingest_commands(
                     .spawn((
                         DiscoveryOperationOf(source),
                         OperationKind::Discovery,
+                        OperationGeneration(generation),
                         OperationState {
-                            generation,
                             phase: OperationPhase::Prepared,
                         },
                         DiscoveryEffectInput {
@@ -5941,7 +5985,11 @@ fn reconcile_agent_control(
 fn reconcile_run_control(
     mut commands: Commands,
     mut runs: Query<(Entity, &mut RunControl, Option<&RunOperations>)>,
-    mut operations: Query<(&mut OperationState, Option<&EffectDeadline>)>,
+    mut operations: Query<(
+        &mut OperationState,
+        &OperationGeneration,
+        Option<&EffectDeadline>,
+    )>,
     cancellations: Res<CancellationOutbox>,
     mut progress: ResMut<Progress>,
 ) {
@@ -5961,7 +6009,7 @@ fn reconcile_run_control(
                 let has_in_flight = operation_entities.iter().any(|entity| {
                     operations
                         .get(*entity)
-                        .is_ok_and(|(state, _)| matches!(state.phase, OperationPhase::InFlight))
+                        .is_ok_and(|(state, _, _)| matches!(state.phase, OperationPhase::InFlight))
                 });
                 if !has_in_flight {
                     *control = RunControl::Paused(mode);
@@ -5970,18 +6018,21 @@ fn reconcile_run_control(
             }
             PauseMode::CancelAndSuspend => {
                 for operation_entity in operation_entities {
-                    let Ok((mut operation, deadline)) = operations.get_mut(operation_entity) else {
+                    let Ok((mut operation, generation, deadline)) =
+                        operations.get_mut(operation_entity)
+                    else {
                         continue;
                     };
                     if !matches!(operation.phase, OperationPhase::InFlight) {
                         continue;
                     }
-                    let generation = operation.generation;
                     let _ = cancellations.0.try_send(EffectCancellation {
                         operation: operation_entity,
-                        generation,
+                        generation: generation.0,
                     });
-                    operation.generation = operation.generation.saturating_add(1);
+                    commands
+                        .entity(operation_entity)
+                        .insert(OperationGeneration(generation.0.saturating_add(1)));
                     operation.phase = OperationPhase::Prepared;
                     if deadline.is_some() {
                         commands.entity(operation_entity).remove::<EffectDeadline>();
@@ -6003,7 +6054,12 @@ fn reconcile_discovery_operations(
     mut commands: Commands,
     mut sources: Query<(Entity, &StableId, &TenantId, &mut DiscoverySource)>,
     operations: Query<
-        (Entity, &DiscoveryOperationOf, &OperationState),
+        (
+            Entity,
+            &DiscoveryOperationOf,
+            &OperationGeneration,
+            &OperationState,
+        ),
         (With<DiscoveryEffectInput>, Without<DiscoveryApplied>),
     >,
     mut discovered_tools: Query<(
@@ -6015,7 +6071,7 @@ fn reconcile_discovery_operations(
     )>,
     mut progress: ResMut<Progress>,
 ) {
-    for (operation_entity, operation_of, operation) in &operations {
+    for (operation_entity, operation_of, generation, operation) in &operations {
         let OperationPhase::Settled(outcome) = &operation.phase else {
             continue;
         };
@@ -6028,7 +6084,7 @@ fn reconcile_discovery_operations(
         if !matches!(
             source.state,
             DiscoveryState::Refreshing { operation } if operation == operation_entity
-        ) || source.generation != operation.generation
+        ) || source.generation != generation.0
         {
             commands.entity(operation_entity).insert(DiscoveryApplied);
             continue;
@@ -6274,8 +6330,8 @@ fn prepare_store_operations(
                     .spawn((
                         OperationOf(run_entity),
                         OperationKind::Store,
+                        OperationGeneration(0),
                         OperationState {
-                            generation: 0,
                             phase: OperationPhase::Prepared,
                         },
                         StoreEffectInput {
@@ -6302,8 +6358,8 @@ fn prepare_store_operations(
                     .spawn((
                         OperationOf(run_entity),
                         OperationKind::Store,
+                        OperationGeneration(0),
                         OperationState {
-                            generation: 0,
                             phase: OperationPhase::Prepared,
                         },
                         StoreEffectInput {
@@ -6332,8 +6388,8 @@ fn prepare_store_operations(
                     .spawn((
                         OperationOf(run_entity),
                         OperationKind::Store,
+                        OperationGeneration(0),
                         OperationState {
-                            generation: 0,
                             phase: OperationPhase::Prepared,
                         },
                         StoreEffectInput {
@@ -6509,8 +6565,8 @@ fn prepare_model_operations(
         let operation = commands
             .spawn((
                 OperationOf(run_entity),
+                OperationGeneration(0),
                 OperationState {
-                    generation: 0,
                     phase: OperationPhase::Prepared,
                 },
                 OperationKind::Model,
@@ -6596,6 +6652,8 @@ fn initialize_request_policy_evaluations(
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
+                order: policy.order,
+                point: PolicyPoint::Request,
             })
             .collect::<Vec<_>>();
         commands.entity(operation).insert(RequestPolicyInitialized);
@@ -7025,8 +7083,8 @@ fn begin_policy_approval(
             OperationOf(run),
             ApprovalForEvaluation(evaluation),
             OperationKind::PolicyApproval,
+            OperationGeneration(0),
             OperationState {
-                generation: 0,
                 phase: OperationPhase::Prepared,
             },
             PolicyApprovalEffectInput {
@@ -7244,6 +7302,8 @@ fn initialize_tool_call_policy_evaluations(
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
+                order: policy.order,
+                point: PolicyPoint::ToolCall,
             })
             .collect::<Vec<_>>();
         commands.entity(operation).insert(ToolCallPolicyInitialized);
@@ -7457,6 +7517,8 @@ fn initialize_invalid_tool_call_policy_evaluations(
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
+                order: policy.order,
+                point: PolicyPoint::InvalidToolCall,
             })
             .collect::<Vec<_>>();
         commands.entity(operation).insert((
@@ -7770,8 +7832,11 @@ fn evaluate_invalid_tool_call_policies(world: &mut World) {
 
 fn apply_dispatch_phase(world: &mut World, entity: Entity, generation: u64, phase: OperationPhase) {
     let dispatched = matches!(phase, OperationPhase::InFlight);
-    let updated = if let Some(mut state) = world.get_mut::<OperationState>(entity)
-        && state.generation == generation
+    let generation_matches = world
+        .get::<OperationGeneration>(entity)
+        .is_some_and(|current| current.0 == generation);
+    let updated = if generation_matches
+        && let Some(mut state) = world.get_mut::<OperationState>(entity)
         && matches!(state.phase, OperationPhase::Prepared)
     {
         state.phase = phase;
@@ -7796,11 +7861,12 @@ fn dispatch_model_operations(world: &mut World) {
         Entity,
         &OperationOf,
         &ModelEffectInput,
+        &OperationGeneration,
         &OperationState,
     ), (With<ModelEffectInput>, Without<ToolEffectInput>)>();
     let mut prepared = query
         .iter(world)
-        .filter_map(|(entity, run, input, state)| {
+        .filter_map(|(entity, run, input, generation, state)| {
             if !matches!(state.phase, OperationPhase::Prepared)
                 || world.get::<WaitingForChildren>(run.get()).is_some()
                 || !matches!(
@@ -7819,7 +7885,7 @@ fn dispatch_model_operations(world: &mut World) {
                 run_id.clone(),
                 run.get(),
                 entity,
-                state.generation,
+                generation.0,
                 input.clone(),
             ))
         })
@@ -7992,22 +8058,86 @@ fn publish_applied_tool_policy_observations(
         commands.trigger(ToolResultPresentationFinalized {
             operation,
             run: operation_of.get(),
-            raw: raw.clone(),
+            status: tool_output_status(raw),
             presentation: effective.presentation,
         });
+    }
+}
+
+fn tool_output_status(output: &ToolEffectOutput) -> ToolExecutionStatus {
+    output.failure.as_ref().map_or(
+        ToolExecutionStatus {
+            succeeded: true,
+            failure_kind: None,
+            retryable: None,
+            refusal: false,
+        },
+        |failure| ToolExecutionStatus {
+            succeeded: false,
+            failure_kind: Some(failure.kind),
+            retryable: failure.retryable,
+            refusal: failure.refusal,
+        },
+    )
+}
+
+fn published_tool_result(output: &ToolEffectOutput) -> PublishedToolResult {
+    PublishedToolResult {
+        call_id: output.call_id.clone(),
+        provider_result_id: output.provider_result_id.clone(),
+        provider_call_id: output.provider_call_id.clone(),
+        name: output.name.clone(),
+        presentation: output.presentation.clone(),
+        status: tool_output_status(output),
+    }
+}
+
+fn tool_execution_status(outcome: &OperationOutcome) -> ToolExecutionStatus {
+    match outcome {
+        OperationOutcome::Success(EffectOutput::Tool(output)) => tool_output_status(output),
+        OperationOutcome::Failure(error) => {
+            let (failure_kind, retryable) = match error {
+                CanonicalError::Timeout => (Some(crate::tool::ToolErrorKind::Timeout), Some(true)),
+                CanonicalError::Tool { retryable, .. } => {
+                    (Some(crate::tool::ToolErrorKind::Other), Some(*retryable))
+                }
+                CanonicalError::ExecutorDisconnected | CanonicalError::ExecutorPanicked(_) => {
+                    (Some(crate::tool::ToolErrorKind::Other), Some(false))
+                }
+                CanonicalError::EffectKindMismatch => {
+                    (Some(crate::tool::ToolErrorKind::Other), Some(false))
+                }
+                _ => (None, None),
+            };
+            ToolExecutionStatus {
+                succeeded: false,
+                failure_kind,
+                retryable,
+                refusal: false,
+            }
+        }
+        OperationOutcome::Success(_) => ToolExecutionStatus {
+            succeeded: false,
+            failure_kind: Some(crate::tool::ToolErrorKind::Other),
+            retryable: Some(false),
+            refusal: false,
+        },
     }
 }
 
 fn dispatch_tool_operations(world: &mut World) {
     let outbox = world.resource::<EffectOutbox>().0.clone();
     let mut batch_query = world.query::<&BatchOf>();
-    let mut query = world.query_filtered::<
-        (Entity, &OperationOfBatch, &ToolEffectInput, &OperationState),
-        (With<ToolEffectInput>, Without<ModelEffectInput>),
-    >();
+    let mut query = world.query_filtered::<(
+        Entity,
+        &OperationOfBatch,
+        &ToolEffectInput,
+        &OperationGeneration,
+        &OperationState,
+    ), (With<ToolEffectInput>, Without<ModelEffectInput>)>();
     let mut prepared = query
         .iter(world)
-        .filter_map(|(entity, batch, input, state)| {
+        .filter_map(|(entity, batch, input, generation, state)| {
             let run = batch_query.get(world, batch.get()).ok()?.get();
             if !matches!(state.phase, OperationPhase::Prepared)
                 || world.get::<WaitingForChildren>(run).is_some()
@@ -8024,7 +8154,7 @@ fn dispatch_tool_operations(world: &mut World) {
                 input.index,
                 run,
                 entity,
-                state.generation,
+                generation.0,
                 input.clone(),
             ))
         })
@@ -8070,20 +8200,17 @@ fn dispatch_tool_operations(world: &mut World) {
 
 fn dispatch_discovery_operations(world: &mut World) {
     let outbox = world.resource::<EffectOutbox>().0.clone();
-    let mut query = world.query_filtered::<
-        (Entity, &DiscoveryEffectInput, &OperationState),
-        With<DiscoveryEffectInput>,
-    >();
+    let mut query = world.query_filtered::<(
+        Entity,
+        &DiscoveryEffectInput,
+        &OperationGeneration,
+        &OperationState,
+    ), With<DiscoveryEffectInput>>();
     let mut prepared = query
         .iter(world)
-        .filter(|(_, _, state)| matches!(state.phase, OperationPhase::Prepared))
-        .map(|(entity, input, state)| {
-            (
-                input.source_id.clone(),
-                entity,
-                state.generation,
-                input.clone(),
-            )
+        .filter(|(_, _, _, state)| matches!(state.phase, OperationPhase::Prepared))
+        .map(|(entity, input, generation, _)| {
+            (input.source_id.clone(), entity, generation.0, input.clone())
         })
         .collect::<Vec<_>>();
     prepared.sort_by(
@@ -8124,13 +8251,16 @@ fn dispatch_discovery_operations(world: &mut World) {
 
 fn dispatch_store_operations(world: &mut World) {
     let outbox = world.resource::<EffectOutbox>().0.clone();
-    let mut query = world.query_filtered::<
-        (Entity, &OperationOf, &StoreEffectInput, &OperationState),
-        With<StoreEffectInput>,
-    >();
+    let mut query = world.query_filtered::<(
+        Entity,
+        &OperationOf,
+        &StoreEffectInput,
+        &OperationGeneration,
+        &OperationState,
+    ), With<StoreEffectInput>>();
     let mut prepared = query
         .iter(world)
-        .filter_map(|(entity, run, input, state)| {
+        .filter_map(|(entity, run, input, generation, state)| {
             if !matches!(state.phase, OperationPhase::Prepared)
                 || world.get::<WaitingForChildren>(run.get()).is_some()
                 || !matches!(
@@ -8145,7 +8275,7 @@ fn dispatch_store_operations(world: &mut World) {
                 return None;
             }
             let run_id = world.get::<StableId>(run.get())?;
-            Some((run_id.clone(), entity, state.generation, input.clone()))
+            Some((run_id.clone(), entity, generation.0, input.clone()))
         })
         .collect::<Vec<_>>();
     prepared.sort_by(
@@ -8190,11 +8320,12 @@ fn dispatch_policy_approval_operations(world: &mut World) {
         Entity,
         &OperationOf,
         &PolicyApprovalEffectInput,
+        &OperationGeneration,
         &OperationState,
     )>();
     let mut prepared = query
         .iter(world)
-        .filter_map(|(entity, run, input, state)| {
+        .filter_map(|(entity, run, input, generation, state)| {
             if !matches!(state.phase, OperationPhase::Prepared)
                 || world.get::<WaitingForChildren>(run.get()).is_some()
                 || !matches!(
@@ -8205,7 +8336,7 @@ fn dispatch_policy_approval_operations(world: &mut World) {
                 return None;
             }
             let run_id = world.get::<StableId>(run.get())?;
-            Some((run_id.clone(), entity, state.generation, input.clone()))
+            Some((run_id.clone(), entity, generation.0, input.clone()))
         })
         .collect::<Vec<_>>();
     prepared.sort_by(|left, right| {
@@ -8244,10 +8375,15 @@ fn dispatch_policy_approval_operations(world: &mut World) {
 fn propagate_cancellation(
     runs: Query<&RunState>,
     cancellations: Res<CancellationOutbox>,
-    mut operations: Query<(Entity, &OperationOf, &mut OperationState)>,
+    mut operations: Query<(
+        Entity,
+        &OperationOf,
+        &OperationGeneration,
+        &mut OperationState,
+    )>,
     mut progress: ResMut<Progress>,
 ) {
-    for (entity, operation_of, mut operation) in &mut operations {
+    for (entity, operation_of, generation, mut operation) in &mut operations {
         let Ok(run) = runs.get(operation_of.get()) else {
             continue;
         };
@@ -8261,7 +8397,7 @@ fn propagate_cancellation(
                 && matches!(
                     cancellations.0.try_send(EffectCancellation {
                         operation: entity,
-                        generation: operation.generation,
+                        generation: generation.0,
                     }),
                     Err(TrySendError::Full(_))
                 )
@@ -8282,6 +8418,7 @@ fn apply_effect_ingress(
     mut operations: Query<(
         &OperationKind,
         Option<&OperationOf>,
+        &OperationGeneration,
         &mut OperationState,
         Option<&mut ModelStreamState>,
         Option<&mut EffectDeadline>,
@@ -8298,12 +8435,12 @@ fn apply_effect_ingress(
     for EffectIngressMessage(message) in messages.read() {
         match message {
             EffectIngress::Completion(completion) => {
-                let Ok((kind, operation_of, mut state, stream_state, _)) =
+                let Ok((kind, operation_of, generation, mut state, stream_state, _)) =
                     operations.get_mut(completion.operation)
                 else {
                     continue;
                 };
-                if state.generation != completion.generation
+                if generation.0 != completion.generation
                     || !matches!(state.phase, OperationPhase::InFlight)
                 {
                     continue;
@@ -8355,7 +8492,7 @@ fn apply_effect_ingress(
                             operation: completion.operation,
                             run,
                             generation: completion.generation,
-                            outcome: outcome.clone(),
+                            status: tool_execution_status(outcome),
                         }),
                         OperationKind::Discovery
                         | OperationKind::Store
@@ -8373,11 +8510,12 @@ fn apply_effect_ingress(
                 mark_progress(&mut progress);
             }
             EffectIngress::ProviderDiagnostics(diagnostics) => {
-                let Ok((kind, _, state, _, _)) = operations.get(diagnostics.operation) else {
+                let Ok((kind, _, generation, state, _, _)) = operations.get(diagnostics.operation)
+                else {
                     continue;
                 };
                 if !matches!(kind, OperationKind::Model)
-                    || state.generation != diagnostics.generation
+                    || generation.0 != diagnostics.generation
                     || !matches!(state.phase, OperationPhase::InFlight)
                 {
                     continue;
@@ -8388,13 +8526,13 @@ fn apply_effect_ingress(
                 mark_progress(&mut progress);
             }
             EffectIngress::Delta(delta) => {
-                let Ok((kind, operation_of, state, stream_state, deadline)) =
+                let Ok((kind, operation_of, generation, state, stream_state, deadline)) =
                     operations.get_mut(delta.operation)
                 else {
                     continue;
                 };
                 if !matches!(kind, OperationKind::Model)
-                    || state.generation != delta.generation
+                    || generation.0 != delta.generation
                     || !matches!(state.phase, OperationPhase::InFlight)
                 {
                     continue;
@@ -8451,6 +8589,8 @@ fn apply_effect_ingress(
                                 id: id.clone(),
                                 entity,
                                 revision: policy.revision,
+                                order: policy.order,
+                                point: PolicyPoint::TextDelta,
                             })
                             .collect::<Vec<_>>();
                         if !snapshot.is_empty() {
@@ -8885,6 +9025,8 @@ fn initialize_completion_response_policy_evaluations(
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
+                order: policy.order,
+                point: PolicyPoint::CompletionResponse,
             })
             .collect::<Vec<_>>();
         commands
@@ -9214,6 +9356,8 @@ fn initialize_tool_result_policy_evaluations(
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
+                order: policy.order,
+                point: PolicyPoint::ToolResult,
             })
             .collect::<Vec<_>>();
         commands
@@ -9815,8 +9959,8 @@ fn commit_model_operations(
                             .spawn((
                                 OperationOf(operation_of.get()),
                                 OperationKind::Store,
+                                OperationGeneration(0),
                                 OperationState {
-                                    generation: 0,
                                     phase: OperationPhase::Prepared,
                                 },
                                 StoreEffectInput {
@@ -9883,8 +10027,8 @@ fn commit_model_operations(
                             OperationOf(operation_of.get()),
                             OperationOfBatch(batch),
                             OperationKind::Tool,
+                            OperationGeneration(0),
                             OperationState {
-                                generation: 0,
                                 phase: OperationPhase::Prepared,
                             },
                         ));
@@ -10050,7 +10194,7 @@ fn commit_tool_batches(
         commands.trigger(ToolBatchCommitted {
             batch: batch_entity,
             run: batch_of.get(),
-            results: results.clone(),
+            results: results.iter().map(published_tool_result).collect(),
         });
         record.pending_tool_results = results;
         let Some(model_call_limit) = agents
@@ -11988,6 +12132,8 @@ mod tests {
                 id: id("deny-secret"),
                 entity: policy,
                 revision: 4,
+                order: 10,
+                point: PolicyPoint::Request,
             }]))
         );
     }
@@ -13737,13 +13883,26 @@ mod tests {
         let finalized = &runtime.world().resource::<FinalizedToolResults>().0;
         assert_eq!(finalized.len(), 1);
         assert_eq!(finalized[0].presentation, "redacted twice");
-        assert_eq!(finalized[0].raw.presentation, "unredacted");
-        assert_eq!(finalized[0].raw.raw, serde_json::json!({"secret": 42}));
+        assert_eq!(
+            finalized[0].status,
+            ToolExecutionStatus {
+                succeeded: false,
+                failure_kind: Some(crate::tool::ToolErrorKind::PermissionDenied),
+                retryable: Some(false),
+                refusal: true,
+            }
+        );
     }
 
     #[test]
     fn stopped_tool_result_is_not_committed_or_redispatched() {
         let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .world_mut()
+            .insert_resource(FinalizedToolResults::default());
+        runtime
+            .world_mut()
+            .add_observer(record_finalized_tool_result);
         runtime
             .spawn_policy(
                 id("stop-result"),
@@ -13795,6 +13954,14 @@ mod tests {
                 .transcript
                 .iter()
                 .any(|entry| matches!(entry, TranscriptEntry::ToolResult { .. }))
+        );
+        assert!(
+            runtime
+                .world()
+                .resource::<FinalizedToolResults>()
+                .0
+                .is_empty(),
+            "stopped results must never cross the finalized telemetry boundary"
         );
     }
 
@@ -15185,9 +15352,14 @@ mod tests {
         assert_eq!(
             runtime.world().get::<OperationState>(request.operation),
             Some(&OperationState {
-                generation: 0,
                 phase: OperationPhase::Cancelled,
             })
+        );
+        assert_eq!(
+            runtime
+                .world()
+                .get::<OperationGeneration>(request.operation),
+            Some(&OperationGeneration(request.generation))
         );
     }
 
@@ -15327,6 +15499,12 @@ mod tests {
             runtime.world().get::<RunControl>(run.entity()),
             Some(&RunControl::Paused(PauseMode::CancelAndSuspend))
         );
+        assert_eq!(
+            runtime
+                .world()
+                .get::<OperationGeneration>(request.operation),
+            Some(&OperationGeneration(request.generation + 1))
+        );
         runtime
             .effects()
             .completion_sender()
@@ -15348,6 +15526,12 @@ mod tests {
         let retried = runtime.effects().try_recv().unwrap().unwrap();
         assert_eq!(retried.operation, request.operation);
         assert_eq!(retried.generation, request.generation + 1);
+        assert_eq!(
+            runtime
+                .world()
+                .get::<OperationGeneration>(request.operation),
+            Some(&OperationGeneration(retried.generation))
+        );
     }
 
     #[test]
@@ -15508,9 +15692,14 @@ mod tests {
                 .world()
                 .get::<OperationState>(parent_request.operation),
             Some(&OperationState {
-                generation: parent_request.generation,
                 phase: OperationPhase::InFlight,
             })
+        );
+        assert_eq!(
+            runtime
+                .world()
+                .get::<OperationGeneration>(parent_request.operation),
+            Some(&OperationGeneration(parent_request.generation))
         );
     }
 
@@ -17176,10 +17365,33 @@ mod tests {
             &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(snapshot.version, 3);
+        assert_eq!(snapshot.version, 4);
         assert_eq!(snapshot.run_policies.len(), 1);
         assert_eq!(snapshot.run_policies[0].id, id("run-rewrite"));
         assert_eq!(snapshot.run_policies[0].run_id, *pending.stable_id());
+        let accepted = snapshot
+            .operations
+            .iter()
+            .find_map(|operation| operation.tool_call_policies.as_deref())
+            .and_then(|policies| policies.first())
+            .unwrap();
+        assert_eq!(accepted.order, 0);
+        assert_eq!(accepted.point, PolicyPoint::ToolCall);
+
+        let mut incompatible = snapshot.clone();
+        incompatible
+            .operations
+            .iter_mut()
+            .find_map(|operation| operation.tool_call_policies.as_mut())
+            .and_then(|policies| policies.first_mut())
+            .unwrap()
+            .order = 1;
+        let mut rejected = runtime();
+        rejected.restore(domain.clone()).unwrap();
+        assert!(matches!(
+            rejected.restore_active_run(incompatible),
+            Err(ActiveRunSnapshotError::InvalidSnapshot(_))
+        ));
 
         let mut restored = runtime();
         restored.restore(domain).unwrap();
@@ -17229,6 +17441,8 @@ mod tests {
                 id: id("run-rewrite"),
                 entity: restored_policy,
                 revision: 6,
+                order: 0,
+                point: PolicyPoint::ToolCall,
             }]))
         );
     }
