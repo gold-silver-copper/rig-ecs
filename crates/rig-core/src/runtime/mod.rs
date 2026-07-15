@@ -4750,16 +4750,13 @@ pub fn install_runtime_with_waker(
             .chain()
             .in_set(RigSet::CommitModelTurn),
     );
-    schedule.add_systems(
-        (
-            initialize_tool_call_policy_evaluations,
-            publish_prepared_tool_observations,
-        )
-            .chain()
-            .in_set(RigSet::PrepareToolBatch),
-    );
+    schedule.add_systems(initialize_tool_call_policy_evaluations.in_set(RigSet::PrepareToolBatch));
     schedule.add_systems(evaluate_tool_call_policies.in_set(RigSet::BeginToolCallPolicy));
-    schedule.add_systems(dispatch_tool_operations.in_set(RigSet::DispatchTools));
+    schedule.add_systems(
+        (publish_prepared_tool_observations, dispatch_tool_operations)
+            .chain()
+            .in_set(RigSet::DispatchTools),
+    );
     schedule.add_systems(
         (
             initialize_tool_result_policy_evaluations,

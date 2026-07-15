@@ -13,6 +13,7 @@ mod cassette {
     mod generate_sessions;
     mod generate_tool_args;
     mod generate_tool_modes;
+    mod hook_stress_tools;
     #[cfg(feature = "image")]
     mod image_generation;
     mod interactions_api;
@@ -26,6 +27,7 @@ mod cassette {
     mod structured_output;
     mod tool_choice;
     mod tool_definitions;
+    mod tool_hooks;
     mod transcription;
 }
 
