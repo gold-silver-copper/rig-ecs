@@ -10281,6 +10281,9 @@ mod tests {
     #[derive(Resource, Default)]
     struct ComponentLifecycleLog(Vec<&'static str>);
 
+    #[derive(Resource, Default)]
+    struct OperationGenerationLifecycleLog(Vec<&'static str>);
+
     #[derive(Resource)]
     struct ObservationEnabled(bool);
 
@@ -15484,6 +15487,21 @@ mod tests {
         let request = runtime.effects().try_recv().unwrap().unwrap();
         let run = runtime.resolve_run(&pending).unwrap();
         runtime
+            .world_mut()
+            .init_resource::<OperationGenerationLifecycleLog>();
+        runtime.world_mut().add_observer(
+            |_: On<Discard, OperationGeneration>,
+             mut log: ResMut<OperationGenerationLifecycleLog>| {
+                log.0.push("discard");
+            },
+        );
+        runtime.world_mut().add_observer(
+            |_: On<Insert, OperationGeneration>,
+             mut log: ResMut<OperationGenerationLifecycleLog>| {
+                log.0.push("insert");
+            },
+        );
+        runtime
             .handle()
             .pause_with_mode(run, PauseMode::CancelAndSuspend)
             .unwrap();
@@ -15504,6 +15522,13 @@ mod tests {
                 .world()
                 .get::<OperationGeneration>(request.operation),
             Some(&OperationGeneration(request.generation + 1))
+        );
+        assert_eq!(
+            runtime
+                .world()
+                .resource::<OperationGenerationLifecycleLog>()
+                .0,
+            vec!["discard", "insert"]
         );
         runtime
             .effects()
