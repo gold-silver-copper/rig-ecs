@@ -1,23 +1,196 @@
-//! Hook-system stress suite: `HookContext` identity, the shared `Scratchpad`
-//! threaded across hooks and turns, and `HookStack` composition (multiple hooks,
-//! observe-only both-fire, `add_hook` append, `CompletionCall` patch
+//! ECS observation stress suite: run identity, a typed agent component
+//! shared across observers and turns, and extension composition (multiple taps,
+//! observe-only both-fire, request patch
 //! accumulation, `active_tools` intersection). Recorded against real Gemini.
 //!
 //! Assertions are loose for model-shaped values and exact only for
 //! rig-synthesized values (see `tools_support`'s note).
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
+use rig::bevy_ecs;
+use rig::bevy_ecs::prelude::{Component, On, Query};
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::providers::gemini;
-
-use super::super::hook_stress_support::{
-    ApplyPatch, CHAIN_PREAMBLE, CountingMultiply, EventTap, ScratchpadReader, fact_doc,
+use rig::runtime::{
+    Agent as RuntimeAgent, CompletionRequestPrepared, ModelTurnFinished, PolicyRule, RequestPatch,
+    RetrievedDocument, ToolCallPrepared, ToolResultPresentationFinalized,
 };
-use super::super::support::with_gemini_cassette;
-use super::super::tools_support::{CountingAdd, CountingSubtract};
-use crate::support::assert_nonempty_response;
 
-use rig::agent::RequestPatch;
+use super::super::support::with_gemini_cassette;
+use super::super::tools_support::{CountingAdd, CountingSubtract, EmbedMultiply};
+use crate::support::{assert_nonempty_response, install_policy};
+
+const CHAIN_PREAMBLE: &str = "You are a calculator assistant. You MUST use the provided tools for every arithmetic operation instead of computing results yourself. Perform the steps in order, using the result of each step as an input to the next. Once you have the final tool result, reply with the final numeric answer in plain text.";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Breadcrumb {
+    tag: &'static str,
+    turn: usize,
+}
+
+#[derive(Clone, Default)]
+struct EventTap {
+    breadcrumbs: Arc<Mutex<Vec<Breadcrumb>>>,
+    run_ids: Arc<Mutex<BTreeSet<u64>>>,
+    streaming: Arc<Mutex<Option<bool>>>,
+    agent_name: Arc<Mutex<Option<String>>>,
+    call_ids: Arc<Mutex<Vec<String>>>,
+    result_ids: Arc<Mutex<Vec<String>>>,
+}
+
+impl EventTap {
+    fn record(&self, run: rig::bevy_ecs::entity::Entity, tag: &'static str, turn: usize) {
+        self.run_ids.lock().expect("run ids").insert(run.to_bits());
+        self.breadcrumbs
+            .lock()
+            .expect("breadcrumbs")
+            .push(Breadcrumb { tag, turn });
+    }
+
+    fn distinct_run_ids(&self) -> usize {
+        self.run_ids.lock().expect("run ids").len()
+    }
+
+    fn is_streaming(&self) -> Option<bool> {
+        *self.streaming.lock().expect("streaming")
+    }
+
+    fn agent_name(&self) -> Option<String> {
+        self.agent_name.lock().expect("agent name").clone()
+    }
+
+    fn count(&self, tag: &str) -> usize {
+        self.breadcrumbs
+            .lock()
+            .expect("breadcrumbs")
+            .iter()
+            .filter(|breadcrumb| breadcrumb.tag == tag)
+            .count()
+    }
+
+    fn distinct_turns(&self) -> Vec<usize> {
+        self.breadcrumbs
+            .lock()
+            .expect("breadcrumbs")
+            .iter()
+            .map(|breadcrumb| breadcrumb.turn)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn call_ids(&self) -> Vec<String> {
+        self.call_ids.lock().expect("call ids").clone()
+    }
+
+    fn result_ids(&self) -> Vec<String> {
+        self.result_ids.lock().expect("result ids").clone()
+    }
+}
+
+fn install_tap(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    tap: EventTap,
+    streaming: bool,
+) {
+    let agent_entity = agent.handle().entity();
+    agent
+        .with_runtime_mut(move |runtime| {
+            *tap.streaming.lock().expect("streaming") = Some(streaming);
+            *tap.agent_name.lock().expect("agent name") = runtime
+                .world()
+                .get::<RuntimeAgent>(agent_entity)
+                .and_then(|agent| agent.name.clone());
+
+            let request_tap = tap.clone();
+            runtime
+                .world_mut()
+                .add_observer(move |event: On<CompletionRequestPrepared>| {
+                    request_tap.record(event.run, "CompletionCall", 1);
+                });
+            let call_tap = tap.clone();
+            runtime
+                .world_mut()
+                .add_observer(move |event: On<ToolCallPrepared>| {
+                    call_tap.record(event.run, "ToolCall", 1);
+                    call_tap
+                        .call_ids
+                        .lock()
+                        .expect("call ids")
+                        .push(event.call.call_id.clone());
+                });
+            let result_tap = tap.clone();
+            runtime
+                .world_mut()
+                .add_observer(move |event: On<ToolResultPresentationFinalized>| {
+                    result_tap.record(event.run, "ToolResult", 1);
+                    result_tap
+                        .result_ids
+                        .lock()
+                        .expect("result ids")
+                        .push(event.raw.call_id.clone());
+                });
+            runtime
+                .world_mut()
+                .add_observer(move |event: On<ModelTurnFinished>| {
+                    tap.record(event.run, "ModelTurnFinished", event.turn as usize + 1);
+                });
+        })
+        .expect("tap observers should install");
+}
+
+#[derive(Component, Default)]
+struct ToolCallTally(usize);
+
+#[derive(Clone, Default)]
+struct TallyReader(Arc<Mutex<Vec<usize>>>);
+
+impl TallyReader {
+    fn tallies(&self) -> Vec<usize> {
+        self.0.lock().expect("tallies").clone()
+    }
+}
+
+fn install_tally_observers(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    tap: EventTap,
+    reader: TallyReader,
+) {
+    let agent_entity = agent.handle().entity();
+    agent
+        .with_runtime_mut(move |runtime| {
+            runtime
+                .world_mut()
+                .entity_mut(agent_entity)
+                .insert(ToolCallTally::default());
+            runtime.world_mut().add_observer(
+                move |event: On<ToolCallPrepared>, mut tallies: Query<&mut ToolCallTally>| {
+                    tap.record(event.run, "ToolCall", 1);
+                    if let Ok(mut tally) = tallies.get_mut(agent_entity) {
+                        tally.0 += 1;
+                    }
+                },
+            );
+            runtime.world_mut().add_observer(
+                move |_event: On<ModelTurnFinished>, tallies: Query<&ToolCallTally>| {
+                    if let Ok(tally) = tallies.get(agent_entity) {
+                        reader.0.lock().expect("tallies").push(tally.0);
+                    }
+                },
+            );
+        })
+        .expect("typed tally observers should install");
+}
+
+fn fact(id: &str, text: &str) -> RetrievedDocument {
+    RetrievedDocument {
+        id: id.to_owned(),
+        text: text.to_owned(),
+        metadata: Default::default(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HookContext identity + turn advancement.
@@ -42,13 +215,14 @@ async fn hook_context_identity_stable_and_turn_advances_blocking() {
                 .tool(subtract)
                 .build();
 
+            install_tap(&agent, tap, false);
+
             let response = agent
                 .prompt(
                     "First add 9 and 6 with the add tool. Then subtract 4 from that sum with the \
                      subtract tool. Report the final number.",
                 )
                 .max_turns(6)
-                .add_hook(tap)
                 .await
                 .expect("dependent chain should succeed");
 
@@ -88,10 +262,11 @@ async fn agent_name_absent_when_unconfigured_blocking() {
                 .tool(add)
                 .build();
 
+            install_tap(&agent, tap, false);
+
             let response = agent
                 .prompt("Use the add tool to add 3 and 4, then report the result.")
                 .max_turns(4)
-                .add_hook(tap)
                 .await
                 .expect("run should succeed");
 
@@ -117,7 +292,7 @@ async fn scratchpad_tally_grows_across_turns_and_is_read_by_second_hook_blocking
     let add_calls = add.counter.clone();
     let subtract_calls = subtract.counter.clone();
     let tap = EventTap::default();
-    let reader = ScratchpadReader::default();
+    let reader = TallyReader::default();
     let tap_probe = tap.clone();
     let reader_probe = reader.clone();
 
@@ -133,16 +308,14 @@ async fn scratchpad_tally_grows_across_turns_and_is_read_by_second_hook_blocking
                 .tool(subtract)
                 .build();
 
+            install_tally_observers(&agent, tap, reader);
+
             let response = agent
                 .prompt(
                     "First add 30 and 12 with the add tool. Then subtract 5 from that sum with the \
                      subtract tool. Report the final number.",
                 )
                 .max_turns(6)
-                // Writer (tap) bumps the scratchpad tally on each ToolCall; the
-                // reader (a *different* hook) reads it on each ModelTurnFinished.
-                .add_hook(tap)
-                .add_hook(reader)
                 .await
                 .expect("dependent chain should succeed");
 
@@ -199,13 +372,14 @@ async fn internal_call_id_correlates_tool_call_and_result_blocking() {
                 .tool(subtract)
                 .build();
 
+            install_tap(&agent, tap, false);
+
             let response = agent
                 .prompt(
                     "First add 7 and 7 with the add tool. Then subtract 2 from that sum with the \
                      subtract tool. Report the final number.",
                 )
                 .max_turns(6)
-                .add_hook(tap)
                 .await
                 .expect("dependent chain should succeed");
 
@@ -249,11 +423,12 @@ async fn two_observe_only_hooks_both_observe_the_run_blocking() {
                 .tool(add)
                 .build();
 
+            install_tap(&agent, first, false);
+            install_tap(&agent, second, false);
+
             let response = agent
                 .prompt("Use the add tool to add 8 and 8, then report the result.")
                 .max_turns(4)
-                .add_hook(first)
-                .add_hook(second)
                 .await
                 .expect("run should succeed");
 
@@ -296,13 +471,14 @@ async fn add_hook_appends_across_builder_and_request_blocking() {
                 .preamble(CHAIN_PREAMBLE)
                 .temperature(0.0)
                 .tool(add)
-                .add_hook(builder_hook)
                 .build();
+
+            install_tap(&agent, builder_hook, false);
+            install_tap(&agent, request_hook, false);
 
             let response = agent
                 .prompt("Use the add tool to add 5 and 6, then report the result.")
                 .max_turns(4)
-                .add_hook(request_hook)
                 .await
                 .expect("run should succeed");
 
@@ -342,20 +518,35 @@ async fn completion_call_patches_accumulate_from_two_hooks_blocking() {
                 .tool(add)
                 .build();
 
+            install_policy(
+                &agent,
+                "harbor-context",
+                0,
+                1,
+                PolicyRule::PatchRequest(
+                    RequestPatch::new()
+                        .extra_context([fact("harbor", "The harbor code is ALPHA-11.")])
+                        .temperature(0.0),
+                ),
+            )
+            .expect("first context policy should install");
+            install_policy(
+                &agent,
+                "orchard-context",
+                1,
+                1,
+                PolicyRule::PatchRequest(
+                    RequestPatch::new()
+                        .extra_context([fact("orchard", "The orchard code is BETA-22.")]),
+                ),
+            )
+            .expect("second context policy should install");
+
             // Two independent hooks each inject a different fact via extra_context.
             // Patches must accumulate (append), so BOTH facts reach the model.
             let response = agent
                 .prompt("Tell me both the harbor code and the orchard code.")
                 .max_turns(4)
-                .add_hook(ApplyPatch(
-                    RequestPatch::new()
-                        .context(fact_doc("harbor", "The harbor code is ALPHA-11."))
-                        .temperature(0.0),
-                ))
-                .add_hook(ApplyPatch(
-                    RequestPatch::new()
-                        .context(fact_doc("orchard", "The orchard code is BETA-22.")),
-                ))
                 .await
                 .expect("accumulated context run should succeed");
 
@@ -377,7 +568,7 @@ async fn completion_call_patches_accumulate_from_two_hooks_blocking() {
 async fn two_hooks_narrow_active_tools_to_intersection_blocking() {
     let add = CountingAdd::default();
     let subtract = CountingSubtract::default();
-    let multiply = CountingMultiply::default();
+    let multiply = EmbedMultiply::default();
     let add_calls = add.counter.clone();
     let subtract_calls = subtract.counter.clone();
     let multiply_calls = multiply.counter.clone();
@@ -397,6 +588,27 @@ async fn two_hooks_narrow_active_tools_to_intersection_blocking() {
                 .tool(multiply)
                 .build();
 
+            install_policy(
+                &agent,
+                "add-or-subtract",
+                0,
+                1,
+                PolicyRule::PatchRequest(
+                    RequestPatch::new()
+                        .active_tools(["add", "subtract"])
+                        .temperature(0.0),
+                ),
+            )
+            .expect("first narrowing policy should install");
+            install_policy(
+                &agent,
+                "add-or-multiply",
+                1,
+                1,
+                PolicyRule::PatchRequest(RequestPatch::new().active_tools(["add", "multiply"])),
+            )
+            .expect("second narrowing policy should install");
+
             // Two narrowing hooks: {add, subtract} ∩ {add, multiply} == {add}.
             let response = agent
                 .prompt(
@@ -404,14 +616,6 @@ async fn two_hooks_narrow_active_tools_to_intersection_blocking() {
                      obtain.",
                 )
                 .max_turns(5)
-                .add_hook(ApplyPatch(
-                    RequestPatch::new()
-                        .active_tools(["add", "subtract"])
-                        .temperature(0.0),
-                ))
-                .add_hook(ApplyPatch(
-                    RequestPatch::new().active_tools(["add", "multiply"]),
-                ))
                 .await
                 .expect("intersected-tools run should succeed");
 
