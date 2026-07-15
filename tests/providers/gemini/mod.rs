@@ -1,8 +1,10 @@
 mod agent_run_support;
 mod support;
+mod tools_support;
 
 mod cassette {
     mod agent;
+    mod agent_tools_e2e;
     mod chat_history;
     mod document_ordering;
     mod embeddings;
@@ -15,6 +17,7 @@ mod cassette {
     mod image_generation;
     mod interactions_api;
     mod models;
+    mod multi_turn_streaming;
     mod reasoning_roundtrip;
     mod reasoning_tool_roundtrip;
     mod streaming;

@@ -130,6 +130,7 @@ where
     prompt: Message,
     history: Vec<Message>,
     max_model_calls: Option<u32>,
+    tool_concurrency: usize,
     conversation: Result<Option<StableId>, crate::runtime::IdentityError>,
 }
 
@@ -200,6 +201,18 @@ where
         self.max_model_calls = Some(u32::try_from(max_turns).unwrap_or(u32::MAX));
         self
     }
+
+    /// Sets the host-side upper bound for concurrent tool effects.
+    ///
+    /// Tool results are still committed in canonical logical-batch order.
+    pub fn tool_concurrency(mut self, concurrency: usize) -> Self {
+        assert!(
+            concurrency > 0,
+            "tool concurrency must be greater than zero"
+        );
+        self.tool_concurrency = concurrency;
+        self
+    }
 }
 
 impl<M> std::future::IntoFuture for ExtendedAgentPromptRequest<M>
@@ -223,6 +236,7 @@ where
                     None,
                     conversation,
                     request.max_model_calls,
+                    request.tool_concurrency,
                 )
                 .await
                 .map_err(local_prompt_error)?;
@@ -277,6 +291,7 @@ where
                     None,
                     conversation,
                     self.max_model_calls,
+                    self.tool_concurrency,
                 )
                 .await
                 .map(|output| output.text)
@@ -1134,6 +1149,7 @@ where
             prompt: prompt.into(),
             history: Vec::new(),
             max_model_calls: None,
+            tool_concurrency: usize::MAX,
             conversation: Ok(None),
         }
     }
@@ -1205,7 +1221,7 @@ where
         history: Vec<Message>,
         output_schema: Option<serde_json::Value>,
     ) -> Result<RunOutput, LocalAgentError> {
-        self.run_prompt_options(prompt, history, output_schema, None, None)
+        self.run_prompt_options(prompt, history, output_schema, None, None, usize::MAX)
             .await
     }
 
@@ -1216,6 +1232,7 @@ where
         output_schema: Option<serde_json::Value>,
         conversation: Option<StableId>,
         max_model_calls: Option<u32>,
+        tool_concurrency: usize,
     ) -> Result<RunOutput, LocalAgentError> {
         self.run_prompt_options_detailed(
             prompt,
@@ -1223,6 +1240,7 @@ where
             output_schema,
             conversation,
             max_model_calls,
+            tool_concurrency,
         )
         .await
         .map(|result| result.output)
@@ -1235,6 +1253,7 @@ where
         output_schema: Option<serde_json::Value>,
         conversation: Option<StableId>,
         max_model_calls: Option<u32>,
+        tool_concurrency: usize,
     ) -> Result<LocalRunResult, LocalAgentError> {
         let pending = {
             let runtime = self
@@ -1293,7 +1312,10 @@ where
                     },
                 )?;
             }
-            for completion in self.execute_tool_batch(tool_requests, usize::MAX).await {
+            for completion in self
+                .execute_tool_batch(tool_requests, tool_concurrency)
+                .await
+            {
                 self.submit_completion(&completion_sender, completion)?;
             }
             let (state, transcript, completion_calls) = {
@@ -1898,6 +1920,7 @@ where
             prompt: prompt.into(),
             history: Vec::new(),
             max_model_calls: None,
+            tool_concurrency: usize::MAX,
             conversation: Ok(None),
         }
     }
@@ -1915,7 +1938,14 @@ where
         let prompt = prompt.into();
         async move {
             let details = self
-                .run_prompt_options_detailed(prompt, chat_history.clone(), None, None, None)
+                .run_prompt_options_detailed(
+                    prompt,
+                    chat_history.clone(),
+                    None,
+                    None,
+                    None,
+                    usize::MAX,
+                )
                 .await
                 .map_err(local_prompt_error)?;
             *chat_history = response_messages(&details.transcript)

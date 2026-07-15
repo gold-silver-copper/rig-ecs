@@ -4,7 +4,7 @@
 //! pipeline ahead of the rmcp migration.
 
 use rig::client::CompletionClient;
-use rig::completion::{Chat, Message, Prompt};
+use rig::completion::{Chat, Message};
 use rig::providers::gemini;
 use rig::streaming::StreamingPrompt;
 
