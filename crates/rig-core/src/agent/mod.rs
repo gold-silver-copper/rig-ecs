@@ -16,7 +16,7 @@ use crate::{
         AssistantContent, CompletionError, CompletionModel, GetTokenUsage, Message, PromptError,
         Usage,
     },
-    runtime::adapters::{LocalAgentError, LocalStreamEvent},
+    runtime::adapters::{LocalAgentError, LocalStreamEvent, local_prompt_error},
     streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat, StreamingPrompt},
 };
 
@@ -251,7 +251,9 @@ where
             Ok(conversation) => conversation,
             Err(error) => {
                 return Box::pin(futures::stream::once(async move {
-                    Err(StreamingError::Agent(LocalAgentError::Identity(error)))
+                    Err(StreamingError::Prompt(Box::new(local_prompt_error(
+                        LocalAgentError::Identity(error),
+                    ))))
                 }));
             }
         };
@@ -264,7 +266,7 @@ where
         );
         Box::pin(source.map(|event| {
             event
-                .map_err(StreamingError::from)
+                .map_err(|error| StreamingError::Prompt(Box::new(local_prompt_error(error))))
                 .map(|event| match event {
                     LocalStreamEvent::Delta(text) => MultiTurnStreamItem::StreamAssistantItem(
                         StreamedAssistantContent::Text(Text::from(text)),

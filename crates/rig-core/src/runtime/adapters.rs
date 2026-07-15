@@ -1343,11 +1343,12 @@ where
                         completion_calls,
                     });
                 }
-                Some(RunState::Failed(CanonicalError::ModelCallBudget { limit })) => {
-                    return Err(LocalAgentError::ModelCallBudget { limit, transcript });
+                Some(RunState::Failed(error)) => {
+                    return Err(local_run_failure(error, transcript));
                 }
-                Some(RunState::Failed(error)) => return Err(error.into()),
-                Some(RunState::Cancelled) => return Err(LocalAgentError::Cancelled),
+                Some(RunState::Cancelled) => {
+                    return Err(LocalAgentError::Cancelled { transcript });
+                }
                 Some(
                     RunState::Queued
                     | RunState::WaitingModel { .. }
@@ -1510,6 +1511,23 @@ where
         Ok((transcript, completion_calls))
     }
 
+    fn failure_for_pending(
+        &self,
+        pending: &crate::runtime::PendingRunHandle,
+        error: CanonicalError,
+    ) -> Result<LocalAgentError, LocalAgentError> {
+        let (transcript, _) = self.details_for_pending(pending)?;
+        Ok(local_run_failure(error, transcript))
+    }
+
+    fn cancellation_for_pending(
+        &self,
+        pending: &crate::runtime::PendingRunHandle,
+    ) -> Result<LocalAgentError, LocalAgentError> {
+        let (transcript, _) = self.details_for_pending(pending)?;
+        Ok(LocalAgentError::Cancelled { transcript })
+    }
+
     /// Streams one run while all authoritative progression remains in
     /// [`crate::runtime::RigSchedule`].
     pub fn stream_run(
@@ -1637,10 +1655,10 @@ where
                                                     break 'drive;
                                                 }
                                                 StreamItem::Finished(StreamTerminal::Failed(error)) => {
-                                                    Err(LocalAgentError::Canonical(error))?;
+                                                    Err(agent.failure_for_pending(&pending, error)?)?;
                                                 }
                                                 StreamItem::Finished(StreamTerminal::Cancelled) => {
-                                                    Err(LocalAgentError::Cancelled)?;
+                                                    Err(agent.cancellation_for_pending(&pending)?)?;
                                                 }
                                             }
                                         }
@@ -1696,10 +1714,10 @@ where
                                                     break 'drive;
                                                 }
                                                 StreamItem::Finished(StreamTerminal::Failed(error)) => {
-                                                    Err(LocalAgentError::Canonical(error))?;
+                                                    Err(agent.failure_for_pending(&pending, error)?)?;
                                                 }
                                                 StreamItem::Finished(StreamTerminal::Cancelled) => {
-                                                    Err(LocalAgentError::Cancelled)?;
+                                                    Err(agent.cancellation_for_pending(&pending)?)?;
                                                 }
                                             }
                                         }
@@ -1878,18 +1896,22 @@ where
                             break 'drive;
                         }
                         StreamItem::Finished(StreamTerminal::Failed(error)) => {
-                            Err(LocalAgentError::Canonical(error))?;
+                            Err(agent.failure_for_pending(&pending, error)?)?;
                         }
                         StreamItem::Finished(StreamTerminal::Cancelled) => {
-                            Err(LocalAgentError::Cancelled)?;
+                            Err(agent.cancellation_for_pending(&pending)?)?;
                         }
                     }
                 }
 
                 let terminal = agent.observed_state(&pending)?;
                 match terminal {
-                    Some(RunState::Failed(error)) => Err(LocalAgentError::Canonical(error))?,
-                    Some(RunState::Cancelled) => Err(LocalAgentError::Cancelled)?,
+                    Some(RunState::Failed(error)) => {
+                        Err(agent.failure_for_pending(&pending, error)?)?
+                    }
+                    Some(RunState::Cancelled) => {
+                        Err(agent.cancellation_for_pending(&pending)?)?
+                    }
                     Some(RunState::Completed(output)) => {
                         let (transcript, completion_calls) =
                             agent.details_for_pending(&pending)?;
@@ -1985,12 +2007,37 @@ where
     }
 }
 
-fn local_prompt_error(error: LocalAgentError) -> PromptError {
+fn local_run_failure(error: CanonicalError, transcript: Vec<TranscriptEntry>) -> LocalAgentError {
+    match error {
+        CanonicalError::ModelCallBudget { limit } => {
+            LocalAgentError::ModelCallBudget { limit, transcript }
+        }
+        CanonicalError::UnknownTool(tool_name) => LocalAgentError::UnknownToolCall {
+            tool_name,
+            transcript,
+        },
+        CanonicalError::PolicyDenied { policy } => {
+            LocalAgentError::PolicyDenied { policy, transcript }
+        }
+        error => LocalAgentError::Canonical(error),
+    }
+}
+
+pub(crate) fn local_prompt_error(error: LocalAgentError) -> PromptError {
     let message = error.to_string();
     match error {
         LocalAgentError::Canonical(CanonicalError::Provider { .. }) => {
             CompletionError::ProviderError(message).into()
         }
+        LocalAgentError::UnknownToolCall {
+            tool_name,
+            transcript,
+        } => PromptError::UnknownToolCall {
+            tool_name,
+            available_tools: Vec::new(),
+            allowed_tools: Vec::new(),
+            chat_history: Box::new(response_messages(&transcript).unwrap_or_default()),
+        },
         LocalAgentError::Canonical(CanonicalError::UnknownTool(tool_name)) => {
             PromptError::UnknownToolCall {
                 tool_name,
@@ -2013,8 +2060,9 @@ fn local_prompt_error(error: LocalAgentError) -> PromptError {
                 prompt: Box::new(prompt),
             }
         }
-        LocalAgentError::Cancelled => PromptError::PromptCancelled {
-            chat_history: Vec::new(),
+        LocalAgentError::PolicyDenied { transcript, .. }
+        | LocalAgentError::Cancelled { transcript } => PromptError::PromptCancelled {
+            chat_history: response_messages(&transcript).unwrap_or_default(),
             reason: message,
         },
         _ => CompletionError::ProviderError(message).into(),
@@ -2059,9 +2107,28 @@ pub enum LocalAgentError {
         /// Complete transcript at the failed transition.
         transcript: Vec<TranscriptEntry>,
     },
+    /// A run rejected a model-emitted tool while retaining diagnostic history.
+    #[error("unknown or unavailable tool `{tool_name}`")]
+    UnknownToolCall {
+        /// Provider-emitted tool name.
+        tool_name: String,
+        /// Complete transcript at invalid-call detection.
+        transcript: Vec<TranscriptEntry>,
+    },
+    /// A steering policy stopped the run with its committed history retained.
+    #[error("policy `{policy}` denied the operation")]
+    PolicyDenied {
+        /// Stable policy identity.
+        policy: String,
+        /// Complete transcript at the stopping transition.
+        transcript: Vec<TranscriptEntry>,
+    },
     /// The run was cancelled before completion.
     #[error("run was cancelled")]
-    Cancelled,
+    Cancelled {
+        /// Complete transcript retained by cancellation.
+        transcript: Vec<TranscriptEntry>,
+    },
     /// Another thread panicked while it had exclusive access to the local world.
     #[error("local ECS runtime lock was poisoned")]
     RuntimePoisoned,

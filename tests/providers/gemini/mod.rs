@@ -6,6 +6,7 @@ mod cassette {
     mod agent;
     mod agent_run_recovery;
     mod agent_run_stepping;
+    mod agent_run_streamed;
     mod agent_tools_e2e;
     mod chat_history;
     mod document_ordering;

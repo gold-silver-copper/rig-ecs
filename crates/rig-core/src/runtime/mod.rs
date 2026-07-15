@@ -9446,8 +9446,7 @@ fn commit_model_operations(
                                     turn: committed_turn,
                                     tool_choice: input.tool_choice.clone(),
                                     diagnostic_history: record.transcript.clone(),
-                                    streaming_origin: stream_state
-                                        .is_some_and(|state| state.next_sequence > 0),
+                                    streaming_origin: stream_state.is_some(),
                                     retry_count: record.invalid_tool_call_retries,
                                     max_retries: record.max_invalid_tool_call_retries,
                                 })
