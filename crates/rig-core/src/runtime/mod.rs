@@ -4,6 +4,27 @@
 //! by both [`Runtime`] and embedded worlds. External work leaves the world as an
 //! owned [`EffectRequest`] and returns through [`EffectCompletion`]; neither
 //! type can contain an ECS borrow.
+//!
+//! Agents, runs, turns, operations, capabilities, grants, policy evaluations,
+//! and their topology are ordinary entities, components, and relationships.
+//! Steering policies are snapshotted by `(order, StableId)` and evaluated by a
+//! durable cursor; observe-only lifecycle events remain separate so observer
+//! registration order cannot change decisions. Request patches are rebuilt for
+//! each model operation and never mutate the agent baseline.
+//!
+//! Blocking and streaming facades use the same schedule. Streaming deltas enter
+//! through bounded effect ingress, are validated in sequence, then cross
+//! entity-targeted observation and policy boundaries before publication.
+//! Asynchronous approval, model, tool, store, and discovery work always runs on
+//! owned inputs outside the world and returns with operation generations that
+//! reject stale or late completions.
+//!
+//! [`RunControl`] and [`AgentControl`] provide independent pause and admission
+//! semantics while multiple agents and sibling runs share one world. Active
+//! runs can be captured as stable-ID [`ActiveRunSnapshot`] values; runtime-only
+//! observers, systems, clients, channels, and secrets must be rebound after
+//! restoration. Extension state belongs in typed components related to the run
+//! or operation, not in an erased scratchpad.
 
 pub mod adapters;
 mod snapshot;
@@ -375,6 +396,16 @@ pub struct PolicyFor(pub Entity);
 #[relationship_target(relationship = PolicyFor)]
 pub struct AgentPolicies(Vec<Entity>);
 
+/// Relationship from a run-local policy instance to the run it governs.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+#[relationship(relationship_target = RunPolicies)]
+pub struct PolicyForRun(pub Entity);
+
+/// Policy instances that apply only to one run and its future operations.
+#[derive(Component, Debug)]
+#[relationship_target(relationship = PolicyForRun, linked_spawn)]
+pub struct RunPolicies(Vec<Entity>);
+
 /// Relationship from a grant entity to its agent.
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
 #[relationship(relationship_target = AgentToolGrants)]
@@ -445,6 +476,22 @@ pub struct Policy {
     pub rule: PolicyRule,
 }
 
+/// Policy definition installed atomically with one newly admitted run.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunPolicySpec {
+    /// Persistent identity unique within the runtime world.
+    pub id: StableId,
+    /// Immutable ordered policy definition.
+    pub policy: Policy,
+}
+
+impl RunPolicySpec {
+    /// Creates a run-local policy specification.
+    pub fn new(id: StableId, policy: Policy) -> Self {
+        Self { id, policy }
+    }
+}
+
 /// Admission status for a policy revision.
 #[derive(Component, Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PolicyStatus {
@@ -455,8 +502,21 @@ pub enum PolicyStatus {
     Retired,
 }
 
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct BoundPolicyObserver(Entity);
+
 fn accepts_new_policy_evaluations(status: Option<&PolicyStatus>) -> bool {
     !matches!(status, Some(PolicyStatus::Retired))
+}
+
+fn policy_entities<'a>(
+    agent: Option<&'a AgentPolicies>,
+    run: Option<&'a RunPolicies>,
+) -> impl Iterator<Item = Entity> + 'a {
+    agent
+        .into_iter()
+        .flat_map(AgentPolicies::iter)
+        .chain(run.into_iter().flat_map(RunPolicies::iter))
 }
 
 /// Built-in policy data. Extensions can add components and systems at the
@@ -2296,6 +2356,9 @@ pub enum CanonicalError {
     /// Discovery payload violated source reconciliation invariants.
     #[error("invalid discovery payload: {0}")]
     InvalidDiscovery(String),
+    /// Run-local policy specifications conflicted at command admission.
+    #[error("invalid run-local policy: {0}")]
+    InvalidRunPolicy(String),
 }
 
 /// Owned request submitted at the asynchronous effect boundary.
@@ -2938,6 +3001,7 @@ enum RuntimeCommand {
         conversation: Option<StableId>,
         subscriber: Option<SyncSender<StreamItem>>,
         parent: Option<(Entity, u64)>,
+        run_policies: Vec<RunPolicySpec>,
     },
     Cancel {
         run: Entity,
@@ -3113,6 +3177,7 @@ impl RuntimeHandle {
             conversation: None,
             subscriber: None,
             parent: None,
+            run_policies: Vec::new(),
         })?;
         Ok(PendingRunHandle {
             runtime_id: self.runtime_id,
@@ -3141,6 +3206,7 @@ impl RuntimeHandle {
             conversation: None,
             subscriber: None,
             parent: None,
+            run_policies: Vec::new(),
         })?;
         Ok(PendingRunHandle {
             runtime_id: self.runtime_id,
@@ -3160,6 +3226,29 @@ impl RuntimeHandle {
         output_schema: Option<serde_json::Value>,
         max_model_calls: Option<u32>,
         conversation: Option<StableId>,
+    ) -> Result<PendingRunHandle, SubmitError> {
+        self.prompt_configured_with_run_policies(
+            agent,
+            prompt,
+            history,
+            output_schema,
+            max_model_calls,
+            conversation,
+            Vec::new(),
+        )
+    }
+
+    /// Submits a configured prompt and atomically installs policies on its run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prompt_configured_with_run_policies(
+        &self,
+        agent: AgentHandle,
+        prompt: impl Into<CompletionMessage>,
+        history: impl IntoIterator<Item = CompletionMessage>,
+        output_schema: Option<serde_json::Value>,
+        max_model_calls: Option<u32>,
+        conversation: Option<StableId>,
+        run_policies: Vec<RunPolicySpec>,
     ) -> Result<PendingRunHandle, SubmitError> {
         if agent.runtime_id != self.runtime_id {
             return Err(SubmitError::ForeignRuntime);
@@ -3183,6 +3272,7 @@ impl RuntimeHandle {
             conversation,
             subscriber: None,
             parent: None,
+            run_policies,
         })?;
         Ok(PendingRunHandle {
             runtime_id: self.runtime_id,
@@ -3212,6 +3302,7 @@ impl RuntimeHandle {
             conversation: Some(conversation),
             subscriber: None,
             parent: None,
+            run_policies: Vec::new(),
         })?;
         Ok(PendingRunHandle {
             runtime_id: self.runtime_id,
@@ -3241,6 +3332,7 @@ impl RuntimeHandle {
             conversation: None,
             subscriber: None,
             parent: Some((parent.entity, sequence)),
+            run_policies: Vec::new(),
         })?;
         Ok(PendingRunHandle {
             runtime_id: self.runtime_id,
@@ -3270,6 +3362,7 @@ impl RuntimeHandle {
             conversation: None,
             subscriber: Some(sender),
             parent: None,
+            run_policies: Vec::new(),
         })?;
         Ok((
             PendingRunHandle {
@@ -3296,6 +3389,29 @@ impl RuntimeHandle {
         max_model_calls: Option<u32>,
         conversation: Option<StableId>,
     ) -> Result<(PendingRunHandle, RunStream), SubmitError> {
+        self.prompt_stream_configured_with_run_policies(
+            agent,
+            prompt,
+            history,
+            output_schema,
+            max_model_calls,
+            conversation,
+            Vec::new(),
+        )
+    }
+
+    /// Submits a configured stream and atomically installs policies on its run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prompt_stream_configured_with_run_policies(
+        &self,
+        agent: AgentHandle,
+        prompt: impl Into<CompletionMessage>,
+        history: impl IntoIterator<Item = CompletionMessage>,
+        output_schema: Option<serde_json::Value>,
+        max_model_calls: Option<u32>,
+        conversation: Option<StableId>,
+        run_policies: Vec<RunPolicySpec>,
+    ) -> Result<(PendingRunHandle, RunStream), SubmitError> {
         if agent.runtime_id != self.runtime_id {
             return Err(SubmitError::ForeignRuntime);
         }
@@ -3319,6 +3435,7 @@ impl RuntimeHandle {
             conversation,
             subscriber: Some(sender),
             parent: None,
+            run_policies,
         })?;
         Ok((
             PendingRunHandle {
@@ -4661,6 +4778,7 @@ pub fn install_runtime_with_waker(
     world.insert_resource(waker.clone());
     world.insert_resource(Messages::<EffectIngressMessage>::default());
     world.add_observer(bind_builtin_policy_observer);
+    world.add_observer(unbind_builtin_policy_observer);
     world.add_observer(count_prepared_request);
     world.add_observer(count_committed_model_turn);
     world.add_observer(count_committed_tool_batch);
@@ -4970,6 +5088,39 @@ impl Runtime {
                 policy,
                 PolicyStatus::Enabled,
                 PolicyFor(agent.entity),
+            ))
+            .id())
+    }
+
+    /// Spawns a policy revision scoped to one live run.
+    pub fn spawn_run_policy(
+        &mut self,
+        id: StableId,
+        tenant: TenantId,
+        policy: Policy,
+        run: RunHandle,
+    ) -> Result<Entity, SpawnError> {
+        if run.runtime_id != self.handle.runtime_id {
+            return Err(SpawnError::ForeignRuntime);
+        }
+        ensure_unique_id(&mut self.world, &id)?;
+        let Some(run_tenant) = self.world.get::<TenantId>(run.entity) else {
+            return Err(SpawnError::StaleEntity(run.entity));
+        };
+        if self.world.get::<RunState>(run.entity).is_none() {
+            return Err(SpawnError::StaleEntity(run.entity));
+        }
+        if run_tenant != &tenant {
+            return Err(SpawnError::TenantMismatch);
+        }
+        Ok(self
+            .world
+            .spawn((
+                id,
+                tenant,
+                policy,
+                PolicyStatus::Enabled,
+                PolicyForRun(run.entity),
             ))
             .id())
     }
@@ -5452,6 +5603,7 @@ fn ingest_commands(
                 conversation,
                 subscriber,
                 parent,
+                run_policies,
             }) => {
                 let transcript_entry = if prompt.plain_text {
                     TranscriptEntry::User(prompt.text.clone())
@@ -5490,7 +5642,7 @@ fn ingest_commands(
                     pending_output: None,
                     pending_tool_results: Vec::new(),
                 };
-                let run = match agents.get_mut(agent) {
+                let (run, run_tenant) = match agents.get_mut(agent) {
                     Ok((tenant, _, invalid_budget, output_retry_budget, control))
                         if control
                             .as_deref()
@@ -5502,7 +5654,7 @@ fn ingest_commands(
                             .map_or_else(default_structured_output_retries, |budget| {
                                 budget.max_retries
                             });
-                        commands
+                        let run = commands
                             .spawn((
                                 run_id,
                                 tenant.clone(),
@@ -5511,27 +5663,56 @@ fn ingest_commands(
                                 RunControl::Running,
                                 record,
                             ))
-                            .id()
+                            .id();
+                        (run, Some(tenant.clone()))
                     }
-                    Ok((tenant, _, _, _, _)) => commands
-                        .spawn((
-                            run_id,
-                            tenant.clone(),
-                            RunOf(agent),
-                            RunState::Failed(CanonicalError::AgentAdmissionDenied),
-                            RunControl::Running,
-                            record,
-                        ))
-                        .id(),
-                    Err(_) => commands
-                        .spawn((
-                            run_id,
-                            RunState::Failed(CanonicalError::StaleEntity("agent".to_owned())),
-                            RunControl::Running,
-                            record,
-                        ))
-                        .id(),
+                    Ok((tenant, _, _, _, _)) => (
+                        commands
+                            .spawn((
+                                run_id,
+                                tenant.clone(),
+                                RunOf(agent),
+                                RunState::Failed(CanonicalError::AgentAdmissionDenied),
+                                RunControl::Running,
+                                record,
+                            ))
+                            .id(),
+                        None,
+                    ),
+                    Err(_) => (
+                        commands
+                            .spawn((
+                                run_id,
+                                RunState::Failed(CanonicalError::StaleEntity("agent".to_owned())),
+                                RunControl::Running,
+                                record,
+                            ))
+                            .id(),
+                        None,
+                    ),
                 };
+                if let Some(tenant) = run_tenant {
+                    let mut local_ids = HashSet::new();
+                    let conflict = run_policies.iter().find(|spec| {
+                        accepted_ids.contains(&spec.id) || !local_ids.insert(spec.id.clone())
+                    });
+                    if let Some(conflict) = conflict {
+                        commands.entity(run).insert(RunState::Failed(
+                            CanonicalError::InvalidRunPolicy(conflict.id.as_str().to_owned()),
+                        ));
+                    } else {
+                        for spec in run_policies {
+                            accepted_ids.insert(spec.id.clone());
+                            commands.spawn((
+                                spec.id,
+                                tenant.clone(),
+                                spec.policy,
+                                PolicyStatus::Enabled,
+                                PolicyForRun(run),
+                            ));
+                        }
+                    }
+                }
                 if let Some(subscriber) = subscriber {
                     commands.spawn((
                         SubscriptionOf(run),
@@ -5940,6 +6121,7 @@ fn reconcile_stable_ids(world: &mut World) {
 
     validate_relation!(UsesModel, ModelCapability, "UsesModel");
     validate_relation!(PolicyFor, Agent, "PolicyFor");
+    validate_relation!(PolicyForRun, RunState, "PolicyForRun");
     validate_relation!(GrantForAgent, Agent, "GrantForAgent");
     validate_relation!(GrantForTool, ToolCapability, "GrantForTool");
     validate_relation!(StoreGrantForAgent, Agent, "StoreGrantForAgent");
@@ -6321,13 +6503,14 @@ fn prepare_model_operations(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn initialize_request_policy_evaluations(
     mut commands: Commands,
     operations: Query<
         (Entity, &OperationOf, &PendingModelRequest, &OperationState),
         Without<RequestPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
+    runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -6336,18 +6519,13 @@ fn initialize_request_policy_evaluations(
         if !matches!(state.phase, OperationPhase::Prepared) {
             continue;
         }
-        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+        let Ok((run_of, run_policies, control)) = runs.get(operation_of.get()) else {
             continue;
         };
         if !control_allows_internal_progress(control) {
             continue;
         }
-        let mut ordered = agents
-            .get(run_of.get())
-            .ok()
-            .flatten()
-            .into_iter()
-            .flat_map(|agent_policies| agent_policies.iter())
+        let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
             .filter(|(_, _, policy, status)| {
                 accepts_new_policy_evaluations(*status)
@@ -6401,46 +6579,62 @@ fn bind_builtin_policy_observer(
     let Ok(policy) = policies.get(event.entity) else {
         return;
     };
-    if policy.rule.applies_to(PolicyPoint::Request) && !matches!(policy.rule, PolicyRule::Custom(_))
-    {
+    let observer = match &policy.rule {
+        PolicyRule::Custom(_) => None,
+        _ if policy.rule.applies_to(PolicyPoint::Request) => Some(
+            commands
+                .spawn(Observer::new(apply_builtin_request_policy).with_entity(event.entity))
+                .id(),
+        ),
+        _ if policy.rule.applies_to(PolicyPoint::ToolCall) => Some(
+            commands
+                .spawn(Observer::new(apply_builtin_tool_call_policy).with_entity(event.entity))
+                .id(),
+        ),
+        _ if policy.rule.applies_to(PolicyPoint::InvalidToolCall) => Some(
+            commands
+                .spawn(
+                    Observer::new(apply_builtin_invalid_tool_call_policy).with_entity(event.entity),
+                )
+                .id(),
+        ),
+        _ if policy.rule.applies_to(PolicyPoint::ToolResult) => Some(
+            commands
+                .spawn(Observer::new(apply_builtin_tool_result_policy).with_entity(event.entity))
+                .id(),
+        ),
+        _ if policy.rule.applies_to(PolicyPoint::CompletionResponse) => Some(
+            commands
+                .spawn(
+                    Observer::new(apply_builtin_completion_response_policy)
+                        .with_entity(event.entity),
+                )
+                .id(),
+        ),
+        _ if policy.rule.applies_to(PolicyPoint::TextDelta) => Some(
+            commands
+                .spawn(Observer::new(apply_builtin_text_delta_policy).with_entity(event.entity))
+                .id(),
+        ),
+        _ => None,
+    };
+    if let Some(observer) = observer {
         commands
             .entity(event.entity)
-            .observe(apply_builtin_request_policy);
+            .insert(BoundPolicyObserver(observer));
     }
-    if policy.rule.applies_to(PolicyPoint::ToolCall)
-        && !matches!(policy.rule, PolicyRule::Custom(_))
-    {
+}
+
+fn unbind_builtin_policy_observer(
+    event: On<Remove, Policy>,
+    bindings: Query<&BoundPolicyObserver>,
+    mut commands: Commands,
+) {
+    if let Ok(binding) = bindings.get(event.entity) {
+        commands.entity(binding.0).despawn();
         commands
             .entity(event.entity)
-            .observe(apply_builtin_tool_call_policy);
-    }
-    if policy.rule.applies_to(PolicyPoint::InvalidToolCall)
-        && !matches!(policy.rule, PolicyRule::Custom(_))
-    {
-        commands
-            .entity(event.entity)
-            .observe(apply_builtin_invalid_tool_call_policy);
-    }
-    if policy.rule.applies_to(PolicyPoint::ToolResult)
-        && !matches!(policy.rule, PolicyRule::Custom(_))
-    {
-        commands
-            .entity(event.entity)
-            .observe(apply_builtin_tool_result_policy);
-    }
-    if policy.rule.applies_to(PolicyPoint::CompletionResponse)
-        && !matches!(policy.rule, PolicyRule::Custom(_))
-    {
-        commands
-            .entity(event.entity)
-            .observe(apply_builtin_completion_response_policy);
-    }
-    if policy.rule.applies_to(PolicyPoint::TextDelta)
-        && !matches!(policy.rule, PolicyRule::Custom(_))
-    {
-        commands
-            .entity(event.entity)
-            .observe(apply_builtin_text_delta_policy);
+            .remove::<BoundPolicyObserver>();
     }
 }
 
@@ -6792,6 +6986,38 @@ fn begin_policy_approval(
         .id()
 }
 
+fn trigger_single_policy_responder<E>(
+    world: &mut World,
+    invocation: &mut E,
+    policy: Entity,
+    policy_id: &StableId,
+) where
+    E: EntityEvent,
+    for<'a> <E as Event>::Trigger<'a>: Default,
+{
+    let event_key = world.register_event_key::<E>();
+    let responders = {
+        let mut observers = world.query::<&Observer>();
+        observers
+            .iter(world)
+            .filter(|observer| {
+                observer.descriptor().event_keys().contains(&event_key)
+                    && (observer.descriptor().entities().is_empty()
+                        || observer.descriptor().entities().contains(&policy))
+            })
+            .count()
+    };
+    if responders == 1 {
+        world.trigger_ref(invocation);
+    } else {
+        tracing::warn!(
+            policy = policy_id.as_str(),
+            responders,
+            "steering policy must have exactly one applicable responder"
+        );
+    }
+}
+
 fn evaluate_request_policies(world: &mut World) {
     let mut query = world.query::<(Entity, &EvaluationOfOperation, &RequestPolicyEvaluation)>();
     let mut ready = query
@@ -6844,7 +7070,7 @@ fn evaluate_request_policies(world: &mut World) {
             revision: policy.revision,
             cursor,
         });
-        world.trigger_ref(&mut invocation);
+        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
         let decision = invocation.decision.clone();
         world.trigger(RequestPolicyDecided {
             policy: policy.entity,
@@ -6925,13 +7151,14 @@ fn evaluate_request_policies(world: &mut World) {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn initialize_tool_call_policy_evaluations(
     mut commands: Commands,
     operations: Query<
         (Entity, &OperationOf, &PendingToolCall, &OperationState),
         Without<ToolCallPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
+    runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -6940,18 +7167,13 @@ fn initialize_tool_call_policy_evaluations(
         if !matches!(state.phase, OperationPhase::Prepared) {
             continue;
         }
-        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+        let Ok((run_of, run_policies, control)) = runs.get(operation_of.get()) else {
             continue;
         };
         if !control_allows_internal_progress(control) {
             continue;
         }
-        let mut ordered = agents
-            .get(run_of.get())
-            .ok()
-            .flatten()
-            .into_iter()
-            .flat_map(|agent_policies| agent_policies.iter())
+        let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
             .filter(|(_, _, policy, status)| {
                 accepts_new_policy_evaluations(*status)
@@ -7048,7 +7270,7 @@ fn evaluate_tool_call_policies(world: &mut World) {
             call: evaluation.effective.clone(),
             decision: None,
         };
-        world.trigger_ref(&mut invocation);
+        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
         match invocation.decision {
             Some(ToolCallPolicyDecision::Run) => {
                 if let Some(mut evaluation) =
@@ -7137,6 +7359,7 @@ fn evaluate_tool_call_policies(world: &mut World) {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn initialize_invalid_tool_call_policy_evaluations(
     mut commands: Commands,
     operations: Query<
@@ -7148,7 +7371,7 @@ fn initialize_invalid_tool_call_policy_evaluations(
         ),
         Without<InvalidToolCallPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
+    runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -7157,18 +7380,13 @@ fn initialize_invalid_tool_call_policy_evaluations(
         if !matches!(state.phase, OperationPhase::Prepared) {
             continue;
         }
-        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+        let Ok((run_of, run_policies, control)) = runs.get(operation_of.get()) else {
             continue;
         };
         if !control_allows_internal_progress(control) {
             continue;
         }
-        let mut ordered = agents
-            .get(run_of.get())
-            .ok()
-            .flatten()
-            .into_iter()
-            .flat_map(|agent_policies| agent_policies.iter())
+        let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
             .filter(|(_, _, policy, status)| {
                 accepts_new_policy_evaluations(*status)
@@ -7344,7 +7562,7 @@ fn evaluate_invalid_tool_call_policies(world: &mut World) {
             invalid: evaluation.invalid.clone(),
             decision: None,
         };
-        world.trigger_ref(&mut invocation);
+        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
         match invocation.decision {
             Some(InvalidToolCallPolicyDecision::Continue) => {
                 if let Some(mut evaluation) =
@@ -8017,7 +8235,7 @@ fn apply_effect_ingress(
     )>,
     clock: Res<RuntimeClock>,
     timeout: Res<EffectTimeoutTicks>,
-    runs: Query<(&RunOf, &RunRecord)>,
+    runs: Query<(&RunOf, Option<&RunPolicies>, &RunRecord)>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     run_subscriptions: Query<&RunSubscriptions>,
@@ -8127,7 +8345,7 @@ fn apply_effect_ingress(
                     deadline.expires_at = clock.tick.saturating_add(timeout.0);
                 }
                 let run = operation_of.get();
-                let Ok((run_of, record)) = runs.get(run) else {
+                let Ok((run_of, run_policies, record)) = runs.get(run) else {
                     continue;
                 };
                 let turn = record.next_turn;
@@ -8144,18 +8362,14 @@ fn apply_effect_ingress(
                             delta: text.clone(),
                             aggregated: aggregated.clone(),
                         });
-                        let mut stream_policies = agents
-                            .get(run_of.get())
-                            .ok()
-                            .flatten()
-                            .into_iter()
-                            .flat_map(|agent_policies| agent_policies.iter())
-                            .filter_map(|entity| policies.get(entity).ok())
-                            .filter(|(_, _, policy, status)| {
-                                accepts_new_policy_evaluations(*status)
-                                    && policy.rule.applies_to(PolicyPoint::TextDelta)
-                            })
-                            .collect::<Vec<_>>();
+                        let mut stream_policies =
+                            policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
+                                .filter_map(|entity| policies.get(entity).ok())
+                                .filter(|(_, _, policy, status)| {
+                                    accepts_new_policy_evaluations(*status)
+                                        && policy.rule.applies_to(PolicyPoint::TextDelta)
+                                })
+                                .collect::<Vec<_>>();
                         stream_policies.sort_by(
                             |(_, left_id, left, _), (_, right_id, right, _)| {
                                 left.order
@@ -8561,13 +8775,14 @@ fn update_runtime_metrics(
     *metrics = next;
 }
 
+#[allow(clippy::type_complexity)]
 fn initialize_completion_response_policy_evaluations(
     mut commands: Commands,
     operations: Query<
         (Entity, &OperationOf, &ModelEffectInput, &OperationState),
         Without<CompletionResponsePolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
+    runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -8578,18 +8793,13 @@ fn initialize_completion_response_policy_evaluations(
         else {
             continue;
         };
-        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+        let Ok((run_of, run_policies, control)) = runs.get(operation_of.get()) else {
             continue;
         };
         if !control_allows_internal_progress(control) {
             continue;
         }
-        let mut ordered = agents
-            .get(run_of.get())
-            .ok()
-            .flatten()
-            .into_iter()
-            .flat_map(|agent_policies| agent_policies.iter())
+        let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
             .filter(|(_, _, policy, status)| {
                 accepts_new_policy_evaluations(*status)
@@ -8695,7 +8905,7 @@ fn evaluate_completion_response_policies(world: &mut World) {
             response: evaluation.effective,
             decision: None,
         };
-        world.trigger_ref(&mut invocation);
+        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
         match invocation.decision {
             Some(CompletionResponsePolicyDecision::Continue) => {
                 if let Some(mut evaluation) =
@@ -8843,7 +9053,7 @@ fn evaluate_text_delta_policies(world: &mut World) {
             aggregated: evaluation.aggregated,
             decision: None,
         };
-        world.trigger_ref(&mut invocation);
+        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
         match invocation.decision {
             Some(TextDeltaPolicyDecision::Continue) => {
                 if let Some(mut state) =
@@ -8894,13 +9104,14 @@ fn evaluate_text_delta_policies(world: &mut World) {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn initialize_tool_result_policy_evaluations(
     mut commands: Commands,
     operations: Query<
         (Entity, &OperationOf, &ToolEffectInput, &OperationState),
         Without<ToolResultPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
+    runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -8911,18 +9122,13 @@ fn initialize_tool_result_policy_evaluations(
         else {
             continue;
         };
-        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+        let Ok((run_of, run_policies, control)) = runs.get(operation_of.get()) else {
             continue;
         };
         if !control_allows_internal_progress(control) {
             continue;
         }
-        let mut ordered = agents
-            .get(run_of.get())
-            .ok()
-            .flatten()
-            .into_iter()
-            .flat_map(|agent_policies| agent_policies.iter())
+        let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
             .filter(|(_, _, policy, status)| {
                 accepts_new_policy_evaluations(*status)
@@ -9031,7 +9237,7 @@ fn evaluate_tool_result_policies(world: &mut World) {
             result: evaluation.effective,
             decision: None,
         };
-        world.trigger_ref(&mut invocation);
+        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
         match invocation.decision {
             Some(ToolResultPolicyDecision::Keep) => {
                 if let Some(mut evaluation) =
@@ -9825,6 +10031,12 @@ mod tests {
         replacement_presentation: String,
     }
 
+    #[derive(Component)]
+    struct TerminalToolPolicy {
+        expected_arguments: serde_json::Value,
+        stop: bool,
+    }
+
     #[derive(Resource, Default)]
     struct FinishedTurns(Vec<ModelTurnFinished>);
 
@@ -9834,6 +10046,9 @@ mod tests {
         tool: Vec<ToolCallDeltaObserved>,
         finished: Vec<StreamResponseFinished>,
     }
+
+    #[derive(Resource, Default)]
+    struct FinalizedToolResults(Vec<ToolResultPresentationFinalized>);
 
     #[derive(Resource, Default)]
     struct LifecycleLog(Vec<&'static str>);
@@ -9853,6 +10068,25 @@ mod tests {
 
     #[derive(Resource, Default)]
     struct ComponentLifecycleLog(Vec<&'static str>);
+
+    #[derive(Resource)]
+    struct ObservationEnabled(bool);
+
+    #[derive(Resource, Default)]
+    struct ConditionalObservationCount(u32);
+
+    #[derive(EntityEvent)]
+    struct ConditionalProbe {
+        #[event_target]
+        target: Entity,
+    }
+
+    fn record_conditional_probe(
+        _: On<ConditionalProbe>,
+        mut count: ResMut<ConditionalObservationCount>,
+    ) {
+        count.0 = count.0.saturating_add(1);
+    }
 
     fn capture_operation_context(
         context: RigOperationContext<'_, '_>,
@@ -9930,6 +10164,14 @@ mod tests {
         );
     }
 
+    fn allow_custom_request(mut event: On<RequestPolicyInvocation>) {
+        event.decision = Some(RequestPolicyDecision::Continue);
+    }
+
+    fn stop_custom_request(mut event: On<RequestPolicyInvocation>) {
+        event.decision = Some(RequestPolicyDecision::Stop("ambiguous".to_owned()));
+    }
+
     fn inspect_tool_policy(
         mut event: On<ToolCallPolicyInvocation>,
         policies: Query<&InspectToolPolicy>,
@@ -9942,6 +10184,34 @@ mod tests {
         } else {
             ToolCallPolicyDecision::Stop("earlier argument rewrite was not visible".to_owned())
         });
+    }
+
+    fn finish_tool_policy(
+        mut event: On<ToolCallPolicyInvocation>,
+        policies: Query<&TerminalToolPolicy>,
+    ) {
+        let Ok(policy) = policies.get(event.policy) else {
+            return;
+        };
+        event.decision = Some(if event.call.arguments != policy.expected_arguments {
+            ToolCallPolicyDecision::Stop("earlier rewrite was not retained".to_owned())
+        } else if policy.stop {
+            ToolCallPolicyDecision::Stop("operator stopped dispatch".to_owned())
+        } else {
+            ToolCallPolicyDecision::Skip("operator skipped dispatch".to_owned())
+        });
+    }
+
+    fn isolate_tool_call_policy(mut event: On<ToolCallPolicyInvocation>) {
+        let Some(value) = event.call.arguments["value"].as_i64() else {
+            event.decision = Some(ToolCallPolicyDecision::Stop(
+                "missing isolated input".to_owned(),
+            ));
+            return;
+        };
+        event.decision = Some(ToolCallPolicyDecision::Rewrite(
+            serde_json::json!({"value": value + 10}),
+        ));
     }
 
     fn inspect_tool_result_policy(
@@ -9958,6 +10228,22 @@ mod tests {
                 ToolResultPolicyDecision::Stop("earlier result rewrite was not visible".to_owned())
             },
         );
+    }
+
+    fn fail_invalid_tool(mut event: On<InvalidToolCallPolicyInvocation>) {
+        event.decision = Some(InvalidToolCallPolicyDecision::Fail);
+    }
+
+    fn skip_invalid_tool(mut event: On<InvalidToolCallPolicyInvocation>) {
+        event.decision = Some(InvalidToolCallPolicyDecision::Skip(
+            "synthetic skip".to_owned(),
+        ));
+    }
+
+    fn stop_invalid_tool(mut event: On<InvalidToolCallPolicyInvocation>) {
+        event.decision = Some(InvalidToolCallPolicyDecision::Stop(
+            "operator stopped the run".to_owned(),
+        ));
     }
 
     fn record_finished_turn(event: On<ModelTurnFinished>, mut turns: ResMut<FinishedTurns>) {
@@ -9980,6 +10266,13 @@ mod tests {
         mut observed: ResMut<ObservedStreamDeltas>,
     ) {
         observed.finished.push(event.event().clone());
+    }
+
+    fn record_finalized_tool_result(
+        event: On<ToolResultPresentationFinalized>,
+        mut finalized: ResMut<FinalizedToolResults>,
+    ) {
+        finalized.0.push(event.event().clone());
     }
 
     fn id(value: &str) -> StableId {
@@ -10070,6 +10363,41 @@ mod tests {
         runtime.run_until_stalled().unwrap();
         let tool = runtime.effects().try_recv().unwrap().unwrap();
         (pending, tool)
+    }
+
+    fn submit_invalid_tool_call(
+        runtime: &mut Runtime,
+        agent: AgentHandle,
+        name: &str,
+    ) -> PendingRunHandle {
+        let pending = runtime
+            .handle()
+            .prompt(agent, "use a missing tool")
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "invalid-call".to_owned(),
+                        provider_result_id: "provider-result".to_owned(),
+                        provider_call_id: Some("provider-call".to_owned()),
+                        name: name.to_owned(),
+                        arguments: serde_json::json!({"query": "weather"}),
+                    }],
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        pending
     }
 
     #[test]
@@ -12050,6 +12378,139 @@ mod tests {
     }
 
     #[test]
+    fn multiple_steering_responders_fail_closed_without_registration_order() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let policy = runtime
+            .spawn_policy(
+                id("ambiguous-policy"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::Custom(PolicyPoint::Request),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(policy)
+            .observe(allow_custom_request)
+            .observe(stop_custom_request);
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+
+        runtime.run_until_stalled().unwrap();
+
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Failed(CanonicalError::PolicyDenied {
+                policy: "ambiguous-policy".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn run_scoped_policy_affects_only_its_target_run_and_cleans_up_with_it() {
+        let (mut runtime, agent) = runtime_with_tool();
+        let first_pending = runtime.handle().prompt(agent, "first").unwrap();
+        let second_pending = runtime.handle().prompt(agent, "second").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model_requests = [
+            runtime.effects().try_recv().unwrap().unwrap(),
+            runtime.effects().try_recv().unwrap().unwrap(),
+        ];
+        let first = runtime.resolve_run(&first_pending).unwrap();
+        let second = runtime.resolve_run(&second_pending).unwrap();
+        let run_policy = runtime
+            .spawn_run_policy(
+                id("first-run-only"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 5,
+                    rule: PolicyRule::SkipToolCall {
+                        tool: Some("lookup".to_owned()),
+                        reason: "first run skipped".to_owned(),
+                    },
+                },
+                first,
+            )
+            .unwrap();
+
+        for request in model_requests {
+            let run = runtime
+                .world()
+                .get::<OperationOf>(request.operation)
+                .unwrap()
+                .get();
+            let call_id = if run == first.entity() {
+                "first-call"
+            } else {
+                assert_eq!(run, second.entity());
+                "second-call"
+            };
+            runtime
+                .effects()
+                .completion_sender()
+                .try_send(EffectCompletion {
+                    operation: request.operation,
+                    generation: request.generation,
+                    result: Ok(EffectOutput::Model(ModelEffectOutput {
+                        assistant_message: None,
+                        text: String::new(),
+                        usage: Usage::default(),
+                        tool_calls: vec![ModelToolCall {
+                            id: call_id.to_owned(),
+                            provider_result_id: call_id.to_owned(),
+                            provider_call_id: None,
+                            name: "lookup".to_owned(),
+                            arguments: serde_json::json!({"run": call_id}),
+                        }],
+                    })),
+                })
+                .unwrap();
+        }
+        runtime.run_until_stalled().unwrap();
+        let effects = [
+            runtime.effects().try_recv().unwrap().unwrap(),
+            runtime.effects().try_recv().unwrap().unwrap(),
+        ];
+        let first_next_model = effects
+            .iter()
+            .find_map(EffectRequest::model_input)
+            .expect("the scoped skip must re-enter only the first run's model flow");
+        assert_eq!(
+            first_next_model.tool_results[0].presentation,
+            "first run skipped"
+        );
+        let second_tool = effects
+            .iter()
+            .find_map(EffectRequest::tool_input)
+            .expect("the unrelated sibling must still dispatch its tool");
+        assert_eq!(second_tool.call_id, "second-call");
+
+        runtime.world_mut().despawn(first.entity());
+        assert!(runtime.world().get_entity(run_policy).is_err());
+    }
+
+    #[test]
     fn request_approval_operation_suspends_and_resumes_policy_cursor() {
         let mut runtime = runtime();
         let model = runtime
@@ -12292,6 +12753,58 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_tool_approval_cancels_effect_and_rejects_late_completion() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("approve-tool"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 3,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::ToolCall,
+                        prompt: "approve lookup".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let (pending, approval) = advance_to_lookup_tool(&mut runtime, agent);
+        assert!(approval.policy_approval_input().is_some());
+        let run = runtime.resolve_run(&pending).unwrap();
+
+        runtime.handle().cancel(run).unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.effects().try_recv_cancellation().unwrap(),
+            Some(EffectCancellation {
+                operation: approval.operation,
+                generation: approval.generation,
+            })
+        );
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: true,
+                    reason: Some("late".to_owned()),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Cancelled)
+        );
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+    }
+
+    #[test]
     fn completion_response_policy_runs_before_commit_and_emits_turn_event() {
         let mut runtime = runtime();
         runtime
@@ -12491,6 +13004,168 @@ mod tests {
     }
 
     #[test]
+    fn tool_skip_and_stop_after_rewrite_retain_effective_arguments() {
+        for (stop, terminal_id) in [(false, "skip-after-rewrite"), (true, "stop-after-rewrite")] {
+            let (mut runtime, agent) = runtime_with_tool();
+            runtime
+                .spawn_policy(
+                    id("rewrite-first"),
+                    tenant("a"),
+                    Policy {
+                        order: 0,
+                        revision: 1,
+                        rule: PolicyRule::RewriteToolArguments {
+                            tool: Some("lookup".to_owned()),
+                            arguments: serde_json::json!({"rewritten": true}),
+                        },
+                    },
+                    agent,
+                )
+                .unwrap();
+            let terminal = runtime
+                .spawn_policy(
+                    id(terminal_id),
+                    tenant("a"),
+                    Policy {
+                        order: 1,
+                        revision: 2,
+                        rule: PolicyRule::Custom(PolicyPoint::ToolCall),
+                    },
+                    agent,
+                )
+                .unwrap();
+            runtime
+                .world_mut()
+                .entity_mut(terminal)
+                .insert(TerminalToolPolicy {
+                    expected_arguments: serde_json::json!({"rewritten": true}),
+                    stop,
+                })
+                .observe(finish_tool_policy);
+
+            let pending = runtime.handle().prompt(agent, "use lookup").unwrap();
+            runtime.run_until_stalled().unwrap();
+            let model = runtime.effects().try_recv().unwrap().unwrap();
+            runtime
+                .effects()
+                .completion_sender()
+                .try_send(EffectCompletion {
+                    operation: model.operation,
+                    generation: model.generation,
+                    result: Ok(EffectOutput::Model(ModelEffectOutput {
+                        assistant_message: None,
+                        text: String::new(),
+                        usage: Usage::default(),
+                        tool_calls: vec![ModelToolCall {
+                            id: "call".to_owned(),
+                            provider_result_id: "call".to_owned(),
+                            provider_call_id: None,
+                            name: "lookup".to_owned(),
+                            arguments: serde_json::json!({"original": true}),
+                        }],
+                    })),
+                })
+                .unwrap();
+            runtime.run_until_stalled().unwrap();
+            let run = runtime.resolve_run(&pending).unwrap();
+            let mut evaluations = runtime.world_mut().query::<&ToolCallPolicyEvaluation>();
+            let evaluation = evaluations.iter(runtime.world()).next().unwrap();
+            assert_eq!(
+                evaluation.effective.arguments,
+                serde_json::json!({"rewritten": true})
+            );
+
+            if stop {
+                assert_eq!(runtime.effects().try_recv().unwrap(), None);
+                assert_eq!(
+                    runtime.world().get::<RunState>(run.entity()),
+                    Some(&RunState::Failed(CanonicalError::PolicyDenied {
+                        policy: terminal_id.to_owned(),
+                    }))
+                );
+            } else {
+                let next_model = runtime.effects().try_recv().unwrap().unwrap();
+                let result = &next_model.model_input().unwrap().tool_results[0];
+                assert_eq!(result.presentation, "operator skipped dispatch");
+                assert_eq!(
+                    result.raw,
+                    serde_json::json!({
+                        "skipped": true,
+                        "reason": "operator skipped dispatch"
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_tool_call_policy_evaluations_are_isolated() {
+        let (mut runtime, agent) = runtime_with_tool();
+        let policy = runtime
+            .spawn_policy(
+                id("isolated-rewrite"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::Custom(PolicyPoint::ToolCall),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(policy)
+            .observe(isolate_tool_call_policy);
+        runtime.handle().prompt(agent, "two lookups").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![
+                        ModelToolCall {
+                            id: "first".to_owned(),
+                            provider_result_id: "first".to_owned(),
+                            provider_call_id: None,
+                            name: "lookup".to_owned(),
+                            arguments: serde_json::json!({"value": 1}),
+                        },
+                        ModelToolCall {
+                            id: "second".to_owned(),
+                            provider_result_id: "second".to_owned(),
+                            provider_call_id: None,
+                            name: "lookup".to_owned(),
+                            arguments: serde_json::json!({"value": 2}),
+                        },
+                    ],
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+
+        let first = runtime.effects().try_recv().unwrap().unwrap();
+        let second = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(first.tool_input().unwrap().call_id, "first");
+        assert_eq!(
+            first.tool_input().unwrap().arguments,
+            serde_json::json!({"value": 11})
+        );
+        assert_eq!(second.tool_input().unwrap().call_id, "second");
+        assert_eq!(
+            second.tool_input().unwrap().arguments,
+            serde_json::json!({"value": 12})
+        );
+    }
+
+    #[test]
     fn skipped_tool_call_never_dispatches_and_reenters_model_flow() {
         let (mut runtime, agent) = runtime_with_tool();
         runtime
@@ -12548,6 +13223,12 @@ mod tests {
     #[test]
     fn tool_result_rewrites_chain_without_mutating_raw_audit_data() {
         let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .world_mut()
+            .insert_resource(FinalizedToolResults::default());
+        runtime
+            .world_mut()
+            .add_observer(record_finalized_tool_result);
         runtime
             .spawn_policy(
                 id("first-result"),
@@ -12635,6 +13316,11 @@ mod tests {
                         if raw == &serde_json::json!({"secret": 42}) && content == "redacted twice"
                 ))
         );
+        let finalized = &runtime.world().resource::<FinalizedToolResults>().0;
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].presentation, "redacted twice");
+        assert_eq!(finalized[0].raw.presentation, "unredacted");
+        assert_eq!(finalized[0].raw.raw, serde_json::json!({"secret": 42}));
     }
 
     #[test]
@@ -13371,6 +14057,282 @@ mod tests {
             )))
         );
         assert_eq!(runtime.effects().try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_tool_fail_skip_and_stop_decisions_have_distinct_semantics() {
+        enum Expected {
+            Fail,
+            Skip,
+            Stop,
+        }
+
+        type InvalidPolicyCase = (
+            fn(On<InvalidToolCallPolicyInvocation>),
+            Expected,
+            &'static str,
+        );
+        let cases: [InvalidPolicyCase; 3] = [
+            (fail_invalid_tool, Expected::Fail, "fail-invalid"),
+            (skip_invalid_tool, Expected::Skip, "skip-invalid"),
+            (stop_invalid_tool, Expected::Stop, "stop-invalid"),
+        ];
+
+        for (observer, expected, policy_id) in cases {
+            let (mut runtime, agent) = runtime_with_tool();
+            let policy = runtime
+                .spawn_policy(
+                    id(policy_id),
+                    tenant("a"),
+                    Policy {
+                        order: 0,
+                        revision: 7,
+                        rule: PolicyRule::Custom(PolicyPoint::InvalidToolCall),
+                    },
+                    agent,
+                )
+                .unwrap();
+            runtime.world_mut().entity_mut(policy).observe(observer);
+            let pending = submit_invalid_tool_call(&mut runtime, agent, "missing");
+            let run = runtime.resolve_run(&pending).unwrap();
+
+            match expected {
+                Expected::Fail => assert_eq!(
+                    runtime.world().get::<RunState>(run.entity()),
+                    Some(&RunState::Failed(CanonicalError::UnknownTool(
+                        "missing".to_owned()
+                    )))
+                ),
+                Expected::Stop => assert_eq!(
+                    runtime.world().get::<RunState>(run.entity()),
+                    Some(&RunState::Failed(CanonicalError::PolicyDenied {
+                        policy: policy_id.to_owned()
+                    }))
+                ),
+                Expected::Skip => {
+                    let next_model = runtime.effects().try_recv().unwrap().unwrap();
+                    let input = next_model.model_input().unwrap();
+                    assert_eq!(input.tool_results.len(), 1);
+                    assert_eq!(input.tool_results[0].presentation, "synthetic skip");
+                    assert_eq!(
+                        input.tool_results[0].raw,
+                        serde_json::json!({
+                            "invalid_tool_call": "skip",
+                            "feedback": "synthetic skip"
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_tool_approval_resumes_at_the_next_policy_cursor() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("approve-invalid"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 4,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::InvalidToolCall,
+                        prompt: "approve repair".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("repair-after-approval"),
+                tenant("a"),
+                Policy {
+                    order: 1,
+                    revision: 9,
+                    rule: PolicyRule::RepairInvalidTool {
+                        from: Some("lookpu".to_owned()),
+                        to: "lookup".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+
+        submit_invalid_tool_call(&mut runtime, agent, "lookpu");
+        let approval = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            approval.policy_approval_input(),
+            Some(&PolicyApprovalEffectInput {
+                policy_id: id("approve-invalid"),
+                revision: 4,
+                point: PolicyPoint::InvalidToolCall,
+                prompt: "approve repair".to_owned(),
+            })
+        );
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: true,
+                    reason: Some("operator approved".to_owned()),
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let repaired = runtime.effects().try_recv().unwrap().unwrap();
+        let input = repaired.tool_input().unwrap();
+        assert_eq!(input.decision.name, "lookup");
+        assert_eq!(input.call_id, "invalid-call");
+        assert_eq!(input.provider_result_id, "provider-result");
+        assert_eq!(input.provider_call_id.as_deref(), Some("provider-call"));
+        assert_eq!(input.arguments, serde_json::json!({"query": "weather"}));
+    }
+
+    #[test]
+    fn streamed_invalid_tool_fragments_survive_repair_with_blocking_parity() {
+        let (mut streaming, streaming_agent) = runtime_with_tool();
+        streaming
+            .spawn_policy(
+                id("stream-repair"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::RepairInvalidTool {
+                        from: Some("lookpu".to_owned()),
+                        to: "lookup".to_owned(),
+                    },
+                },
+                streaming_agent,
+            )
+            .unwrap();
+        let (_, stream) = streaming
+            .handle()
+            .prompt_stream(streaming_agent, "use lookup")
+            .unwrap();
+        streaming.run_until_stalled().unwrap();
+        let model = streaming.effects().try_recv().unwrap().unwrap();
+        for (sequence, content) in [
+            (0, ToolCallDeltaContent::Name("look".to_owned())),
+            (
+                1,
+                ToolCallDeltaContent::Delta("{\"query\":\"weather\"}".to_owned()),
+            ),
+        ] {
+            streaming
+                .effects()
+                .delta_sender()
+                .try_send(EffectDelta {
+                    operation: model.operation,
+                    generation: model.generation,
+                    sequence,
+                    provider_correlation: Some("wire-call".to_owned()),
+                    kind: EffectDeltaKind::ToolCall {
+                        id: "wire-call".to_owned(),
+                        internal_call_id: "invalid-call".to_owned(),
+                        content,
+                    },
+                })
+                .unwrap();
+        }
+        streaming
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "invalid-call".to_owned(),
+                        provider_result_id: "provider-result".to_owned(),
+                        provider_call_id: Some("provider-call".to_owned()),
+                        name: "lookpu".to_owned(),
+                        arguments: serde_json::json!({"query": "weather"}),
+                    }],
+                })),
+            })
+            .unwrap();
+        streaming.run_until_stalled().unwrap();
+        let streamed_tool = streaming.effects().try_recv().unwrap().unwrap();
+        let streamed_input = streamed_tool.tool_input().unwrap();
+        assert_eq!(streamed_input.decision.name, "lookup");
+        assert_eq!(streamed_input.call_id, "invalid-call");
+        assert_eq!(streamed_input.provider_result_id, "provider-result");
+        assert_eq!(
+            streamed_input.provider_call_id.as_deref(),
+            Some("provider-call")
+        );
+        assert_eq!(
+            streamed_input.arguments,
+            serde_json::json!({"query": "weather"})
+        );
+        let mut evaluations = streaming
+            .world_mut()
+            .query::<&InvalidToolCallPolicyEvaluation>();
+        assert!(
+            evaluations
+                .iter(streaming.world())
+                .all(|evaluation| evaluation.invalid.streaming_origin)
+        );
+        assert!(matches!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::ToolCallDelta {
+                sequence: 0,
+                id,
+                internal_call_id,
+                content: ToolCallDeltaContent::Name(name),
+            }) if id == "wire-call" && internal_call_id == "invalid-call" && name == "look"
+        ));
+        assert!(matches!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::ToolCallDelta {
+                sequence: 1,
+                internal_call_id,
+                content: ToolCallDeltaContent::Delta(arguments),
+                ..
+            }) if internal_call_id == "invalid-call"
+                && arguments == "{\"query\":\"weather\"}"
+        ));
+
+        let (mut blocking, blocking_agent) = runtime_with_tool();
+        blocking
+            .spawn_policy(
+                id("blocking-repair"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::RepairInvalidTool {
+                        from: Some("lookpu".to_owned()),
+                        to: "lookup".to_owned(),
+                    },
+                },
+                blocking_agent,
+            )
+            .unwrap();
+        submit_invalid_tool_call(&mut blocking, blocking_agent, "lookpu");
+        let blocking_tool = blocking.effects().try_recv().unwrap().unwrap();
+        let blocking_input = blocking_tool.tool_input().unwrap();
+        assert_eq!(blocking_input.decision.name, streamed_input.decision.name);
+        assert_eq!(blocking_input.call_id, streamed_input.call_id);
+        assert_eq!(
+            blocking_input.provider_result_id,
+            streamed_input.provider_result_id
+        );
+        assert_eq!(
+            blocking_input.provider_call_id,
+            streamed_input.provider_call_id
+        );
+        assert_eq!(blocking_input.arguments, streamed_input.arguments);
     }
 
     #[test]
@@ -15043,6 +16005,81 @@ mod tests {
     }
 
     #[test]
+    fn entity_observer_conditions_gate_observation_without_order_dependence() {
+        let mut world = World::new();
+        world.insert_resource(ObservationEnabled(false));
+        world.insert_resource(ConditionalObservationCount::default());
+        let target = world.spawn_empty().id();
+        world
+            .entity_mut(target)
+            .observe(record_conditional_probe.run_if(|enabled: Res<ObservationEnabled>| enabled.0));
+
+        world.trigger(ConditionalProbe { target });
+        assert_eq!(world.resource::<ConditionalObservationCount>().0, 0);
+        world.resource_mut::<ObservationEnabled>().0 = true;
+        world.trigger(ConditionalProbe { target });
+        assert_eq!(world.resource::<ConditionalObservationCount>().0, 1);
+    }
+
+    #[test]
+    fn built_in_policy_observers_are_removed_with_policy_lifecycle() {
+        let (mut runtime, agent) = runtime_with_tool();
+        let removed_policy = runtime
+            .spawn_policy(
+                id("removed-policy"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::PatchRequest(RequestPatch::new().instructions("temporary")),
+                },
+                agent,
+            )
+            .unwrap();
+        let removed_observer = runtime
+            .world()
+            .get::<BoundPolicyObserver>(removed_policy)
+            .expect("On<Add, Policy> must bind its targeted observer")
+            .0;
+        assert!(runtime.world().get::<Observer>(removed_observer).is_some());
+
+        runtime
+            .world_mut()
+            .entity_mut(removed_policy)
+            .remove::<Policy>();
+        assert!(runtime.world().get_entity(removed_observer).is_err());
+        assert!(
+            runtime
+                .world()
+                .get::<BoundPolicyObserver>(removed_policy)
+                .is_none()
+        );
+
+        let despawned_policy = runtime
+            .spawn_policy(
+                id("despawned-policy"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::SkipToolCall {
+                        tool: None,
+                        reason: "temporary".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let despawned_observer = runtime
+            .world()
+            .get::<BoundPolicyObserver>(despawned_policy)
+            .unwrap()
+            .0;
+        runtime.world_mut().despawn(despawned_policy);
+        assert!(runtime.world().get_entity(despawned_observer).is_err());
+    }
+
+    #[test]
     fn policy_heavy_run_does_not_starve_ready_sibling() {
         let mut runtime = runtime();
         let model = runtime
@@ -15390,6 +16427,312 @@ mod tests {
             restored.observe_run(run).unwrap(),
             Some(RunState::Completed(RunOutput { text, .. })) if text == "approved after restore"
         ));
+    }
+
+    #[test]
+    fn active_run_snapshot_restores_waiting_tool_effect() {
+        let (mut source, agent) = runtime_with_tool();
+        let domain = source.snapshot().unwrap();
+        let (pending, original_tool) = advance_to_lookup_tool(&mut source, agent);
+        let run = source.resolve_run(&pending).unwrap();
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        assert_eq!(
+            source.effects().try_recv_cancellation().unwrap(),
+            Some(EffectCancellation {
+                operation: original_tool.operation,
+                generation: original_tool.generation,
+            })
+        );
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let runs = restored.restore_active_run(snapshot).unwrap();
+        let run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: runs.0.get(pending.stable_id()).copied().unwrap(),
+        };
+        restored.handle().resume(run).unwrap();
+        restored.run_until_stalled().unwrap();
+        let tool = restored.effects().try_recv().unwrap().unwrap();
+        assert!(tool.generation > original_tool.generation);
+        let input = tool.tool_input().unwrap();
+        assert_eq!(input.decision.name, "lookup");
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: tool.operation,
+                generation: tool.generation,
+                result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                    call_id: input.call_id.clone(),
+                    provider_result_id: input.provider_result_id.clone(),
+                    provider_call_id: input.provider_call_id.clone(),
+                    name: input.decision.name.clone(),
+                    raw: serde_json::json!({"answer": 42}),
+                    presentation: "42".to_owned(),
+                    failure: None,
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        let model = restored.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            model.model_input().unwrap().tool_results[0].presentation,
+            "42"
+        );
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "restored after tool".to_owned(),
+                    usage: Usage {
+                        input_tokens: 6,
+                        output_tokens: 3,
+                    },
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+
+        assert_eq!(
+            restored.observe_run(run).unwrap(),
+            Some(RunState::Completed(RunOutput {
+                text: "restored after tool".to_owned(),
+                usage: Usage {
+                    input_tokens: 6,
+                    output_tokens: 3,
+                },
+            }))
+        );
+        assert!(restored.run_transcript(run).unwrap().iter().any(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::ToolResult { content, .. } if content == "42"
+            )
+        }));
+    }
+
+    #[test]
+    fn active_run_snapshot_restores_run_scoped_policy_definition_and_decision() {
+        let (mut source, agent) = runtime_with_tool();
+        let domain = source.snapshot().unwrap();
+        let pending = source
+            .handle()
+            .prompt(agent, "run policy checkpoint")
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let model = source.effects().try_recv().unwrap().unwrap();
+        let run = source.resolve_run(&pending).unwrap();
+        source
+            .spawn_run_policy(
+                id("run-rewrite"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 6,
+                    rule: PolicyRule::RewriteToolArguments {
+                        tool: Some("lookup".to_owned()),
+                        arguments: serde_json::json!({"restored": true}),
+                    },
+                },
+                run,
+            )
+            .unwrap();
+        source
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "lookup".to_owned(),
+                        arguments: serde_json::json!({"original": true}),
+                    }],
+                })),
+            })
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let original_tool = source.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            original_tool.tool_input().unwrap().arguments,
+            serde_json::json!({"restored": true})
+        );
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.run_policies.len(), 1);
+        assert_eq!(snapshot.run_policies[0].id, id("run-rewrite"));
+        assert_eq!(snapshot.run_policies[0].run_id, *pending.stable_id());
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let runs = restored.restore_active_run(snapshot).unwrap();
+        let run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: runs.0.get(pending.stable_id()).copied().unwrap(),
+        };
+        let restored_policy = restored
+            .world()
+            .iter_entities()
+            .find(|entity| {
+                entity
+                    .get::<StableId>()
+                    .is_some_and(|stable_id| stable_id == &id("run-rewrite"))
+            })
+            .map(|entity| entity.id())
+            .unwrap();
+        assert_eq!(
+            restored
+                .world()
+                .get::<PolicyForRun>(restored_policy)
+                .map(Relationship::get),
+            Some(run.entity())
+        );
+        assert_eq!(
+            restored
+                .world()
+                .get::<Policy>(restored_policy)
+                .unwrap()
+                .revision,
+            6
+        );
+        restored.handle().resume(run).unwrap();
+        restored.run_until_stalled().unwrap();
+        let tool = restored.effects().try_recv().unwrap().unwrap();
+        assert!(tool.generation > original_tool.generation);
+        assert_eq!(
+            tool.tool_input().unwrap().arguments,
+            serde_json::json!({"restored": true})
+        );
+        assert_eq!(
+            restored
+                .world()
+                .get::<AcceptedToolCallPolicies>(tool.operation),
+            Some(&AcceptedToolCallPolicies(vec![AcceptedPolicy {
+                id: id("run-rewrite"),
+                entity: restored_policy,
+                revision: 6,
+            }]))
+        );
+    }
+
+    #[test]
+    fn active_run_snapshot_restores_settled_terminal_before_publication() {
+        let mut source = runtime();
+        let model = source
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = source
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let domain = source.snapshot().unwrap();
+        let pending = source.handle().prompt(agent, "freeze terminal").unwrap();
+        source.run_until_stalled().unwrap();
+        let request = source.effects().try_recv().unwrap().unwrap();
+        let run = source.resolve_run(&pending).unwrap();
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::FreezeAfterIngress)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        source
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "frozen answer".to_owned(),
+                    usage: Usage {
+                        input_tokens: 4,
+                        output_tokens: 2,
+                    },
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        assert!(matches!(
+            source.world().get::<OperationState>(request.operation),
+            Some(OperationState {
+                phase: OperationPhase::Settled(OperationOutcome::Success(EffectOutput::Model(_))),
+                ..
+            })
+        ));
+        assert!(matches!(
+            source.world().get::<RunState>(run.entity()),
+            Some(RunState::WaitingModel { .. })
+        ));
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let runs = restored.restore_active_run(snapshot).unwrap();
+        let run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: runs.0.get(pending.stable_id()).copied().unwrap(),
+        };
+        restored.handle().resume(run).unwrap();
+        restored.run_until_stalled().unwrap();
+
+        assert_eq!(
+            restored.observe_run(run).unwrap(),
+            Some(RunState::Completed(RunOutput {
+                text: "frozen answer".to_owned(),
+                usage: Usage {
+                    input_tokens: 4,
+                    output_tokens: 2,
+                },
+            }))
+        );
+        assert_eq!(
+            restored.run_transcript(run),
+            Some(vec![
+                TranscriptEntry::User("freeze terminal".to_owned()),
+                TranscriptEntry::Assistant("frozen answer".to_owned()),
+            ])
+        );
+        assert_eq!(restored.effects().try_recv().unwrap(), None);
     }
 
     #[test]

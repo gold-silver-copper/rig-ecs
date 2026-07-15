@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use super::*;
 
-const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 1;
+const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 2;
 
 /// Serializable checkpoint for one run and all of its descendant runs.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -24,6 +24,8 @@ pub struct ActiveRunSnapshot {
     pub root_run: StableId,
     /// Parent-before-child run records.
     pub runs: Vec<PersistedActiveRun>,
+    /// Policy revisions owned by the captured runs.
+    pub run_policies: Vec<PersistedRunPolicy>,
     /// Run-owned external operations.
     pub operations: Vec<PersistedRunOperation>,
     /// Atomic logical tool batches.
@@ -101,6 +103,21 @@ pub struct PersistedActiveRun {
     pub child_ordinal: Option<u64>,
     /// Whether the result has already committed to its parent.
     pub child_result_committed: bool,
+}
+
+/// Stable definition of one policy scoped to a captured run.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersistedRunPolicy {
+    /// Persistent policy identity.
+    pub id: StableId,
+    /// Tenant scope shared with the target run.
+    pub tenant: TenantId,
+    /// Stable target run identity.
+    pub run_id: StableId,
+    /// Immutable ordered policy definition.
+    pub policy: Policy,
+    /// Admission status for future evaluations after restoration.
+    pub status: PolicyStatus,
 }
 
 /// Run phase with snapshot-local operation and batch references.
@@ -592,6 +609,25 @@ pub fn snapshot_active_run(
         pending.extend(children.into_iter().map(|(_, _, child)| child));
     }
 
+    let mut run_policy_query =
+        world.query::<(&StableId, &TenantId, &Policy, &PolicyStatus, &PolicyForRun)>();
+    let mut run_policies = run_policy_query
+        .iter(world)
+        .filter_map(|(id, tenant, policy, status, policy_for)| {
+            run_ids
+                .get(&policy_for.get())
+                .cloned()
+                .map(|run_id| PersistedRunPolicy {
+                    id: id.clone(),
+                    tenant: tenant.clone(),
+                    run_id,
+                    policy: policy.clone(),
+                    status: *status,
+                })
+        })
+        .collect::<Vec<_>>();
+    run_policies.sort_by(|left, right| left.id.cmp(&right.id));
+
     let mut operations = Vec::with_capacity(operation_entities.len());
     for row in &operation_rows {
         let entity = row.0;
@@ -787,6 +823,7 @@ pub fn snapshot_active_run(
         version: ACTIVE_RUN_SNAPSHOT_VERSION,
         root_run: root_id,
         runs,
+        run_policies,
         operations,
         tool_batches,
         policy_evaluations,
@@ -1166,7 +1203,7 @@ pub fn restore_active_run(
     world: &mut World,
     snapshot: ActiveRunSnapshot,
 ) -> Result<RestoredRuns, ActiveRunSnapshotError> {
-    let domain = validate_active_snapshot(world, &snapshot)?;
+    let mut domain = validate_active_snapshot(world, &snapshot)?;
 
     let mut runs = HashMap::new();
     for persisted in &snapshot.runs {
@@ -1211,6 +1248,29 @@ pub fn restore_active_run(
         if persisted.child_result_committed {
             world.entity_mut(run).insert(ChildResultCommitted);
         }
+    }
+
+    let mut restored_run_policies = Vec::with_capacity(snapshot.run_policies.len());
+    for persisted in &snapshot.run_policies {
+        let run = local_run(&runs, &persisted.run_id)?;
+        let entity = world
+            .spawn((
+                persisted.id.clone(),
+                persisted.tenant.clone(),
+                persisted.policy.clone(),
+                persisted.status,
+                PolicyForRun(run),
+            ))
+            .id();
+        domain.policies.insert(
+            persisted.id.clone(),
+            DomainRef {
+                entity,
+                tenant: persisted.tenant.clone(),
+                revision: Some(persisted.policy.revision),
+            },
+        );
+        restored_run_policies.push((persisted.id.clone(), entity));
     }
 
     let mut batches = HashMap::new();
@@ -1322,6 +1382,9 @@ pub fn restore_active_run(
         for (id, entity) in &runs {
             index.0.insert(id.clone(), *entity);
         }
+        for (id, entity) in restored_run_policies {
+            index.0.insert(id, entity);
+        }
     }
     Ok(RestoredRuns(runs))
 }
@@ -1338,7 +1401,7 @@ fn validate_active_snapshot(
     if snapshot.version != ACTIVE_RUN_SNAPSHOT_VERSION {
         return Err(ActiveRunSnapshotError::UnsupportedVersion(snapshot.version));
     }
-    let domain = collect_domain_refs(world);
+    let mut domain = collect_domain_refs(world);
     let mut run_ids = HashSet::new();
     for run in &snapshot.runs {
         if domain.existing_ids.contains(&run.id) || !run_ids.insert(run.id.clone()) {
@@ -1354,6 +1417,38 @@ fn validate_active_snapshot(
         return Err(ActiveRunSnapshotError::MissingSnapshotReference(
             snapshot.root_run.as_str().to_owned(),
         ));
+    }
+    let mut run_policy_ids = HashSet::new();
+    for policy in &snapshot.run_policies {
+        if domain.existing_ids.contains(&policy.id)
+            || run_ids.contains(&policy.id)
+            || !run_policy_ids.insert(policy.id.clone())
+        {
+            return Err(ActiveRunSnapshotError::ConflictingStableId(
+                policy.id.as_str().to_owned(),
+            ));
+        }
+        let run = snapshot
+            .runs
+            .iter()
+            .find(|run| run.id == policy.run_id)
+            .ok_or_else(|| {
+                ActiveRunSnapshotError::MissingSnapshotReference(policy.run_id.as_str().to_owned())
+            })?;
+        if run.tenant != policy.tenant {
+            return Err(ActiveRunSnapshotError::TenantMismatch(
+                policy.id.as_str().to_owned(),
+            ));
+        }
+        domain.policies.insert(
+            policy.id.clone(),
+            DomainRef {
+                entity: Entity::PLACEHOLDER,
+                tenant: policy.tenant.clone(),
+                revision: Some(policy.policy.revision),
+            },
+        );
+        domain.existing_ids.insert(policy.id.clone());
     }
     let mut child_ordinals = HashSet::new();
     for run in &snapshot.runs {

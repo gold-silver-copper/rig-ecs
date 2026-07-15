@@ -787,7 +787,7 @@ scheduling-shard boundary for distinct trust domains.
 
 ## Active-run snapshot format
 
-`ActiveRunSnapshot` is versioned and contains only stable domain IDs plus opaque
+`ActiveRunSnapshot` format version 2 contains only stable domain IDs plus opaque
 snapshot-local references. It records:
 
 - root and descendant runs, parent identity, child ordinal, and committed-child status;
@@ -797,6 +797,7 @@ snapshot-local references. It records:
 - operation generation/phase, immutable model/tool/store decisions, stream sequence, and settled output;
 - tool batches and explicit call order;
 - accepted policy IDs/revisions, evaluation kind/cursor, accumulated request patch, effective arguments/presentation, and pending approvals;
+- run-scoped policy definitions, status, and stable run relationships;
 - committed-turn audit records.
 
 Raw entity IDs, observers, registered systems, clients, secrets, channels, and
