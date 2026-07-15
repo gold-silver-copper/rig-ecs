@@ -10,3 +10,4 @@ mod streaming;
 mod streaming_tools;
 mod structured_output;
 mod support;
+mod typed_prompt_tools;

@@ -12,6 +12,7 @@ mod streaming;
 mod streaming_tools;
 mod support;
 mod transcription;
+mod typed_prompt_tools;
 
 pub(super) const DEFAULT_MODEL: &str = "mistral-small-latest";
 pub(super) const TOOL_MODEL: &str = DEFAULT_MODEL;

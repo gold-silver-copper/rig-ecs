@@ -13,6 +13,7 @@ mod streaming_tools;
 mod structured_output;
 mod support;
 mod tools;
+mod typed_prompt_tools;
 
 mod cassette {
     mod agent;

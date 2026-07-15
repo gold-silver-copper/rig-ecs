@@ -17,3 +17,4 @@ mod streaming;
 mod streaming_tools;
 mod support;
 mod tools;
+mod typed_prompt_tools;

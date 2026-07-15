@@ -14,6 +14,7 @@ mod routing;
 mod streaming;
 mod streaming_tools;
 mod structured_output;
+mod typed_prompt_tools;
 
 use assert_fs::TempDir;
 use rig::providers::copilot;

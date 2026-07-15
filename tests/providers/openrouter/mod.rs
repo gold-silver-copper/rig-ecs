@@ -19,6 +19,7 @@ mod cassette {
     mod streaming;
     mod streaming_tools;
     mod transcription;
+    mod typed_prompt_tools;
 }
 
 #[cfg(feature = "audio")]

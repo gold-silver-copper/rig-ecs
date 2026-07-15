@@ -6,13 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rig::agent::{
-    AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent,
-    ObservationAction, ToolCall as ToolCallEvent, ToolCallAction, ToolResultAction,
-    ToolResultEvent,
-};
 use rig::client::CompletionClient;
-use rig::completion::{CompletionModel, TypedPrompt};
+use rig::completion::TypedPrompt;
 use rig::tool::Tool;
 
 use super::support;
@@ -36,85 +31,6 @@ struct WeatherTool {
 impl WeatherTool {
     fn new(call_count: Arc<AtomicUsize>) -> Self {
         Self { call_count }
-    }
-}
-
-#[derive(Clone, Default)]
-struct StepLogger {
-    completion_calls: Arc<AtomicUsize>,
-    tool_calls: Arc<AtomicUsize>,
-}
-
-impl StepLogger {
-    fn next_completion_call(&self) -> usize {
-        self.completion_calls.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    fn current_completion_call(&self) -> usize {
-        self.completion_calls.load(Ordering::SeqCst)
-    }
-
-    fn next_tool_call(&self) -> usize {
-        self.tool_calls.fetch_add(1, Ordering::SeqCst) + 1
-    }
-}
-
-impl<M> AgentHook<M> for StepLogger
-where
-    M: CompletionModel,
-    M::Response: Serialize,
-{
-    async fn on_completion_call(
-        &self,
-        _ctx: &rig::agent::HookContext,
-        event: CompletionCallEvent<'_>,
-    ) -> CompletionCallAction {
-        let call_no = self.next_completion_call();
-        println!("\n=== completion call #{call_no}: model input ===");
-        println!("history:\n{}", pretty_json(event.history));
-        println!("prompt:\n{}", pretty_json(event.prompt));
-        CompletionCallAction::continue_run()
-    }
-
-    async fn on_completion_response(
-        &self,
-        _ctx: &rig::agent::HookContext,
-        event: CompletionResponseEvent<'_, M>,
-    ) -> ObservationAction {
-        let call_no = self.current_completion_call();
-        println!("\n=== completion response #{call_no}: normalized choice ===");
-        println!("{}", pretty_json(&event.response.choice));
-        println!("\n=== completion response #{call_no}: raw provider payload ===");
-        println!("{}", pretty_json(&event.response.raw_response));
-        ObservationAction::continue_run()
-    }
-
-    async fn on_tool_call(
-        &self,
-        _ctx: &rig::agent::HookContext,
-        event: ToolCallEvent<'_>,
-    ) -> ToolCallAction {
-        let tool_no = self.next_tool_call();
-        println!("\n=== tool call #{tool_no}: model requested tool ===");
-        println!("tool_name: {}", event.tool_name);
-        println!("tool_call_id: {:?}", event.tool_call_id);
-        println!("internal_call_id: {}", event.internal_call_id);
-        println!("args: {}", event.args);
-        ToolCallAction::run()
-    }
-
-    async fn on_tool_result(
-        &self,
-        _ctx: &rig::agent::HookContext,
-        event: ToolResultEvent<'_>,
-    ) -> ToolResultAction {
-        println!("\n=== tool result: tool returned ===");
-        println!("tool_name: {}", event.tool_name);
-        println!("tool_call_id: {:?}", event.tool_call_id);
-        println!("internal_call_id: {}", event.internal_call_id);
-        println!("args: {}", event.args);
-        println!("result: {}", event.presentation.render());
-        ToolResultAction::keep()
     }
 }
 
@@ -148,7 +64,6 @@ impl Tool for WeatherTool {
 
     fn call(
         &self,
-        _context: &mut rig::tool::ToolContext,
         args: Self::Args,
     ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
         self.call_count.fetch_add(1, Ordering::SeqCst);
@@ -171,8 +86,6 @@ impl Tool for WeatherTool {
 #[ignore = "requires a local llama.cpp OpenAI-compatible server"]
 async fn prompt_typed_with_tool_call_verbatim_roundtrip() -> Result<()> {
     let model = support::model_name();
-    let hook = StepLogger::default();
-
     let call_count = Arc::new(AtomicUsize::new(0));
     let client = support::completions_client();
 
@@ -186,7 +99,6 @@ async fn prompt_typed_with_tool_call_verbatim_roundtrip() -> Result<()> {
 
     let result = agent
         .prompt_typed::<WeatherResponse>("Hello, whats the weather in London?")
-        .add_hook(hook)
         .await;
 
     println!("prompt_typed result: {result:#?}");
