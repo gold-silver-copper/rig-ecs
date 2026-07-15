@@ -17,10 +17,13 @@ Most examples expect provider API keys in the environment (e.g. `OPENAI_API_KEY`
 | `agent_parallelization` | See source. |
 | `agent_prompt_chaining` | Demonstrates prompt chaining with two agents in sequence. |
 | `agent_routing` | Demonstrates routing one prompt into different follow-up prompts. |
+| `agent_run_stepping` | Demonstrates ECS run stepping, all pause modes, cancellation, checkpointing, and resume. |
 | `agent_stream_chat` | Demonstrates `stream_chat` with prior conversation history. |
 | `agent_with_agent_tool` | See source. |
+| `agent_with_approval_policy` | Demonstrates an ECS tool-call approval policy. |
 | `agent_with_context` | Demonstrates adding small context documents directly to an agent. |
 | `agent_with_default_max_turns` | Demonstrates extending the default agent loop budget for tool-heavy prompts. |
+| `agent_with_durable_approval` | Demonstrates approval operations that survive active-run checkpoint and restoration. |
 | `agent_with_echochambers` | See source. |
 | `agent_with_human_in_the_loop` | Demonstrates fail-closed human approval before submitting a run, followed by an ECS policy gate. |
 | `agent_with_loaders` | Demonstrates loading real example files into agent context. |
@@ -37,12 +40,15 @@ Most examples expect provider API keys in the environment (e.g. `OPENAI_API_KEY`
 | `discord_bot` | See source. |
 | `enum_dispatch` | See source. |
 | `extractor` | Demonstrates typed extraction and extraction with usage metadata. |
+| `force_tool_first_turn` | Demonstrates ordered request/tool policy that forces an initial tool call. |
 | `gemini_deep_research` | See source. |
+| `gemini_default_api_recovery` | Demonstrates ECS-native invalid-tool repair and retry with Gemini. |
 | `gemini_extractor_with_rag` | See source. |
 | `gemini_nanobanana_image_generation` | See source. |
 | `gemini_stream_kill_token_count` | Live Gemini example: obtaining a token-count estimate when a streaming |
 | `gemini_video_understanding` | Demonstrates Gemini video understanding with provider-specific request parameters. |
 | `multi_agent` | See source. |
+| `manual_tool_calls` | Demonstrates manually coordinating model and tool effects through ECS operations. |
 | `multi_extract` | Demonstrates fan-out structured extraction with `try_parallel!`. |
 | `multi_turn_agent_extended` | See source. |
 | `multi_turn_agent` | See source. |
@@ -57,7 +63,9 @@ Most examples expect provider API keys in the environment (e.g. `OPENAI_API_KEY`
 | `reasoning_loop` | See source. |
 | `request_hook` | Demonstrates ECS-native ordered policy and immutable request configuration. |
 | `reqwest_middleware` | Demonstrates supplying a custom reqwest client with retry middleware. |
+| `rmcp` | Demonstrates MCP discovery and execution through ECS capability entities. |
 | `sentiment_classifier` | Demonstrates the smallest typed extractor for classification. |
+| `tool_result_outcomes` | Demonstrates tool argument rewrite, skip, result redaction, and stop policies. |
 | `transcription` | See source. |
 | `vector_search_cohere` | Demonstrates vector search with separate Cohere document and query embeddings. |
 | `vector_search_ollama` | Demonstrates vector search against a local Ollama embedding model. |

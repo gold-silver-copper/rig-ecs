@@ -7,6 +7,7 @@ More information about this crate can be found in the [crate documentation](http
 - [Rig](#rig)
   - [Table of contents](#table-of-contents)
   - [High-level features](#high-level-features)
+  - [Bevy ECS runtime](#bevy-ecs-runtime)
   - [Installation](#installation)
   - [Simple example:](#simple-example)
   - [Integrations](#integrations)
@@ -21,6 +22,21 @@ More information about this crate can be found in the [crate documentation](http
 - Support for transcription, audio generation and image generation model capabilities
 - Integrate LLMs in your app with minimal boilerplate
 - Full WASM compatibility (core library only)
+
+## Bevy ECS runtime
+
+Agent execution is owned by one Bevy ECS `World` and the public
+`runtime::RigSchedule`. Blocking and streaming facades drive that same schedule;
+runs, operations, tools, stores, policies, and durable evaluations remain
+queryable ECS state. Extensions can install native bundles and observers with
+`RigExtension`, order systems at the public `RigSet` boundaries, or resolve
+operation ownership with the read-only `RigOperationContext` system parameter.
+
+See the repository's `ECS_MIGRATION.md` for the hook-to-policy map, pause and
+child-run semantics, snapshot format, lifecycle diagram, example inventory, and
+verification contract. `crates/rig-core/examples/ecs_runtime.rs` demonstrates a
+standalone world; `ecs_extension.rs` demonstrates embedding the schedule in an
+existing world.
 
 ## Installation
 ```bash

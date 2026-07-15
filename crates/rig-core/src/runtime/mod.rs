@@ -28,6 +28,7 @@ use bevy_ecs::{
     prelude::*,
     relationship::Relationship,
     schedule::{IntoScheduleConfigs, LogLevel, Schedule, ScheduleBuildSettings, ScheduleLabel},
+    system::SystemParam,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -676,6 +677,327 @@ impl RequestPatch {
     }
 }
 
+/// Native bundle shared by the ergonomic policy bundles below.
+#[derive(Bundle, Clone, Debug)]
+pub struct PolicyEntityBundle {
+    /// Persistent policy identity.
+    pub id: StableId,
+    /// Tenant boundary shared with the governed agent.
+    pub tenant: TenantId,
+    /// Immutable ordered policy data.
+    pub policy: Policy,
+    /// Admission state for future evaluations.
+    pub status: PolicyStatus,
+    /// Agent governed by this policy entity.
+    pub policy_for: PolicyFor,
+}
+
+impl PolicyEntityBundle {
+    fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        rule: PolicyRule,
+    ) -> Self {
+        Self {
+            id,
+            tenant,
+            policy: Policy {
+                order,
+                revision,
+                rule,
+            },
+            status: PolicyStatus::Enabled,
+            policy_for: PolicyFor(agent),
+        }
+    }
+}
+
+macro_rules! policy_bundle {
+    ($name:ident, $docs:literal) => {
+        #[doc = $docs]
+        #[derive(Bundle, Clone, Debug)]
+        pub struct $name {
+            /// Native policy entity components.
+            pub policy: PolicyEntityBundle,
+        }
+
+        impl RigExtension for $name {
+            fn install(&self, world: &mut World) -> Result<(), ExtensionInstallError> {
+                install_policy_extension(world, self.policy.clone())
+            }
+        }
+    };
+}
+
+policy_bundle!(
+    RequestPatchPolicyBundle,
+    "An ordered, non-sticky completion-request patch policy."
+);
+
+impl RequestPatchPolicyBundle {
+    /// Creates a request-patch policy related to `agent`.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        patch: RequestPatch,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::PatchRequest(patch),
+            ),
+        }
+    }
+}
+
+policy_bundle!(
+    ToolApprovalPolicyBundle,
+    "An asynchronous approval policy evaluated before tool dispatch."
+);
+
+impl ToolApprovalPolicyBundle {
+    /// Creates a tool-call approval policy related to `agent`.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::RequireApproval {
+                    point: PolicyPoint::ToolCall,
+                    prompt: prompt.into(),
+                },
+            ),
+        }
+    }
+}
+
+policy_bundle!(
+    ToolArgumentRewritePolicyBundle,
+    "An ordered tool-argument rewrite policy."
+);
+
+impl ToolArgumentRewritePolicyBundle {
+    /// Creates an argument rewrite for one named tool or every tool when `tool` is `None`.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        tool: Option<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::RewriteToolArguments { tool, arguments },
+            ),
+        }
+    }
+}
+
+policy_bundle!(
+    ToolSkipPolicyBundle,
+    "A policy that skips matching tool calls."
+);
+
+impl ToolSkipPolicyBundle {
+    /// Creates a model-visible skip policy for one named tool or every tool.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        tool: Option<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::SkipToolCall {
+                    tool,
+                    reason: reason.into(),
+                },
+            ),
+        }
+    }
+}
+
+policy_bundle!(
+    ToolResultRedactionPolicyBundle,
+    "A policy that rewrites model-visible tool output while preserving raw audit data."
+);
+
+impl ToolResultRedactionPolicyBundle {
+    /// Creates a result-presentation rewrite for one named tool or every tool.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        tool: Option<String>,
+        presentation: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::RewriteToolResult {
+                    tool,
+                    presentation: presentation.into(),
+                },
+            ),
+        }
+    }
+}
+
+policy_bundle!(
+    InvalidToolRepairPolicyBundle,
+    "A policy that repairs a model-emitted tool name against the accepted snapshot."
+);
+
+impl InvalidToolRepairPolicyBundle {
+    /// Creates an invalid-tool repair policy.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        from: Option<String>,
+        to: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::RepairInvalidTool {
+                    from,
+                    to: to.into(),
+                },
+            ),
+        }
+    }
+}
+
+policy_bundle!(
+    InvalidToolRetryPolicyBundle,
+    "A policy that feeds an invalid call back to the model under explicit budgets."
+);
+
+impl InvalidToolRetryPolicyBundle {
+    /// Creates an invalid-tool retry policy.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        tool: Option<String>,
+        feedback: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::RetryInvalidTool {
+                    tool,
+                    feedback: feedback.into(),
+                },
+            ),
+        }
+    }
+}
+
+/// Extension installation failure that leaves the existing world unchanged.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ExtensionInstallError {
+    /// The world has not had [`install_runtime`] applied.
+    #[error("Rig runtime is not installed in this world")]
+    RuntimeNotInstalled,
+    /// The policy stable identity already exists.
+    #[error("duplicate stable id `{0}`")]
+    DuplicateStableId(String),
+    /// The target is not a live agent entity.
+    #[error("policy target {0:?} is not a live agent")]
+    StaleAgent(Entity),
+    /// Policy and agent tenant scopes differ.
+    #[error("policy and target agent cross tenant scope")]
+    TenantMismatch,
+}
+
+/// Thin installer for extensions composed exclusively from Bevy ECS primitives.
+pub trait RigExtension {
+    /// Installs components, bundles, observers, systems, resources, or schedule configuration.
+    fn install(&self, world: &mut World) -> Result<(), ExtensionInstallError>;
+}
+
+fn install_policy_extension(
+    world: &mut World,
+    bundle: PolicyEntityBundle,
+) -> Result<(), ExtensionInstallError> {
+    if !world.contains_resource::<RuntimeIdentity>() {
+        return Err(ExtensionInstallError::RuntimeNotInstalled);
+    }
+    let mut identities = world.query::<&StableId>();
+    if identities.iter(world).any(|id| id == &bundle.id) {
+        return Err(ExtensionInstallError::DuplicateStableId(
+            bundle.id.as_str().to_owned(),
+        ));
+    }
+    let agent = bundle.policy_for.get();
+    let Some(agent_tenant) = world.get::<TenantId>(agent) else {
+        return Err(ExtensionInstallError::StaleAgent(agent));
+    };
+    if world.get::<Agent>(agent).is_none() {
+        return Err(ExtensionInstallError::StaleAgent(agent));
+    }
+    if agent_tenant != &bundle.tenant {
+        return Err(ExtensionInstallError::TenantMismatch);
+    }
+    world.spawn(bundle);
+    Ok(())
+}
+
 /// Typed result returned by a request-policy observer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestPolicyDecision {
@@ -812,6 +1134,8 @@ pub struct RequestPolicyEvaluation {
     pub cursor: usize,
     /// Effective request visible to the next policy.
     pub effective: ModelEffectInput,
+    /// Deterministically reduced operation-local patch retained for audit and resume.
+    pub accumulated: RequestPatch,
     /// Authoritative evaluation phase.
     pub phase: RequestPolicyEvaluationPhase,
 }
@@ -1548,6 +1872,19 @@ pub struct InvalidToolCallBudget {
     pub max_retries: u32,
 }
 
+/// Per-agent structured-output retry budget snapshotted onto admitted runs.
+#[derive(Component, Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StructuredOutputRetryBudget {
+    /// Maximum corrective model retries after schema validation fails.
+    pub max_retries: u32,
+}
+
+impl Default for StructuredOutputRetryBudget {
+    fn default() -> Self {
+        Self { max_retries: 1 }
+    }
+}
+
 /// A run's authoritative input and committed transcript.
 #[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunRecord {
@@ -1573,6 +1910,12 @@ pub struct RunRecord {
     pub invalid_tool_call_retries: u32,
     /// Immutable retry budget accepted when the run was admitted.
     pub max_invalid_tool_call_retries: u32,
+    /// Structured-output retries already consumed since the last real tool batch.
+    #[serde(default)]
+    pub structured_output_retries: u32,
+    /// Immutable structured-output retry budget accepted when the run was admitted.
+    #[serde(default = "default_structured_output_retries")]
+    pub max_structured_output_retries: u32,
     /// Optional stable conversation identity.
     pub conversation: Option<StableId>,
     /// Prevents repeated memory resolution/load.
@@ -1587,6 +1930,89 @@ pub struct RunRecord {
     pub retrieved_documents: Vec<RetrievedDocument>,
     /// Output retained while required persistence settles.
     pub pending_output: Option<RunOutput>,
+    /// Most recently committed logical batch forwarded to the next model operation.
+    #[serde(default)]
+    pub pending_tool_results: Vec<ToolEffectOutput>,
+}
+
+const fn default_structured_output_retries() -> u32 {
+    1
+}
+
+/// Agent-local lifecycle counters updated by observe-only ECS observers.
+#[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LifecycleTelemetry {
+    /// Immutable model requests finalized for dispatch.
+    pub requests_prepared: u64,
+    /// Model turns committed to run history.
+    pub model_turns_committed: u64,
+    /// Atomic tool batches committed to run history.
+    pub tool_batches_committed: u64,
+    /// Runs completing successfully.
+    pub runs_completed: u64,
+    /// Runs ending in failure.
+    pub runs_failed: u64,
+    /// Runs ending through cancellation.
+    pub runs_cancelled: u64,
+}
+
+/// Bundle inserted on an agent to opt into built-in lifecycle counters.
+#[derive(Bundle, Clone, Copy, Debug, Default)]
+pub struct LifecycleTelemetryBundle {
+    /// Queryable telemetry state owned by the agent entity.
+    pub telemetry: LifecycleTelemetry,
+}
+
+/// Owned operation context resolved by [`RigOperationContext`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedOperationContext {
+    /// Operation being resolved.
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Reusable agent definition.
+    pub agent: Entity,
+    /// Stable run identity.
+    pub run_id: StableId,
+    /// Stable agent identity.
+    pub agent_id: StableId,
+    /// Shared tenant boundary.
+    pub tenant: TenantId,
+    /// Human-readable agent name, when configured.
+    pub agent_name: Option<String>,
+}
+
+/// Read-only system parameter resolving operation → run → agent ownership.
+///
+/// The helper returns owned metadata so extensions cannot retain ECS borrows
+/// across asynchronous work.
+#[derive(SystemParam)]
+pub struct RigOperationContext<'w, 's> {
+    operations: Query<'w, 's, &'static OperationOf>,
+    runs: Query<'w, 's, (&'static RunOf, &'static StableId, &'static TenantId)>,
+    agents: Query<'w, 's, (&'static Agent, &'static StableId, &'static TenantId)>,
+}
+
+impl RigOperationContext<'_, '_> {
+    /// Resolves complete ownership context when every relationship is live and tenant-safe.
+    pub fn resolve(&self, operation: Entity) -> Option<ResolvedOperationContext> {
+        let run = self.operations.get(operation).ok()?.get();
+        let (run_of, run_id, run_tenant) = self.runs.get(run).ok()?;
+        let agent = run_of.get();
+        let (agent_config, agent_id, agent_tenant) = self.agents.get(agent).ok()?;
+        if run_tenant != agent_tenant {
+            return None;
+        }
+        Some(ResolvedOperationContext {
+            operation,
+            run,
+            agent,
+            run_id: run_id.clone(),
+            agent_id: agent_id.clone(),
+            tenant: run_tenant.clone(),
+            agent_name: agent_config.name.clone(),
+        })
+    }
 }
 
 /// Canonical transcript entry.
@@ -1626,6 +2052,9 @@ pub enum TranscriptEntry {
         raw: serde_json::Value,
         /// Presentation returned to the next model call.
         content: String,
+        /// Whether policy requires the presentation to replace rich raw content.
+        #[serde(default)]
+        presentation_overrides_raw: bool,
     },
     /// Deterministically reduced terminal child-run outcome.
     ChildResult {
@@ -3399,6 +3828,9 @@ pub struct PersistedAgent {
     pub control: AgentControl,
     /// Optional invalid-tool retry configuration for future runs.
     pub invalid_tool_call_budget: Option<InvalidToolCallBudget>,
+    /// Optional structured-output retry budget for future runs.
+    #[serde(default)]
+    pub structured_output_retry_budget: Option<StructuredOutputRetryBudget>,
     /// Stable model identity remapped during loading.
     pub model_id: StableId,
     /// Optional structured-output configuration.
@@ -3548,6 +3980,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
         &Agent,
         Option<&AgentControl>,
         Option<&InvalidToolCallBudget>,
+        Option<&StructuredOutputRetryBudget>,
         &UsesModel,
         Option<&OutputRequirement>,
         Option<&RetrievalRequirement>,
@@ -3562,6 +3995,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
                 agent,
                 control,
                 invalid_tool_call_budget,
+                structured_output_retry_budget,
                 model,
                 output_requirement,
                 retrieval_requirement,
@@ -3578,6 +4012,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
                         agent: agent.clone(),
                         control: control.copied().unwrap_or_default(),
                         invalid_tool_call_budget: invalid_tool_call_budget.copied(),
+                        structured_output_retry_budget: structured_output_retry_budget.copied(),
                         model_id,
                         output_requirement: output_requirement.cloned(),
                         retrieval_requirement: retrieval_requirement.cloned(),
@@ -3975,6 +4410,9 @@ pub fn restore_domain(
         if let Some(invalid_tool_call_budget) = record.invalid_tool_call_budget {
             entity.insert(invalid_tool_call_budget);
         }
+        if let Some(structured_output_retry_budget) = record.structured_output_retry_budget {
+            entity.insert(structured_output_retry_budget);
+        }
         if let Some(retrieval_requirement) = record.retrieval_requirement {
             entity.insert(retrieval_requirement);
         }
@@ -4060,6 +4498,84 @@ fn mapped_reference(
         .ok_or_else(|| PersistenceError::MissingReference(id.as_str().to_owned()))
 }
 
+fn count_prepared_request(
+    event: On<CompletionRequestPrepared>,
+    runs: Query<&RunOf>,
+    mut agents: Query<&mut LifecycleTelemetry>,
+) {
+    let Ok(run_of) = runs.get(event.run) else {
+        return;
+    };
+    if let Ok(mut telemetry) = agents.get_mut(run_of.get()) {
+        telemetry.requests_prepared = telemetry.requests_prepared.saturating_add(1);
+    }
+}
+
+fn count_committed_model_turn(
+    event: On<ModelTurnFinished>,
+    runs: Query<&RunOf>,
+    mut agents: Query<&mut LifecycleTelemetry>,
+) {
+    let Ok(run_of) = runs.get(event.run) else {
+        return;
+    };
+    if let Ok(mut telemetry) = agents.get_mut(run_of.get()) {
+        telemetry.model_turns_committed = telemetry.model_turns_committed.saturating_add(1);
+    }
+}
+
+fn count_committed_tool_batch(
+    event: On<ToolBatchCommitted>,
+    runs: Query<&RunOf>,
+    mut agents: Query<&mut LifecycleTelemetry>,
+) {
+    let Ok(run_of) = runs.get(event.run) else {
+        return;
+    };
+    if let Ok(mut telemetry) = agents.get_mut(run_of.get()) {
+        telemetry.tool_batches_committed = telemetry.tool_batches_committed.saturating_add(1);
+    }
+}
+
+fn count_completed_run(
+    event: On<RunCompleted>,
+    runs: Query<&RunOf>,
+    mut agents: Query<&mut LifecycleTelemetry>,
+) {
+    let Ok(run_of) = runs.get(event.run) else {
+        return;
+    };
+    if let Ok(mut telemetry) = agents.get_mut(run_of.get()) {
+        telemetry.runs_completed = telemetry.runs_completed.saturating_add(1);
+    }
+}
+
+fn count_failed_run(
+    event: On<RunFailed>,
+    runs: Query<&RunOf>,
+    mut agents: Query<&mut LifecycleTelemetry>,
+) {
+    let Ok(run_of) = runs.get(event.run) else {
+        return;
+    };
+    if let Ok(mut telemetry) = agents.get_mut(run_of.get()) {
+        telemetry.runs_failed = telemetry.runs_failed.saturating_add(1);
+    }
+}
+
+fn count_cancelled_run(
+    event: On<RunCancelled>,
+    runs: Query<&RunOf>,
+    mut agents: Query<&mut LifecycleTelemetry>,
+) {
+    let Ok(run_of) = runs.get(event.run) else {
+        return;
+    };
+    if let Ok(mut telemetry) = agents.get_mut(run_of.get()) {
+        telemetry.runs_cancelled = telemetry.runs_cancelled.saturating_add(1);
+    }
+}
+
 /// Installs Rig's resources and world-resident schedule into an existing world.
 pub fn install_runtime(
     world: &mut World,
@@ -4110,6 +4626,12 @@ pub fn install_runtime_with_waker(
     world.insert_resource(waker.clone());
     world.insert_resource(Messages::<EffectIngressMessage>::default());
     world.add_observer(bind_builtin_policy_observer);
+    world.add_observer(count_prepared_request);
+    world.add_observer(count_committed_model_turn);
+    world.add_observer(count_committed_tool_batch);
+    world.add_observer(count_completed_run);
+    world.add_observer(count_failed_run);
+    world.add_observer(count_cancelled_run);
 
     let mut schedule = Schedule::new(RigSchedule);
     schedule.set_build_settings(ScheduleBuildSettings {
@@ -4328,6 +4850,14 @@ impl Runtime {
         &mut self.world
     }
 
+    /// Installs a thin ECS extension into this runtime's authoritative world.
+    pub fn install_extension(
+        &mut self,
+        extension: &impl RigExtension,
+    ) -> Result<(), ExtensionInstallError> {
+        extension.install(&mut self.world)
+    }
+
     /// Runs one schedule pass.
     pub fn update(&mut self) {
         self.world.run_schedule(RigSchedule);
@@ -4440,6 +4970,28 @@ impl Runtime {
             return Err(SpawnError::StaleEntity(agent.entity));
         }
         entity.insert(requirement);
+        if !entity.contains::<StructuredOutputRetryBudget>() {
+            entity.insert(StructuredOutputRetryBudget::default());
+        }
+        Ok(())
+    }
+
+    /// Sets the structured-output retry budget accepted by future runs.
+    pub fn set_structured_output_retry_budget(
+        &mut self,
+        agent: AgentHandle,
+        max_retries: u32,
+    ) -> Result<(), SpawnError> {
+        if agent.runtime_id != self.handle.runtime_id {
+            return Err(SpawnError::ForeignRuntime);
+        }
+        let Some(mut entity) = self.world.get_entity_mut(agent.entity).ok() else {
+            return Err(SpawnError::StaleEntity(agent.entity));
+        };
+        if !entity.contains::<Agent>() {
+            return Err(SpawnError::StaleEntity(agent.entity));
+        }
+        entity.insert(StructuredOutputRetryBudget { max_retries });
         Ok(())
     }
 
@@ -4753,6 +5305,18 @@ fn advance_runtime_clock(mut clock: ResMut<RuntimeClock>) {
     clock.tick = clock.tick.saturating_add(1);
 }
 
+type IngestAgents<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        &'static TenantId,
+        &'static Agent,
+        Option<&'static InvalidToolCallBudget>,
+        Option<&'static StructuredOutputRetryBudget>,
+        Option<&'static mut AgentControl>,
+    ),
+>;
+
 // Bevy system parameters are independently borrow-checked runtime inputs; grouping
 // them would obscure their access pattern without reducing system complexity.
 #[allow(clippy::too_many_arguments)]
@@ -4762,12 +5326,7 @@ fn ingest_commands(
     runtime: Res<RuntimeIdentity>,
     identities: Query<&StableId>,
     models: Query<(Entity, &StableId, &TenantId), With<ModelCapability>>,
-    mut agents: Query<(
-        &TenantId,
-        &Agent,
-        Option<&InvalidToolCallBudget>,
-        Option<&mut AgentControl>,
-    )>,
+    mut agents: IngestAgents<'_, '_>,
     mut runs: Query<(
         &StableId,
         &mut RunState,
@@ -4852,6 +5411,8 @@ fn ingest_commands(
                     streaming,
                     invalid_tool_call_retries: 0,
                     max_invalid_tool_call_retries: 0,
+                    structured_output_retries: 0,
+                    max_structured_output_retries: default_structured_output_retries(),
                     conversation,
                     memory_loaded: false,
                     memory_store: None,
@@ -4859,15 +5420,20 @@ fn ingest_commands(
                     retrieval_store: None,
                     retrieved_documents: Vec::new(),
                     pending_output: None,
+                    pending_tool_results: Vec::new(),
                 };
                 let run = match agents.get_mut(agent) {
-                    Ok((tenant, _, invalid_budget, control))
+                    Ok((tenant, _, invalid_budget, output_retry_budget, control))
                         if control
                             .as_deref()
                             .is_none_or(|control| matches!(control, AgentControl::Running)) =>
                     {
                         record.max_invalid_tool_call_retries =
                             invalid_budget.map_or(0, |budget| budget.max_retries);
+                        record.max_structured_output_retries = output_retry_budget
+                            .map_or_else(default_structured_output_retries, |budget| {
+                                budget.max_retries
+                            });
                         commands
                             .spawn((
                                 run_id,
@@ -4879,7 +5445,7 @@ fn ingest_commands(
                             ))
                             .id()
                     }
-                    Ok((tenant, _, _, _)) => commands
+                    Ok((tenant, _, _, _, _)) => commands
                         .spawn((
                             run_id,
                             tenant.clone(),
@@ -4955,7 +5521,7 @@ fn ingest_commands(
                 }
             }
             Ok(RuntimeCommand::SetAgentControl { agent, control }) => {
-                if let Ok((_, _, _, existing)) = agents.get_mut(agent)
+                if let Ok((_, _, _, _, existing)) = agents.get_mut(agent)
                     && let Some(mut existing) = existing
                     && *existing != control
                 {
@@ -5460,7 +6026,7 @@ fn prepare_model_operations(
             &TenantId,
             &RunOf,
             &RunControl,
-            &RunRecord,
+            &mut RunRecord,
             &mut RunState,
         ),
         Without<WaitingForChildren>,
@@ -5477,7 +6043,7 @@ fn prepare_model_operations(
     tools: Query<(&StableId, &TenantId, &ToolCapability)>,
     mut progress: ResMut<Progress>,
 ) {
-    for (run_entity, run_tenant, run_of, control, record, mut run_state) in &mut runs {
+    for (run_entity, run_tenant, run_of, control, mut record, mut run_state) in &mut runs {
         if !matches!(*control, RunControl::Running)
             || !matches!(*run_state, RunState::Queued)
             || !record.memory_loaded
@@ -5579,6 +6145,7 @@ fn prepare_model_operations(
             .collect::<Vec<_>>();
         let mut documents = agent.documents.clone();
         documents.extend(record.retrieved_documents.iter().cloned());
+        let tool_results = std::mem::take(&mut record.pending_tool_results);
         let operation = commands
             .spawn((
                 OperationOf(run_entity),
@@ -5605,7 +6172,7 @@ fn prepare_model_operations(
                     prompt: record.prompt.clone(),
                     history: record.transcript.clone(),
                     tools,
-                    tool_results: Vec::new(),
+                    tool_results,
                     output_schema: record
                         .output_schema
                         .clone()
@@ -5687,6 +6254,7 @@ fn initialize_request_policy_evaluations(
                     policies: snapshot,
                     cursor: 0,
                     effective: pending.0.clone(),
+                    accumulated: RequestPatch::default(),
                     phase: RequestPolicyEvaluationPhase::Evaluating,
                 },
             ));
@@ -5980,7 +6548,7 @@ fn apply_builtin_text_delta_policy(
     });
 }
 
-fn merge_request_patch(input: &mut ModelEffectInput, patch: RequestPatch) {
+fn apply_request_patch(input: &mut ModelEffectInput, patch: RequestPatch) {
     if let Some(instructions) = patch.instructions {
         input.instructions = instructions;
     }
@@ -6010,6 +6578,60 @@ fn merge_request_patch(input: &mut ModelEffectInput, patch: RequestPatch) {
     if let Some(history) = patch.history {
         input.history = history;
     }
+}
+
+fn reduce_request_patch(
+    input: &mut ModelEffectInput,
+    accumulated: &mut RequestPatch,
+    patch: RequestPatch,
+    policy: &StableId,
+) {
+    macro_rules! replace_last_writer {
+        ($field:ident) => {
+            if let Some(value) = patch.$field.clone() {
+                if accumulated.$field.is_some() {
+                    tracing::warn!(
+                        policy = policy.as_str(),
+                        field = stringify!($field),
+                        "multiple request policies set a last-writer-wins field"
+                    );
+                }
+                accumulated.$field = Some(value);
+            }
+        };
+    }
+
+    replace_last_writer!(instructions);
+    replace_last_writer!(temperature_bits);
+    replace_last_writer!(max_tokens);
+    replace_last_writer!(tool_choice);
+    replace_last_writer!(history);
+
+    if let Some(active_tools) = patch.active_tools.clone() {
+        accumulated.active_tools = Some(match accumulated.active_tools.take() {
+            Some(existing) => {
+                let active = active_tools.into_iter().collect::<HashSet<_>>();
+                existing
+                    .into_iter()
+                    .filter(|tool| active.contains(tool))
+                    .collect()
+            }
+            None => active_tools,
+        });
+    }
+    if let Some(patch_params) = patch.additional_params.clone() {
+        accumulated.additional_params = match (accumulated.additional_params.take(), patch_params) {
+            (Some(serde_json::Value::Object(mut base)), serde_json::Value::Object(patch)) => {
+                base.extend(patch);
+                Some(serde_json::Value::Object(base))
+            }
+            (_, replacement) => Some(replacement),
+        };
+    }
+    accumulated
+        .extra_context
+        .extend(patch.extra_context.iter().cloned());
+    apply_request_patch(input, patch);
 }
 
 fn begin_policy_approval(
@@ -6112,7 +6734,14 @@ fn evaluate_request_policies(world: &mut World) {
                 if let Some(mut evaluation) =
                     world.get_mut::<RequestPolicyEvaluation>(evaluation_entity)
                 {
-                    merge_request_patch(&mut evaluation.effective, patch);
+                    let mut effective = evaluation.effective.clone();
+                    reduce_request_patch(
+                        &mut effective,
+                        &mut evaluation.accumulated,
+                        patch,
+                        &policy.id,
+                    );
+                    evaluation.effective = effective;
                     evaluation.cursor += 1;
                 }
             }
@@ -8614,9 +9243,10 @@ fn commit_model_operations(
         With<ModelEffectInput>,
     >,
     mut runs: Query<
-        (&mut RunState, &mut RunRecord, Option<&RunControl>),
+        (&RunOf, &mut RunState, &mut RunRecord, Option<&RunControl>),
         Without<WaitingForChildren>,
     >,
+    agents: Query<&Agent>,
     mut progress: ResMut<Progress>,
 ) {
     for (
@@ -8634,7 +9264,8 @@ fn commit_model_operations(
         let OperationPhase::Settled(outcome) = &operation.phase else {
             continue;
         };
-        let Ok((mut run_state, mut record, control)) = runs.get_mut(operation_of.get()) else {
+        let Ok((run_of, mut run_state, mut record, control)) = runs.get_mut(operation_of.get())
+        else {
             continue;
         };
         if !control_allows_internal_progress(control) {
@@ -8741,7 +9372,23 @@ fn commit_model_operations(
                         && let Some(schema) = &input.output_schema
                         && let Err(error) = validate_structured_output(schema, &terminal_text)
                     {
-                        *run_state = RunState::Failed(error);
+                        let model_call_limit = record.max_model_calls.unwrap_or_else(|| {
+                            agents
+                                .get(run_of.get())
+                                .map_or(u32::MAX, |agent| agent.max_model_calls)
+                        });
+                        if record.structured_output_retries < record.max_structured_output_retries
+                            && record.next_turn < model_call_limit
+                        {
+                            record.structured_output_retries =
+                                record.structured_output_retries.saturating_add(1);
+                            record.transcript.push(TranscriptEntry::User(format!(
+                                "The previous response did not satisfy the required output schema: {error}. Return a corrected structured response that satisfies every schema constraint."
+                            )));
+                            *run_state = RunState::Queued;
+                        } else {
+                            *run_state = RunState::Failed(error);
+                        }
                         mark_progress(&mut progress);
                         continue;
                     }
@@ -8775,6 +9422,7 @@ fn commit_model_operations(
                         *run_state = RunState::Completed(final_output);
                     }
                 } else {
+                    record.structured_output_retries = 0;
                     let mut prepared = Vec::with_capacity(output.tool_calls.len());
                     for (index, call) in output.tool_calls.iter().enumerate() {
                         let index = u32::try_from(index).unwrap_or(u32::MAX);
@@ -8893,7 +9541,6 @@ fn commit_tool_batches(
         Option<&EffectiveToolOutput>,
         Option<&ToolResultPolicyDone>,
     )>,
-    source_models: Query<&ModelEffectInput>,
     agents: Query<&Agent>,
     mut runs: Query<
         (&RunOf, &mut RunState, &mut RunRecord, Option<&RunControl>),
@@ -8967,9 +9614,14 @@ fn commit_tool_batches(
                 mark_progress(&mut progress);
                 continue 'batches;
             }
-            results.push(effective.map_or_else(|| output.clone(), |effective| effective.0.clone()));
+            let presentation_overrides_raw =
+                effective.is_some_and(|effective| effective.0.presentation != output.presentation);
+            results.push((
+                effective.map_or_else(|| output.clone(), |effective| effective.0.clone()),
+                presentation_overrides_raw,
+            ));
         }
-        for result in &results {
+        for (result, presentation_overrides_raw) in &results {
             record.transcript.push(TranscriptEntry::ToolResult {
                 call_id: result.call_id.clone(),
                 provider_result_id: result.provider_result_id.clone(),
@@ -8977,21 +9629,19 @@ fn commit_tool_batches(
                 name: result.name.clone(),
                 raw: result.raw.clone(),
                 content: result.presentation.clone(),
+                presentation_overrides_raw: *presentation_overrides_raw,
             });
         }
-        let Ok(source_input) = source_models.get(batch.source_model_operation) else {
-            *run_state = RunState::Failed(CanonicalError::StaleEntity(
-                "source model operation".to_owned(),
-            ));
-            batch.committed = true;
-            mark_progress(&mut progress);
-            continue;
-        };
+        let results = results
+            .into_iter()
+            .map(|(result, _)| result)
+            .collect::<Vec<_>>();
         commands.trigger(ToolBatchCommitted {
             batch: batch_entity,
             run: batch_of.get(),
             results: results.clone(),
         });
+        record.pending_tool_results = results;
         let Some(model_call_limit) = agents
             .get(run_of.get())
             .ok()
@@ -9010,28 +9660,7 @@ fn commit_tool_batches(
             mark_progress(&mut progress);
             continue;
         }
-        let mut next_input = source_input.clone();
-        next_input.history = record.transcript.clone();
-        next_input.tool_results = results;
-        let next_operation = commands
-            .spawn((
-                OperationOf(batch_of.get()),
-                OperationKind::Model,
-                ModelStreamState {
-                    streaming: record.streaming,
-                    ..ModelStreamState::default()
-                },
-                OperationState {
-                    generation: 0,
-                    phase: OperationPhase::Prepared,
-                },
-                next_input.decision.clone(),
-                PendingModelRequest(next_input),
-            ))
-            .id();
-        *run_state = RunState::WaitingModel {
-            operation: next_operation,
-        };
+        *run_state = RunState::Queued;
         batch.committed = true;
         mark_progress(&mut progress);
     }
@@ -9071,6 +9700,33 @@ mod tests {
 
     #[derive(Resource, Default)]
     struct LifecycleLog(Vec<&'static str>);
+
+    #[derive(Resource, Default)]
+    struct CapturedOperationContext(Option<ResolvedOperationContext>);
+
+    #[derive(Component)]
+    #[require(LifecycleRequired)]
+    struct LifecycleProbe(u32);
+
+    #[derive(Component, Default)]
+    struct LifecycleRequired;
+
+    #[derive(Component)]
+    struct DeferredLifecycleMarker;
+
+    #[derive(Resource, Default)]
+    struct ComponentLifecycleLog(Vec<&'static str>);
+
+    fn capture_operation_context(
+        context: RigOperationContext<'_, '_>,
+        operations: Query<Entity, With<ModelEffectInput>>,
+        mut captured: ResMut<CapturedOperationContext>,
+    ) {
+        captured.0 = operations
+            .iter()
+            .next()
+            .and_then(|operation| context.resolve(operation));
+    }
 
     macro_rules! record_lifecycle_event {
         ($function:ident, $event:ty, $name:literal) => {
@@ -9638,6 +10294,52 @@ mod tests {
             .unwrap();
         runtime.run_until_stalled().unwrap();
         let second_run = runtime.resolve_run(&second_pending).unwrap();
+        let retry = runtime.effects().try_recv().unwrap().unwrap();
+        assert_ne!(retry.operation, second.operation);
+        let retry_input = retry.model_input().unwrap();
+        assert!(retry_input.history.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::User(feedback)
+                if feedback.contains("did not satisfy the required output schema")
+        )));
+        let retry_record = runtime
+            .world()
+            .get::<RunRecord>(second_run.entity())
+            .unwrap();
+        assert_eq!(retry_record.structured_output_retries, 1);
+        assert_eq!(retry_record.max_structured_output_retries, 1);
+        runtime
+            .handle()
+            .pause_with_mode(second_run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let checkpoint = runtime.snapshot_active_run(second_run).unwrap();
+        let checkpoint_record = &checkpoint
+            .runs
+            .iter()
+            .find(|run| run.id == *second_pending.stable_id())
+            .unwrap()
+            .record;
+        assert_eq!(checkpoint_record.structured_output_retries, 1);
+        assert_eq!(checkpoint_record.max_structured_output_retries, 1);
+        runtime.handle().resume(second_run).unwrap();
+        runtime.run_until_stalled().unwrap();
+        let retry = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: retry.operation,
+                generation: retry.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: r#"{"old":"still rejected"}"#.to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
         assert!(matches!(
             runtime.world().get::<RunState>(second_run.entity()),
             Some(RunState::Failed(CanonicalError::InvalidStructuredOutput(message)))
@@ -10523,6 +11225,18 @@ mod tests {
                 "z": true
             }))
         );
+        let evaluation = runtime
+            .world()
+            .get::<OperationPolicyEvaluations>(effect.operation)
+            .unwrap()
+            .iter()
+            .find_map(|entity| runtime.world().get::<RequestPolicyEvaluation>(entity))
+            .unwrap();
+        assert_eq!(evaluation.accumulated.instructions.as_deref(), Some("last"));
+        assert_eq!(
+            evaluation.accumulated.additional_params,
+            Some(serde_json::json!({"a": true, "winner": 2, "z": true}))
+        );
         assert_eq!(
             runtime
                 .world()
@@ -10530,6 +11244,107 @@ mod tests {
                 .unwrap()
                 .instructions,
             "baseline"
+        );
+    }
+
+    #[test]
+    fn extension_bundle_telemetry_and_system_param_use_native_ecs_state() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(
+                id("agent"),
+                tenant("a"),
+                Agent {
+                    name: Some("audited".to_owned()),
+                    ..Agent::default()
+                },
+                model,
+            )
+            .unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(agent.entity())
+            .insert(LifecycleTelemetryBundle::default());
+        runtime
+            .install_extension(&RequestPatchPolicyBundle::new(
+                id("request-patch"),
+                tenant("a"),
+                agent.entity(),
+                0,
+                1,
+                RequestPatch::new().instructions("extension-owned"),
+            ))
+            .unwrap();
+
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            request.model_input().unwrap().instructions,
+            "extension-owned"
+        );
+
+        runtime
+            .world_mut()
+            .insert_resource(CapturedOperationContext::default());
+        let mut context_schedule = Schedule::default();
+        context_schedule.add_systems(capture_operation_context);
+        context_schedule.run(runtime.world_mut());
+        let context = runtime
+            .world()
+            .resource::<CapturedOperationContext>()
+            .0
+            .as_ref()
+            .unwrap();
+        assert_eq!(context.operation, request.operation);
+        assert_eq!(context.agent, agent.entity());
+        assert_eq!(context.agent_name.as_deref(), Some("audited"));
+
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "done".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert!(matches!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(RunState::Completed(_))
+        ));
+        assert_eq!(
+            runtime
+                .world()
+                .get::<LifecycleTelemetry>(agent.entity())
+                .copied(),
+            Some(LifecycleTelemetry {
+                requests_prepared: 1,
+                model_turns_committed: 1,
+                tool_batches_committed: 0,
+                runs_completed: 1,
+                runs_failed: 0,
+                runs_cancelled: 0,
+            })
         );
     }
 
@@ -11630,6 +12445,7 @@ mod tests {
                     name: "first".to_owned(),
                     raw: serde_json::json!({"result": 0}),
                     content: "first result".to_owned(),
+                    presentation_overrides_raw: false,
                 },
                 TranscriptEntry::ToolResult {
                     call_id: "call-1".to_owned(),
@@ -11638,6 +12454,7 @@ mod tests {
                     name: "second".to_owned(),
                     raw: serde_json::json!({"result": 1}),
                     content: "second result".to_owned(),
+                    presentation_overrides_raw: false,
                 },
                 TranscriptEntry::Assistant("done".to_owned()),
             ]
@@ -13476,6 +14293,7 @@ mod tests {
                 agent: Agent::default(),
                 control: AgentControl::default(),
                 invalid_tool_call_budget: None,
+                structured_output_retry_budget: None,
                 model_id: id("missing"),
                 output_requirement: None,
                 retrieval_requirement: None,
@@ -13556,6 +14374,114 @@ mod tests {
                     "every conflicting core system pair must have explicit ordering"
                 );
             });
+    }
+
+    #[test]
+    fn component_lifecycle_order_required_components_and_deferred_commands_are_explicit() {
+        let mut world = World::new();
+        world.init_resource::<ComponentLifecycleLog>();
+        world.add_observer(
+            |event: On<Add, LifecycleProbe>,
+             mut log: ResMut<ComponentLifecycleLog>,
+             mut commands: Commands| {
+                log.0.push("add");
+                commands
+                    .entity(event.entity)
+                    .insert(DeferredLifecycleMarker);
+            },
+        );
+        world.add_observer(
+            |_: On<Insert, LifecycleProbe>, mut log: ResMut<ComponentLifecycleLog>| {
+                log.0.push("insert");
+            },
+        );
+        world.add_observer(
+            |_: On<Discard, LifecycleProbe>, mut log: ResMut<ComponentLifecycleLog>| {
+                log.0.push("discard");
+            },
+        );
+        world.add_observer(
+            |_: On<Remove, LifecycleProbe>, mut log: ResMut<ComponentLifecycleLog>| {
+                log.0.push("remove");
+            },
+        );
+        world.add_observer(
+            |_: On<Despawn, LifecycleProbe>, mut log: ResMut<ComponentLifecycleLog>| {
+                log.0.push("despawn");
+            },
+        );
+
+        let entity = world.spawn(LifecycleProbe(1)).id();
+        assert!(world.get::<LifecycleRequired>(entity).is_some());
+        assert!(world.get::<DeferredLifecycleMarker>(entity).is_some());
+        assert_eq!(world.get::<LifecycleProbe>(entity).unwrap().0, 1);
+        world.entity_mut(entity).insert(LifecycleProbe(2));
+        assert_eq!(world.get::<LifecycleProbe>(entity).unwrap().0, 2);
+        world.entity_mut(entity).remove::<LifecycleProbe>();
+        assert!(world.get::<LifecycleProbe>(entity).is_none());
+
+        let despawned = world.spawn(LifecycleProbe(3)).id();
+        world.despawn(despawned);
+        assert_eq!(
+            world.resource::<ComponentLifecycleLog>().0,
+            vec![
+                "add", "insert", "discard", "insert", "discard", "remove", "add", "insert",
+                "despawn", "discard", "remove"
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_heavy_run_does_not_starve_ready_sibling() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let heavy_agent = runtime
+            .spawn_agent(id("heavy-agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let sibling_agent = runtime
+            .spawn_agent(id("sibling-agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        for index in 0..64 {
+            runtime
+                .spawn_policy(
+                    id(&format!("policy-{index:02}")),
+                    tenant("a"),
+                    Policy {
+                        order: index,
+                        revision: 1,
+                        rule: PolicyRule::Allow,
+                    },
+                    heavy_agent,
+                )
+                .unwrap();
+        }
+        let heavy = runtime.handle().prompt(heavy_agent, "heavy").unwrap();
+        let sibling = runtime.handle().prompt(sibling_agent, "sibling").unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let requests = [
+            runtime.effects().try_recv().unwrap().unwrap(),
+            runtime.effects().try_recv().unwrap().unwrap(),
+        ];
+        let heavy_run = runtime.resolve_run(&heavy).unwrap().entity();
+        let sibling_run = runtime.resolve_run(&sibling).unwrap().entity();
+        let dispatched_runs = requests
+            .iter()
+            .filter_map(|request| runtime.world().get::<OperationOf>(request.operation))
+            .map(Relationship::get)
+            .collect::<HashSet<_>>();
+        assert_eq!(dispatched_runs, HashSet::from([heavy_run, sibling_run]));
     }
 
     #[test]

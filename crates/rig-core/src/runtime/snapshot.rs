@@ -293,6 +293,9 @@ pub struct PersistedRequestPolicyEvaluation {
     pub policies: Vec<PersistedAcceptedPolicy>,
     pub cursor: usize,
     pub effective: ModelEffectInput,
+    /// Deterministically reduced operation-local request patch.
+    #[serde(default)]
+    pub accumulated: RequestPatch,
     pub phase: PersistedRequestPolicyPhase,
 }
 
@@ -931,6 +934,7 @@ fn persist_evaluation(
                 policies: persist_policies(&value.policies),
                 cursor: value.cursor,
                 effective,
+                accumulated: value.accumulated.clone(),
                 phase: match &value.phase {
                     RequestPolicyEvaluationPhase::Evaluating => {
                         PersistedRequestPolicyPhase::Evaluating
@@ -2128,6 +2132,7 @@ fn restore_evaluation_components(
                 policies: remap_policies(&value.policies, domain, &tenant)?,
                 cursor: value.cursor,
                 effective,
+                accumulated: value.accumulated.clone(),
                 phase: match &value.phase {
                     PersistedRequestPolicyPhase::Evaluating => {
                         RequestPolicyEvaluationPhase::Evaluating

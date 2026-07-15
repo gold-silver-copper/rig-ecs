@@ -3,8 +3,12 @@
 use super::super::support::with_anthropic_cassette;
 use crate::support::{collect_stream_final_response, install_policy};
 use rig::{
-    client::CompletionClient, providers::anthropic, runtime::PolicyRule,
-    streaming::StreamingPrompt, tool::Tool,
+    bevy_ecs::{observer::Observer, prelude::On},
+    client::CompletionClient,
+    providers::anthropic,
+    runtime::{PolicyRule, ToolResultPresentationFinalized},
+    streaming::StreamingPrompt,
+    tool::Tool,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -58,6 +62,15 @@ async fn run(client: anthropic::Client, streaming: bool, tool: GetUserRecord) {
         },
     )
     .unwrap();
+    agent
+        .with_runtime_mut(|runtime| {
+            runtime.world_mut().spawn(Observer::new(
+                |event: On<ToolResultPresentationFinalized>| {
+                    assert_eq!(event.presentation, REDACTED);
+                },
+            ));
+        })
+        .unwrap();
     let answer = if streaming {
         let mut stream = agent.stream_prompt(PROMPT).max_turns(5).await;
         collect_stream_final_response(&mut stream).await.unwrap()

@@ -14,17 +14,19 @@ use crate::{
     runtime::{
         Agent, AgentHandle, CanonicalError, DiscoveryEffectInput, DiscoveryEffectOutput,
         DriveError, EffectCompletion, EffectDelta, EffectDeltaSender, EffectInput, EffectIoError,
-        EffectOutput, EffectRequest, InstallError, ModelCapability, ModelDecision,
-        ModelEffectInput, ModelEffectOutput, ModelToolCall, ModelToolChoice, OutputRequirement,
-        RetrievalRequirement, RetrievedDocument, RunOutput, RunState, Runtime, RuntimeConfig,
-        SpawnError, StableId, StoreCapability, StoreEffectInput, StoreEffectOutput, StoreGrant,
-        StoreOperation, StreamItem, StreamReceiveError, StreamTerminal, SubmitError, TenantId,
-        ToolCapability, ToolEffectInput, ToolEffectOutput, ToolGrant, TranscriptEntry, Usage,
+        EffectOutput, EffectRequest, ExtensionInstallError, InstallError, ModelCapability,
+        ModelDecision, ModelEffectInput, ModelEffectOutput, ModelToolCall, ModelToolChoice,
+        OutputRequirement, RetrievalRequirement, RetrievedDocument, RigExtension, RunOutput,
+        RunState, Runtime, RuntimeConfig, SpawnError, StableId, StoreCapability, StoreEffectInput,
+        StoreEffectOutput, StoreGrant, StoreOperation, StreamItem, StreamReceiveError,
+        StreamTerminal, SubmitError, TenantId, ToolCapability, ToolEffectInput, ToolEffectOutput,
+        ToolGrant, TranscriptEntry, Usage,
     },
     streaming::{StreamedAssistantContent, ToolCallDeltaContent},
     tool::IntoToolOutput,
     vector_store::{VectorStoreIndexDyn, request::VectorSearchRequest},
 };
+use bevy_ecs::relationship::Relationship;
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt};
 use serde::de::DeserializeOwned;
@@ -477,6 +479,7 @@ pub struct LocalModelAgentBuilder<M> {
     documents: Vec<RetrievedDocument>,
     max_model_calls: u32,
     output_schema: Option<serde_json::Value>,
+    structured_output_retries: u32,
     structured_output_mode: StructuredOutputMode,
     terminal_tool: Option<String>,
     retrieval_limit: Option<usize>,
@@ -667,6 +670,14 @@ where
         self
     }
 
+    /// Sets corrective model retries after structured-output validation fails.
+    pub fn max_output_retries(mut self, retries: usize) -> Self {
+        self.inner = self
+            .inner
+            .max_output_retries(u32::try_from(retries).unwrap_or(u32::MAX));
+        self
+    }
+
     pub(crate) fn terminal_tool(mut self, name: impl Into<String>) -> Self {
         self.inner = self.inner.terminal_tool(name);
         self
@@ -709,6 +720,7 @@ where
             documents: Vec::new(),
             max_model_calls: 16,
             output_schema: None,
+            structured_output_retries: 1,
             structured_output_mode: StructuredOutputMode::Auto,
             terminal_tool: None,
             retrieval_limit: None,
@@ -799,6 +811,12 @@ where
     /// Selects how a configured output schema is presented to the model.
     pub fn structured_output_mode(mut self, mode: StructuredOutputMode) -> Self {
         self.structured_output_mode = mode;
+        self
+    }
+
+    /// Sets corrective model retries after structured-output validation fails.
+    pub fn max_output_retries(mut self, retries: u32) -> Self {
+        self.structured_output_retries = retries;
         self
     }
 
@@ -1014,6 +1032,7 @@ where
         )?;
         if let Some(schema) = self.output_schema {
             runtime.set_output_requirement(agent, OutputRequirement { schema })?;
+            runtime.set_structured_output_retry_budget(agent, self.structured_output_retries)?;
         }
         if let Some(limit) = self.retrieval_limit {
             runtime.set_retrieval_requirement(agent, RetrievalRequirement { limit })?;
@@ -1159,6 +1178,16 @@ where
             .lock()
             .map_err(|_| LocalAgentError::RuntimePoisoned)?;
         Ok(access(&mut runtime))
+    }
+
+    /// Installs an ECS-native extension at an exclusive runtime safe point.
+    pub fn install_extension(&self, extension: &impl RigExtension) -> Result<(), LocalAgentError> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| LocalAgentError::RuntimePoisoned)?;
+        runtime.install_extension(extension)?;
+        Ok(())
     }
 
     /// Submits and resolves one prompt through [`crate::runtime::RigSchedule`].
@@ -1743,7 +1772,7 @@ where
                         result,
                     })?;
                 }
-                let mut committed_tool_results = Vec::new();
+                let mut completed_tool_results = Vec::new();
                 for completion in agent
                     .execute_tool_batch(tool_requests, tool_concurrency)
                     .await
@@ -1753,30 +1782,55 @@ where
                             .get(&output.call_id)
                             .cloned()
                             .unwrap_or_else(|| output.call_id.clone());
-                        if let Some(tool_call) = streamed_tool_calls.get(&output.call_id).cloned() {
-                            committed_tool_results.push(LocalStreamEvent::ToolCommitted {
-                                tool_call,
-                                internal_call_id: internal_call_id.clone(),
-                            });
-                        }
-                            committed_tool_results.push(LocalStreamEvent::ToolResult {
-                                tool_result: MessageToolResult {
-                                id: output.provider_result_id.clone(),
-                                call_id: output.provider_call_id.clone(),
-                                content: tool_result_content(
-                                    &output.raw,
-                                    &output.presentation,
-                                ),
-                            },
+                        completed_tool_results.push((
+                            completion.operation,
+                            output.clone(),
                             internal_call_id,
-                        });
+                            streamed_tool_calls.get(&output.call_id).cloned(),
+                        ));
                     }
                     agent.submit_completion(&completion_sender, completion)?;
                 }
 
                 agent.drive_once()?;
-                for result in committed_tool_results {
-                    yield result;
+                for (operation, raw, internal_call_id, tool_call) in completed_tool_results {
+                    let effective = agent.with_runtime(|runtime| {
+                        let world = runtime.world();
+                        let run = world.get::<crate::runtime::OperationOf>(operation)?.get();
+                        if matches!(
+                            world.get::<RunState>(run),
+                            Some(RunState::Failed(_) | RunState::Cancelled)
+                        ) || world
+                            .get::<crate::runtime::ToolResultPolicyDone>(operation)
+                            .is_none()
+                        {
+                            return None;
+                        }
+                        world
+                            .get::<crate::runtime::EffectiveToolOutput>(operation)
+                            .map(|output| output.0.clone())
+                    })?;
+                    let Some(effective) = effective else {
+                        continue;
+                    };
+                    if let Some(tool_call) = tool_call {
+                        yield LocalStreamEvent::ToolCommitted {
+                            tool_call,
+                            internal_call_id: internal_call_id.clone(),
+                        };
+                    }
+                    yield LocalStreamEvent::ToolResult {
+                        tool_result: MessageToolResult {
+                            id: effective.provider_result_id.clone(),
+                            call_id: effective.provider_call_id.clone(),
+                            content: tool_result_content(
+                                &effective.raw,
+                                &effective.presentation,
+                                effective.presentation != raw.presentation,
+                            ),
+                        },
+                        internal_call_id,
+                    };
                 }
                 while let Some(item) = stream.try_recv()? {
                     match item {
@@ -1942,6 +1996,9 @@ pub enum LocalAgentError {
     /// Runtime installation failed.
     #[error(transparent)]
     Install(#[from] InstallError),
+    /// ECS extension installation failed.
+    #[error(transparent)]
+    ExtensionInstall(#[from] ExtensionInstallError),
     /// Domain construction failed.
     #[error(transparent)]
     Spawn(#[from] SpawnError),
@@ -2643,13 +2700,14 @@ pub(crate) fn transcript_messages(
                     provider_call_id,
                     raw,
                     content: result,
+                    presentation_overrides_raw,
                     ..
                 }) = history.get(index)
                 {
                     content.push(UserContent::ToolResult(MessageToolResult {
                         id: provider_result_id.clone(),
                         call_id: provider_call_id.clone(),
-                        content: tool_result_content(raw, result),
+                        content: tool_result_content(raw, result, *presentation_overrides_raw),
                     }));
                     index += 1;
                 }
@@ -2695,7 +2753,11 @@ fn response_messages(history: &[TranscriptEntry]) -> Result<Vec<Message>, Canoni
 fn tool_result_content(
     raw: &serde_json::Value,
     presentation: &str,
+    presentation_overrides_raw: bool,
 ) -> OneOrMany<ToolResultContent> {
+    if presentation_overrides_raw {
+        return OneOrMany::one(ToolResultContent::text(presentation.to_owned()));
+    }
     serde_json::from_value(raw.clone())
         .unwrap_or_else(|_| OneOrMany::one(ToolResultContent::text(presentation.to_owned())))
 }
@@ -2890,6 +2952,7 @@ mod tests {
                     name: "lookup".to_owned(),
                     raw: serde_json::Value::Null,
                     content: "result".to_owned(),
+                    presentation_overrides_raw: false,
                 },
             ],
             tools: vec![ToolDecision {

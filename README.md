@@ -58,6 +58,14 @@
 ## What is Rig?
 Rig is a Rust library for building scalable, modular, and ergonomic **LLM-powered** applications.
 
+Agent orchestration in this branch is Bevy ECS-native: one authoritative world
+holds reusable agents and independent runs, while the public `RigSchedule`
+drives blocking, streaming, tools, policies, persistence, cancellation, and
+checkpoint/resume through the same state transitions. See
+[`ECS_MIGRATION.md`](ECS_MIGRATION.md) for the capability matrix and migration
+guide, and `crates/rig-core/examples/ecs_extension.rs` for existing-world
+embedding.
+
 More information about this crate can be found in the [official](https://rig.rs/docs) and [crate](https://docs.rs/rig/latest/rig/) API reference documentation.
 
 ## Features

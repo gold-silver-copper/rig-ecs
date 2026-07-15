@@ -1,6 +1,6 @@
 # Rig as a Bevy ECS-Native Agent Runtime
 
-**Status:** Target architecture and direct-cutover specification
+**Status:** Implemented architecture, migration guide, and verification contract
 
 **Scope:** `rig-core`
 
@@ -660,3 +660,207 @@ Long-lived runtimes can accumulate calls, retired tools, subscriptions, and comp
 The migration is complete when this statement is literally true:
 
 > Rig is an asynchronous agent runtime built directly on Bevy ECS 0.19. Agents, executable capabilities, stores, policies, runs, turns, and lifecycle-bearing operations are entities composed from components and relationships. Systems own orchestration and policy. World-resident schedules own progression and deterministic commit. Asynchronous I/O crosses an owned, testable effect boundary and never borrows ECS state. Messages, commands, observers, and change detection are used according to Bevy semantics. Native and WASM use ordinary Rust bounds without compatibility marker traits. The ergonomic prompt API is only a facade over this world, and no legacy runner, mirrored registry, or second runtime exists.
+
+## Implemented capability matrix
+
+The table below is the audit map for the pre-ECS runtime. Test names refer to
+`runtime::tests` unless a provider or adapter suite is named explicitly.
+
+| Pre-ECS capability | ECS primitive and authoritative state | Public surface | Principal evidence | Migrated example |
+| --- | --- | --- | --- | --- |
+| blocking prompt loop | run/model-operation entities progressed by `RigSchedule` | `AgentFacade::prompt`, `RuntimeHandle::prompt` | `model_effect_round_trip_uses_world_resident_schedule` | `agent` |
+| streaming prompt loop | ordered `EffectIngressMessage` deltas plus run subscription entities | `prompt_stream`, `RunStream` | streaming sequence, parity, slow-consumer, and adapter suites | `agent_stream_chat` |
+| completion-call hook | durable request-policy evaluation entity and targeted invocation event | `RequestPatchPolicyBundle`, `RequestPolicyInvocation` | request patch/order/non-sticky tests | `request_hook` |
+| completion-response hook | response-policy evaluation before model commit | `CompletionResponsePolicyInvocation` | completion rewrite/stop tests | `tool_result_outcomes` |
+| model-turn-finished hook | observe-only targeted entity event | `ModelTurnFinished` | `completion_response_policy_runs_before_commit_and_emits_turn_event` | `agent_with_tools_otel` |
+| invalid-tool hook | pending-invalid component plus ordered durable evaluation | repair/retry/skip bundles and invocation event | invalid-tool action, budget, streaming, and snapshot tests | `gemini_default_api_recovery` |
+| tool-call hook | per-operation policy evaluation with immutable tool decision | rewrite/approval/skip bundles | rewrite, approval, skip, and snapshot tests | `agent_with_approval_policy` |
+| tool-result hook | immutable raw effect plus mutable presentation evaluation | `ToolResultRedactionPolicyBundle` | raw/presentation separation and stop tests | `tool_result_outcomes` |
+| hook scratchpad/context | extension-owned typed components and relationship queries | `RigOperationContext`, ordinary `Component` | extension/SystemParam test | `ecs_extension` |
+| asynchronous hooks | approval operation entities and owned effect I/O | `PolicyRule::RequireApproval` | request/tool/result/invalid approval snapshot tests | `agent_with_durable_approval` |
+| tools and dynamic tools | capability and grant entities with revisioned immutable snapshots | agent builder tools, `spawn_tool`, `grant_tool` | collision, retirement, batch, and provider suites | `agent_with_tools`, `rag_dynamic_tools` |
+| MCP/tool-server refresh | discovery-source and discovered-capability relationships | discovery commands and RMCP adapter | generation/retirement and RMCP tests | `rmcp` |
+| memory and retrieval | store capability/grant/operation entities | builder `memory` and `dynamic_context` | memory and vector-retrieval tests | `agent_with_memory`, `rag` |
+| structured output | `OutputRequirement` plus run-local retry counters | output schema/mode/retry builder methods | validation, retry, snapshot, provider extraction tests | `extractor` |
+| cancellation and suspension | `RunControl` orthogonal to `RunState` | pause modes, resume, cancel commands | drain/freeze/cancel-and-suspend race tests | `agent_run_stepping` |
+| active `AgentRun` serialization | stable-ID `ActiveRunSnapshot` | `snapshot_active_run`, `restore_active_run` | every waiting-phase restoration test | `agent_with_durable_approval` |
+| child-agent delegation | `ParentRun`/`ChildRuns`, `WaitingForChildren`, explicit ordinal | `spawn_child_run` | deterministic result and cancellation tests | `agent_with_agent_tool` |
+| telemetry hooks | observe-only entity events and optional typed counters | `LifecycleTelemetryBundle` | lifecycle event ordering and telemetry tests | `agent_with_tools_otel` |
+| provider diagnostics | canonical effect outcome plus provider-owned typed data | effect adapters | provider and adapter suites | provider examples |
+| WASM | identical ECS state with target-specific effect transport only | normal Rust bounds | WASM compile gate | browser-capable core consumers |
+
+## Hook-to-ECS migration guide
+
+Old hooks no longer form a callback stack. Steering is represented by policy
+entities sorted by `(Policy.order, StableId)`. An operation snapshots the exact
+policy revisions, creates a durable evaluation, and targets one policy entity at
+a time. The next policy therefore sees the effective value produced by every
+earlier policy. Observer registration order has no semantic role.
+
+| Old event | Steering boundary | Observe-only boundary |
+| --- | --- | --- |
+| completion call | `RequestPolicyInvocation` | `CompletionRequestPrepared`, `ModelDispatched` |
+| completion response | `CompletionResponsePolicyInvocation` | `ModelSettled`, `CompletionResponseApplied` |
+| model turn finished | none after commit | `ModelTurnFinished` |
+| invalid tool call | `InvalidToolCallPolicyInvocation` | `InvalidToolCallDetected` |
+| tool call | `ToolCallPolicyInvocation` | `ToolCallPrepared`, `ToolExecutionStarted` |
+| tool result | `ToolResultPolicyInvocation` | `ToolExecutionSettled`, `ToolResultPresentationFinalized` |
+| stream text delta | `TextDeltaPolicyInvocation` | `TextDeltaObserved`, `StreamResponseFinished` |
+
+`RequestPatch` is operation-local. The evaluation retains the baseline request,
+the reduced `accumulated` patch, and the current effective request separately.
+Context appends, provider parameters shallow-merge, active tools intersect, and
+scalar/history fields use last-writer-wins. Repeated last-writer fields emit a
+structured warning containing the field and later policy ID. The next turn is
+always rebuilt from agent/run state, never from the prior patched input.
+
+Asynchronous policy behavior creates a `PolicyApproval` operation related to
+the evaluation. The evaluation remains at its cursor while the owned request is
+outside the world. Completion ingress validates operation identity, generation,
+phase, cancellation, and output kind before advancing the cursor.
+
+## Public extension API
+
+`RigExtension` is intentionally only an installer over `&mut World`. The common
+policy helpers—`RequestPatchPolicyBundle`, `ToolApprovalPolicyBundle`,
+`ToolArgumentRewritePolicyBundle`, `ToolSkipPolicyBundle`,
+`ToolResultRedactionPolicyBundle`, `InvalidToolRepairPolicyBundle`, and
+`InvalidToolRetryPolicyBundle`—are ordinary Bevy `Bundle`s and also implement
+the installer. `LifecycleTelemetryBundle` is inserted on an agent to opt into
+queryable observe-only counters. `RigOperationContext` is a read-only
+`SystemParam` resolving operation → run → agent metadata without allowing a
+borrow to escape into asynchronous work.
+
+Custom behavior may add components and systems at the public `RigSet`
+boundaries or attach one targeted steering observer to a `PolicyRule::Custom`
+entity. Additional audit observers consume the separate observation events.
+
+## Schedule and lifecycle diagrams
+
+The public schedule is one ordered progression engine for every agent and run:
+
+```text
+IngestCommands -> IngestControlCommands -> IngestEffects -> Reconcile
+ -> ReconcileAgentControl -> ApplyRunControl -> SpawnDynamicAgentsAndRuns
+ -> PrepareRun -> PrepareModel -> BeginRequestPolicy -> InvokeRequestPolicy
+ -> ReduceRequestPolicy -> FinalizeRequest -> DispatchModel
+ -> ApplyModelCompletion -> BeginResponsePolicy -> CommitModelTurn
+ -> ResolveInvalidTools -> PrepareToolBatch -> BeginToolCallPolicy
+ -> DispatchTools -> ApplyToolCompletions -> BeginToolResultPolicy
+ -> CommitToolBatch -> Persist -> Publish -> Cancel -> Retire -> Cleanup
+ -> MaintainMessages
+```
+
+Mandatory ambiguity detection is enabled at `Error` level and the core schedule
+graph is asserted conflict-free. Deferred structural commands are visible at
+the intentional chained system boundaries. Component lifecycle tests cover
+`Add -> Insert`, replacement `Discard -> Insert`, explicit removal
+`Discard -> Remove`, required-component insertion, observer commands, and the
+despawn observation/removal sequence. Business phases remain ordinary
+queryable components rather than lifecycle-hook control flow.
+
+Parent/child progression is explicit:
+
+```text
+parent model operation active
+ -> SpawnChildRun command
+ -> ParentRun/ChildRuns relationship + WaitingForChildren marker
+ -> child progresses in the same RigSchedule
+ -> child terminal outcome retained
+ -> results reduced by ChildOrdinal (not completion order)
+ -> marker removed only after every child result commits
+ -> parent resumes its preserved RunState
+```
+
+Every ready evaluation is visited once per schedule pass, ordered by stable run
+identity and cursor. The runtime does not cap a pass after one run, so an
+immediately-ready policy-heavy run cannot exclude a ready sibling. Waiting and
+paused runs do not report progress. Separate worlds remain the isolation and
+scheduling-shard boundary for distinct trust domains.
+
+## Active-run snapshot format
+
+`ActiveRunSnapshot` is versioned and contains only stable domain IDs plus opaque
+snapshot-local references. It records:
+
+- root and descendant runs, parent identity, child ordinal, and committed-child status;
+- authoritative run phase and orthogonal pause mode;
+- prompt, transcript, usage, turn/model budgets, invalid-tool retries, and structured-output retries;
+- memory/retrieval decisions, conversation state, pending output, and persistence state;
+- operation generation/phase, immutable model/tool/store decisions, stream sequence, and settled output;
+- tool batches and explicit call order;
+- accepted policy IDs/revisions, evaluation kind/cursor, accumulated request patch, effective arguments/presentation, and pending approvals;
+- committed-turn audit records.
+
+Raw entity IDs, observers, registered systems, clients, secrets, channels, and
+task handles are never serialized. Restoration validates tenant and revision
+compatibility, remaps stable references, reconstructs relationships and the
+`WaitingForChildren` dependency, and then resumes through `RigSchedule`.
+In-flight effects are rejected unless cancel-and-suspend first produced a
+redispatchable prepared generation. Snapshots contain prompts, transcripts,
+tool data, policy decisions, and provider content and must therefore be handled
+as application-sensitive data. Runtime-only custom observers/systems must be
+reinstalled after domain restoration before runs resume.
+
+## Restored example inventory
+
+`.github/example-inventory.txt` is the CI-enforced merge-base inventory. The
+complete restored root package set is:
+
+`agent_autonomous`, `agent_evaluator_optimizer`, `agent_orchestrator`,
+`agent_parallelization`, `agent_prompt_chaining`, `agent_routing`,
+`agent_run_stepping`, `agent_stream_chat`, `agent_with_agent_tool`,
+`agent_with_approval_policy`, `agent_with_context`,
+`agent_with_default_max_turns`, `agent_with_durable_approval`,
+`agent_with_echochambers`, `agent_with_human_in_the_loop`,
+`agent_with_loaders`, `agent_with_memory_streaming`, `agent_with_memory`,
+`agent_with_tools_otel`, `agent_with_tools`, `agent`, `calculator_chatbot`,
+`chain`, `complex_agentic_loop_claude`, `custom_vector_store`, `debate`,
+`discord_bot`, `enum_dispatch`, `extractor`, `force_tool_first_turn`,
+`gemini_deep_research`, `gemini_default_api_recovery`,
+`gemini_extractor_with_rag`, `gemini_nanobanana_image_generation`,
+`gemini_stream_kill_token_count`, `gemini_video_understanding`,
+`manual_tool_calls`, `multi_agent`, `multi_extract`,
+`multi_turn_agent_extended`, `multi_turn_agent`,
+`openai_agent_completions_api_otel`, `openai_streaming_per_call_usage`,
+`openai_streaming_with_tools_otel`, `pdf_agent`,
+`rag_dynamic_tools_multi_turn`, `rag_dynamic_tools`, `rag_ollama`, `rag`,
+`reasoning_loop`, `request_hook`, `reqwest_middleware`, `rmcp`,
+`sentiment_classifier`, `tool_result_outcomes`, `transcription`,
+`vector_search_cohere`, `vector_search_ollama`, and `vector_search`.
+
+Core-native `ecs_runtime` and `ecs_extension` examples additionally demonstrate
+standalone and embedded-world execution. The feature-to-example map is:
+
+| Runtime feature | Example |
+| --- | --- |
+| targeted lifecycle observation / embedded world | `crates/rig-core/examples/ecs_extension.rs` |
+| request patch / deterministic ordering | `request_hook` |
+| tool rewrite, skip, result redaction | `tool_result_outcomes`, `force_tool_first_turn` |
+| approval / durable approval | `agent_with_approval_policy`, `agent_with_durable_approval` |
+| invalid repair/retry | `gemini_default_api_recovery` |
+| streaming delta observation/cancellation | `agent_stream_chat`, `gemini_stream_kill_token_count` |
+| checkpoint/resume and all pause modes | `agent_run_stepping`, `agent_with_durable_approval` |
+| shared world, sibling progress, child delegation | `multi_agent`, `agent_with_agent_tool` |
+
+## Benchmark matrix
+
+`cargo bench -p rig-core --bench ecs_runtime` measures all required operational
+shapes with deterministic fake effects: one-shot prompts, 100 concurrent runs
+on one agent, 100 concurrent runs across eight agents, freeze/resume beside an
+active sibling, dynamic child orchestration, 100-policy evaluation, 100 stream
+deltas, and a 16-call parallel logical tool batch. Results are machine-specific;
+the final PR verification record captures the exact run used for review rather
+than presenting these smoke timings as stable performance guarantees. The
+2026-07-15 verification run on the PR workstation reported:
+
+| Shape | Result |
+| --- | ---: |
+| one-shot prompt | 2,088,351.7 ns/op |
+| 100 runs, one agent | 30,498.3 ns/op |
+| 100 runs, eight agents | 29,802.5 ns/op |
+| freeze/resume beside active | 532,625.0 ns/op |
+| dynamic child orchestration | 935,812.5 ns/op |
+| 100-policy run | 298,031.7 ns/op |
+| 100 streaming deltas | 5,725.4 ns/op |
+| 16-call tool batch | 48,224.0 ns/op |

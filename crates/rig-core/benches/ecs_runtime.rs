@@ -7,10 +7,11 @@
 
 use std::time::{Duration, Instant};
 
+use rig_core::bevy_ecs::{prelude::Entity, relationship::Relationship};
 use rig_core::runtime::{
     Agent, AgentHandle, EffectCompletion, EffectDelta, EffectDeltaKind, EffectOutput,
-    ModelCapability, ModelEffectOutput, ModelToolCall, Runtime, RuntimeConfig, StableId, TenantId,
-    ToolCapability, ToolEffectOutput, ToolGrant, Usage,
+    ModelCapability, ModelEffectOutput, ModelToolCall, OperationOf, PauseMode, Policy, PolicyRule,
+    Runtime, RuntimeConfig, StableId, TenantId, ToolCapability, ToolEffectOutput, ToolGrant, Usage,
 };
 
 const ITERATIONS: usize = 100;
@@ -45,6 +46,23 @@ fn setup() -> (Runtime, AgentHandle) {
         .spawn_agent(id("agent"), tenant, Agent::default(), model)
         .expect("agent spawns");
     (runtime, agent)
+}
+
+fn spawn_peer_agent(runtime: &mut Runtime, index: usize) -> AgentHandle {
+    let model = {
+        let world = runtime.world_mut();
+        let mut models =
+            world.query_filtered::<Entity, rig_core::bevy_ecs::prelude::With<ModelCapability>>();
+        models.iter(world).next().expect("benchmark model exists")
+    };
+    runtime
+        .spawn_agent(
+            id(format!("agent-{index}")),
+            TenantId::new("bench").expect("tenant"),
+            Agent::default(),
+            model,
+        )
+        .expect("peer agent spawns")
 }
 
 fn complete_model(runtime: &Runtime, request: &rig_core::runtime::EffectRequest) {
@@ -95,6 +113,141 @@ fn concurrent_runs() -> Duration {
         complete_model(&runtime, &request);
     }
     runtime.run_until_stalled().expect("commit all");
+    started.elapsed()
+}
+
+fn concurrent_runs_across_agents() -> Duration {
+    let (mut runtime, first) = setup();
+    let mut agents = vec![first];
+    agents.extend((1..8).map(|index| spawn_peer_agent(&mut runtime, index)));
+    let started = Instant::now();
+    for (index, agent) in agents.iter().copied().cycle().take(ITERATIONS).enumerate() {
+        runtime
+            .handle()
+            .prompt(agent, format!("prompt {index}"))
+            .expect("submit");
+    }
+    runtime.run_until_stalled().expect("prepare all");
+    while let Some(request) = runtime.effects().try_recv().expect("queue") {
+        complete_model(&runtime, &request);
+    }
+    runtime.run_until_stalled().expect("commit all");
+    started.elapsed()
+}
+
+fn pause_resume_alongside_active() -> Duration {
+    let (mut runtime, agent) = setup();
+    let frozen_pending = runtime.handle().prompt(agent, "frozen").expect("submit");
+    let active_pending = runtime.handle().prompt(agent, "active").expect("submit");
+    runtime.run_until_stalled().expect("dispatch both");
+    let frozen = runtime.resolve_run(&frozen_pending).expect("frozen run");
+    let active = runtime.resolve_run(&active_pending).expect("active run");
+    runtime
+        .handle()
+        .pause_with_mode(frozen, PauseMode::FreezeAfterIngress)
+        .expect("pause");
+    runtime.run_until_stalled().expect("apply pause");
+    let requests = [
+        runtime
+            .effects()
+            .try_recv()
+            .expect("queue")
+            .expect("request"),
+        runtime
+            .effects()
+            .try_recv()
+            .expect("queue")
+            .expect("request"),
+    ];
+    let started = Instant::now();
+    for request in &requests {
+        complete_model(&runtime, request);
+    }
+    runtime.run_until_stalled().expect("active commits");
+    assert!(matches!(
+        runtime
+            .world()
+            .get::<rig_core::runtime::RunState>(active.entity()),
+        Some(rig_core::runtime::RunState::Completed(_))
+    ));
+    assert!(matches!(
+        runtime
+            .world()
+            .get::<rig_core::runtime::RunState>(frozen.entity()),
+        Some(rig_core::runtime::RunState::WaitingModel { .. })
+    ));
+    runtime.handle().resume(frozen).expect("resume");
+    runtime.run_until_stalled().expect("frozen commits");
+    started.elapsed()
+}
+
+fn dynamic_child_run() -> Duration {
+    let (mut runtime, agent) = setup();
+    let parent_pending = runtime.handle().prompt(agent, "parent").expect("parent");
+    runtime.run_until_stalled().expect("parent dispatch");
+    let parent_request = runtime
+        .effects()
+        .try_recv()
+        .expect("queue")
+        .expect("parent request");
+    let parent = runtime.resolve_run(&parent_pending).expect("parent run");
+    let started = Instant::now();
+    let child_pending = runtime
+        .handle()
+        .spawn_child_run(parent, agent, "child")
+        .expect("child");
+    runtime.run_until_stalled().expect("child dispatch");
+    let child_request = runtime
+        .effects()
+        .try_recv()
+        .expect("queue")
+        .expect("child request");
+    let child = runtime.resolve_run(&child_pending).expect("child run");
+    assert_eq!(
+        runtime
+            .world()
+            .get::<OperationOf>(child_request.operation)
+            .expect("child owner")
+            .get(),
+        child.entity()
+    );
+    complete_model(&runtime, &child_request);
+    runtime.run_until_stalled().expect("child commit");
+    complete_model(&runtime, &parent_request);
+    runtime.run_until_stalled().expect("parent commit");
+    started.elapsed()
+}
+
+fn policy_heavy_run() -> Duration {
+    let (mut runtime, agent) = setup();
+    let tenant = TenantId::new("bench").expect("tenant");
+    for index in 0..100 {
+        runtime
+            .spawn_policy(
+                id(format!("policy-{index}")),
+                tenant.clone(),
+                Policy {
+                    order: index,
+                    revision: 1,
+                    rule: PolicyRule::Allow,
+                },
+                agent,
+            )
+            .expect("policy");
+    }
+    let started = Instant::now();
+    runtime
+        .handle()
+        .prompt(agent, "policy-heavy")
+        .expect("submit");
+    runtime.run_until_stalled().expect("evaluate policies");
+    let request = runtime
+        .effects()
+        .try_recv()
+        .expect("queue")
+        .expect("request");
+    complete_model(&runtime, &request);
+    runtime.run_until_stalled().expect("commit");
     started.elapsed()
 }
 
@@ -275,7 +428,19 @@ fn report(name: &str, duration: Duration, operations: usize) {
 
 fn main() {
     report("one-shot", one_shot(), ITERATIONS);
-    report("concurrent-runs", concurrent_runs(), ITERATIONS);
+    report("concurrent-runs-one-agent", concurrent_runs(), ITERATIONS);
+    report(
+        "concurrent-runs-eight-agents",
+        concurrent_runs_across_agents(),
+        ITERATIONS,
+    );
+    report(
+        "pause-resume-alongside-active",
+        pause_resume_alongside_active(),
+        2,
+    );
+    report("dynamic-child-run", dynamic_child_run(), 2);
+    report("policy-heavy-run", policy_heavy_run(), 100);
     report("large-capability-set", large_capability_set(), 1);
     report("streaming-deltas", streaming(), 100);
     report("parallel-tool-batch", parallel_tool_batch(), 16);
