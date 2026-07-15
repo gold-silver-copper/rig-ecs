@@ -2,6 +2,7 @@
 name = "rig-core"
 version.workspace = true
 edition = { workspace = true }
+rust-version = { workspace = true }
 license = "MIT"
 readme = "README.md"
 description = "An opinionated library for building LLM powered applications."
@@ -23,11 +24,13 @@ doctest = true
 as-any = { workspace = true }
 async-stream = { workspace = true }
 base64 = { workspace = true }
+bevy_ecs = { workspace = true }
 bytes = { workspace = true }
 epub = { workspace = true, optional = true }
 futures = { workspace = true }
 glob = { workspace = true }
 indexmap = { workspace = true }
+jsonschema = { workspace = true }
 lopdf = { workspace = true, optional = true }
 mime_guess = { workspace = true }
 ordered-float = { workspace = true }
@@ -67,7 +70,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 # futures-timer's default backend uses a background timer thread, which cannot
 # drive timers on wasm. Pull in its wasm-bindgen (setTimeout) backend whenever
 # the target is browser wasm — regardless of feature flags — so
-# `wasm_compat::timeout` and the SSE retry backoff actually fire instead of
+# The runtime timeout and SSE retry backoff actually fire instead of
 # hanging. Scoped to `target_os = "unknown"` (browser) rather than the whole
 # `wasm` family because the gloo-timers/setTimeout backend needs a JS host and
 # would be wrong-by-construction on WASI.
@@ -149,3 +152,7 @@ native-tls = ["reqwest/native-tls", "tokio-tungstenite?/native-tls"]
 reqwest-middleware = ["reqwest-middleware-rustls"]
 reqwest-middleware-rustls = ["dep:reqwest-middleware", "rustls", "reqwest-middleware/rustls"]
 reqwest-middleware-native-tls = ["dep:reqwest-middleware", "native-tls"]
+
+[[bench]]
+name = "ecs_runtime"
+harness = false

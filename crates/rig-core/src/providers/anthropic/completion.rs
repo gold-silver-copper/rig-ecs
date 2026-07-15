@@ -10,7 +10,6 @@ use crate::{
     message::{self, DocumentMediaType, DocumentSourceKind, MessageError, MimeType, Reasoning},
     one_or_many::string_or_one_or_many,
     telemetry::{CompletionOperation, CompletionSpanBuilder, ProviderResponseExt, SpanCombinator},
-    wasm_compat::*,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -2436,8 +2435,8 @@ pub(super) fn build_tool_definitions(
 
 impl<Ext, T> completion::CompletionModel for GenericCompletionModel<Ext, T>
 where
-    T: HttpClientExt + Clone + Default + WasmCompatSend + WasmCompatSync + 'static,
-    Ext: AnthropicCompatibleProvider + Clone + WasmCompatSend + WasmCompatSync + 'static,
+    T: HttpClientExt + Clone + Default + Send + Sync + 'static,
+    Ext: AnthropicCompatibleProvider + Clone + Send + Sync + 'static,
 {
     type Response = CompletionResponse;
     type StreamingResponse = StreamingCompletionResponse;

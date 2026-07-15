@@ -1,7 +1,6 @@
 //! Perplexity context/document cassette coverage.
 
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::providers::perplexity;
 
 use crate::support::{CONTEXT_DOCS, CONTEXT_PROMPT, assert_contains_any_case_insensitive};

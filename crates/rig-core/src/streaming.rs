@@ -9,7 +9,7 @@
 //!
 
 use crate::OneOrMany;
-use crate::agent::prompt_request::streaming::StreamingPromptRequest;
+use crate::agent::StreamingPromptRequest;
 use crate::completion::{
     CompletionError, CompletionModel, CompletionRequestBuilder, CompletionResponse, GetTokenUsage,
     Message, Usage,
@@ -17,7 +17,6 @@ use crate::completion::{
 use crate::message::{
     AssistantContent, Reasoning, ReasoningContent, Text, ToolCall, ToolFunction, ToolResult,
 };
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use futures::stream::{AbortHandle, Abortable};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -227,15 +226,9 @@ impl From<RawStreamingToolCall> for ToolCall {
     }
 }
 
-#[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
-/// Provider stream of raw completion chunks on native targets.
+/// Provider stream of raw completion chunks.
 pub type StreamingResult<R> =
     Pin<Box<dyn Stream<Item = Result<RawStreamingChoice<R>, CompletionError>> + Send>>;
-
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-/// Provider stream of raw completion chunks on wasm targets.
-pub type StreamingResult<R> =
-    Pin<Box<dyn Stream<Item = Result<RawStreamingChoice<R>, CompletionError>>>>;
 
 /// The response from a streaming completion request;
 /// message and response are populated at the end of the
@@ -558,33 +551,27 @@ where
 /// Trait for high-level streaming prompt interface.
 ///
 /// This trait provides a simple interface for streaming prompts to a completion model.
-/// Implementations can optionally support prompt hooks for observing and controlling
-/// the agent's execution lifecycle.
+/// Implementations can provide model-specific streaming behavior while the ECS
+/// runtime owns agent lifecycle observation and steering.
 pub trait StreamingPrompt<M, R>
 where
     M: CompletionModel + 'static,
-    <M as CompletionModel>::StreamingResponse: WasmCompatSend,
+    <M as CompletionModel>::StreamingResponse: Send,
     R: Clone + Unpin + GetTokenUsage,
 {
     /// Stream a simple prompt to the model.
     ///
-    /// Attach hooks to observe or steer the run via
-    /// [`StreamingPromptRequest::add_hook`].
-    fn stream_prompt(
-        &self,
-        prompt: impl Into<Message> + WasmCompatSend,
-    ) -> StreamingPromptRequest<M>;
+    fn stream_prompt(&self, prompt: impl Into<Message> + Send) -> StreamingPromptRequest<M>;
 }
 
 /// Trait for high-level streaming chat interface with conversation history.
 ///
 /// This trait provides an interface for streaming chat completions with support
-/// for maintaining conversation history. Implementations can optionally support
-/// prompt hooks for observing and controlling the agent's execution lifecycle.
-pub trait StreamingChat<M, R>: WasmCompatSend + WasmCompatSync
+/// for maintaining conversation history.
+pub trait StreamingChat<M, R>: Send + Sync
 where
     M: CompletionModel + 'static,
-    <M as CompletionModel>::StreamingResponse: WasmCompatSend,
+    <M as CompletionModel>::StreamingResponse: Send,
     R: Clone + Unpin + GetTokenUsage,
 {
     /// Stream a chat with history to the model.
@@ -613,11 +600,11 @@ where
     /// ```
     fn stream_chat<I, T>(
         &self,
-        prompt: impl Into<Message> + WasmCompatSend,
+        prompt: impl Into<Message> + Send,
         chat_history: I,
     ) -> StreamingPromptRequest<M>
     where
-        I: IntoIterator<Item = T> + WasmCompatSend,
+        I: IntoIterator<Item = T> + Send,
         T: Into<Message>;
 }
 
@@ -626,11 +613,11 @@ pub trait StreamingCompletion<M: CompletionModel> {
     /// Generate a streaming completion from a request
     fn stream_completion<I, T>(
         &self,
-        prompt: impl Into<Message> + WasmCompatSend,
+        prompt: impl Into<Message> + Send,
         chat_history: I,
     ) -> impl Future<Output = Result<CompletionRequestBuilder<M>, CompletionError>>
     where
-        I: IntoIterator<Item = T> + WasmCompatSend,
+        I: IntoIterator<Item = T> + Send,
         T: Into<Message>;
 }
 

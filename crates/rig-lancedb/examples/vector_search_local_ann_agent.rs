@@ -1,7 +1,6 @@
 use fixture::{Word, as_record_batch, words};
 use lancedb::index::vector::IvfPqIndexBuilder;
 use rig_core::client::{EmbeddingsClient, ProviderClient};
-use rig_core::completion::Prompt;
 use rig_core::prelude::CompletionClient;
 use rig_core::providers::openai;
 use rig_core::{

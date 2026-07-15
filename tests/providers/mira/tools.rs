@@ -1,7 +1,6 @@
 //! Mira tools smoke test.
 
 use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::providers::{anthropic, mira};
 
 use crate::support::{

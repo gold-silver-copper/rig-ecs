@@ -11,10 +11,8 @@ mod cassette {
     mod models;
     mod multi_extract;
     mod openai_compatible_reasoning_content;
-    mod permission_control;
     mod reasoning_roundtrip;
     mod reasoning_tool_roundtrip;
-    mod request_hook;
     mod response_schema;
     mod responses_behaviors;
     mod responses_input_item;

@@ -276,108 +276,6 @@ fn is_option_type(ty: &Type) -> bool {
     false
 }
 
-/// Returns whether `ty` uses an unambiguous path to Rig's tool execution context.
-///
-/// Procedural macros cannot resolve imported type names. Matching only the last
-/// `ToolContext` path segment would therefore steal unrelated application types
-/// with the same name. Imported aliases use the explicit `#[rig(context)]`
-/// parameter marker instead.
-fn is_tool_context_type(ty: &Type) -> bool {
-    let ty = match ty {
-        Type::Group(group) => &*group.elem,
-        Type::Paren(paren) => &*paren.elem,
-        ty => ty,
-    };
-
-    let Type::Path(type_path) = ty else {
-        return false;
-    };
-    let segments = type_path
-        .path
-        .segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect::<Vec<_>>();
-
-    matches!(
-        segments.as_slice(),
-        [root, tool, context]
-            if matches!(root.as_str(), "rig" | "rig_core")
-                && tool == "tool"
-                && context == "ToolContext"
-    )
-}
-
-/// Whether a function parameter explicitly marks itself as Rig's runtime
-/// context. The marker is removed from the emitted function.
-fn has_tool_context_marker(attrs: &[Attribute]) -> syn::Result<bool> {
-    let mut marked = false;
-    for attr in attrs.iter().filter(|attr| attr.path().is_ident("rig")) {
-        if marked {
-            return Err(syn::Error::new_spanned(
-                attr,
-                "duplicate `#[rig(context)]` parameter marker",
-            ));
-        }
-
-        let Meta::List(list) = &attr.meta else {
-            return Err(syn::Error::new_spanned(
-                attr,
-                "expected `#[rig(context)]` on the runtime context parameter",
-            ));
-        };
-        let marker: Ident = list.parse_args().map_err(|_| {
-            syn::Error::new_spanned(
-                attr,
-                "expected `#[rig(context)]` on the runtime context parameter",
-            )
-        })?;
-        if marker != "context" {
-            return Err(syn::Error::new_spanned(
-                marker,
-                "the only supported parameter marker is `#[rig(context)]`",
-            ));
-        }
-        marked = true;
-    }
-    Ok(marked)
-}
-
-/// Classify a function parameter as the distinguished execution context.
-///
-/// An owned or shared `ToolContext` is almost certainly an authoring mistake:
-/// tools need the exact mutable context supplied by the runtime so result
-/// metadata and mutations remain visible to the caller.
-fn is_tool_context_parameter(ty: &Type, explicitly_marked: bool) -> syn::Result<bool> {
-    let ty = match ty {
-        Type::Group(group) => &*group.elem,
-        Type::Paren(paren) => &*paren.elem,
-        ty => ty,
-    };
-
-    if let Type::Reference(reference) = ty
-        && (explicitly_marked || is_tool_context_type(&reference.elem))
-    {
-        if reference.mutability.is_none() {
-            return Err(syn::Error::new_spanned(
-                ty,
-                "a `ToolContext` parameter must have type `&mut ToolContext`",
-            ));
-        }
-
-        return Ok(true);
-    }
-
-    if explicitly_marked || is_tool_context_type(ty) {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "a `ToolContext` parameter must have type `&mut ToolContext`",
-        ));
-    }
-
-    Ok(false)
-}
-
 fn result_type_tokens(
     return_type: &ReturnType,
 ) -> syn::Result<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
@@ -504,25 +402,6 @@ fn result_type_tokens(
 /// }
 /// ```
 ///
-/// With execution context:
-/// ```text
-/// use rig::tool::ToolContext;
-/// use rig_derive::rig_tool;
-///
-/// #[rig_tool]
-/// fn current_user(
-///     // The marker is required for imported names and type aliases. A fully
-///     // qualified `&mut rig::tool::ToolContext` is also recognized directly.
-///     #[rig(context)] context: &mut ToolContext,
-///     greeting: String,
-/// ) -> Result<String, rig::tool::ToolExecutionError> {
-///     let user = context
-///         .get::<String>()
-///         .map(String::as_str)
-///         .unwrap_or("guest");
-///     Ok(format!("{greeting}, {user}!"))
-/// }
-/// ```
 #[proc_macro_attribute]
 pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as MacroArgs);
@@ -570,12 +449,9 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
         },
     };
 
-    // Build model-facing fields independently from function-call arguments so
-    // the host-only ToolContext never enters the generated JSON schema.
     let mut param_names = Vec::new();
     let mut field_tokens = Vec::new();
     let mut call_arguments = Vec::new();
-    let mut context_param_name = None;
 
     for arg in input_fn.sig.inputs.iter() {
         let syn::FnArg::Typed(pat_type) = arg else {
@@ -583,34 +459,6 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
                 .into_compile_error()
                 .into();
         };
-
-        let explicitly_marked = match has_tool_context_marker(&pat_type.attrs) {
-            Ok(marked) => marked,
-            Err(error) => return error.into_compile_error().into(),
-        };
-        let is_context = match is_tool_context_parameter(&pat_type.ty, explicitly_marked) {
-            Ok(is_context) => is_context,
-            Err(error) => return error.into_compile_error().into(),
-        };
-
-        if is_context {
-            if context_param_name.is_some() {
-                return syn::Error::new_spanned(
-                    pat_type,
-                    "a tool function may have at most one `&mut ToolContext` parameter",
-                )
-                .into_compile_error()
-                .into();
-            }
-
-            if let syn::Pat::Ident(param_ident) = &*pat_type.pat {
-                context_param_name = Some(param_ident.ident.to_string());
-            } else {
-                context_param_name = Some(String::new());
-            }
-            call_arguments.push(quote! { _context });
-            continue;
-        }
 
         let syn::Pat::Ident(param_ident) = &*pat_type.pat else {
             return syn::Error::new_spanned(
@@ -656,23 +504,6 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
         call_arguments.push(quote! { args.#param_name });
     }
 
-    if let Some(context_param_name) = context_param_name.as_deref() {
-        let context_is_described = args.param_descriptions.contains_key(context_param_name);
-        let context_is_required = args
-            .required
-            .as_ref()
-            .is_some_and(|required| required.iter().any(|name| name == context_param_name));
-
-        if context_is_described || context_is_required {
-            return syn::Error::new_spanned(
-                &input_fn.sig,
-                "`ToolContext` is host-only and cannot be listed in `params(...)` or `required(...)`",
-            )
-            .into_compile_error()
-            .into();
-        }
-    }
-
     // Default required to all parameters only when required(...) was omitted.
     let required_args: Vec<String> = args
         .required
@@ -686,21 +517,13 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
     // Generate the call implementation based on whether the function is async
     let call_impl = if is_async {
         quote! {
-            async fn call(
-                &self,
-                _context: &mut #rig_core::tool::ToolContext,
-                args: Self::Args,
-            ) -> Result<Self::Output, Self::Error> {
+            async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
                 #fn_name(#(#call_arguments),*).await
             }
         }
     } else {
         quote! {
-            async fn call(
-                &self,
-                _context: &mut #rig_core::tool::ToolContext,
-                args: Self::Args,
-            ) -> Result<Self::Output, Self::Error> {
+            async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
                 #fn_name(#(#call_arguments),*)
             }
         }

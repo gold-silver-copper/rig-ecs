@@ -1,11 +1,8 @@
 use anyhow::Result;
 use rig::{
-    completion::Prompt,
-    embeddings::EmbeddingsBuilder,
     prelude::*,
     providers::openai::{self, Client},
-    tool::{Tool, ToolEmbedding, ToolSet},
-    vector_store::in_memory_store::InMemoryVectorStore,
+    tool::{Tool, ToolEmbedding},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -53,11 +50,7 @@ impl Tool for Add {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x + args.y;
         Ok(result)
     }
@@ -108,11 +101,7 @@ impl Tool for Subtract {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let result = args.x - args.y;
         Ok(result)
     }
@@ -146,35 +135,17 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
     let openai_client = Client::from_env()?;
 
-    let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
-
-    let toolset = ToolSet::builder()
-        .retrieved_tool(Add)
-        .retrieved_tool(Subtract)
-        .build();
-
-    let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
-        .documents(toolset.schemas()?)?
-        .build()
-        .await?;
-
-    // Create vector store with the embeddings
-    let vector_store =
-        InMemoryVectorStore::from_documents_with_id_f(embeddings, |tool| tool.name.clone());
-
-    // Create vector store index
-    let index = vector_store.index(embedding_model);
-
-    // Create RAG agent with a single context prompt and a dynamic tool source
+    // Static and discovered tools use the same ECS capability representation.
+    // This example registers both implementations directly; discovery adapters
+    // reconcile equivalent definitions through `runtime::EcsDiscovery`.
     let calculator_rag = openai_client
         .agent(openai::GPT_4)
         .preamble(
             "You are a calculator here to help the user perform arithmetic operations.
             Use the tools provided to answer the user's question and do not do any math on your own.",
         )
-        // Add a dynamic tool source with a sample rate of 2 (i.e.: only
-        // 2 additional tool will be added to prompts)
-        .retrieved_tools(2, index, toolset)
+        .tool(Add)
+        .tool(Subtract)
         .build();
 
     // Prompt the agent and print the response

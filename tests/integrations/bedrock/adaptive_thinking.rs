@@ -3,7 +3,7 @@
 use futures::StreamExt;
 use rig::agent::AgentBuilder;
 use rig::client::CompletionClient;
-use rig::completion::{CompletionModel as _, Prompt};
+use rig::completion::CompletionModel as _;
 use rig::streaming::StreamedAssistantContent;
 use serde_json::json;
 

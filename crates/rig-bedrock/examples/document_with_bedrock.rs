@@ -1,5 +1,5 @@
 use rig_core::{
-    completion::{Prompt, message::Document},
+    completion::message::Document,
     message::{DocumentMediaType, DocumentSourceKind},
 };
 

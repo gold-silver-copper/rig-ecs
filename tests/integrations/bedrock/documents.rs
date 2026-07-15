@@ -2,7 +2,6 @@
 
 use rig::OneOrMany;
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::message::{Document, DocumentMediaType, DocumentSourceKind, Message, UserContent};
 
 use super::{

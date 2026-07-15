@@ -3,7 +3,6 @@ use crate::{
     http_client::{self, HttpClientExt},
     model::{Model, ModelList, ModelListingError},
     providers::mistral::Client,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 use serde::Deserialize;
 
@@ -38,7 +37,7 @@ pub struct MistralModelLister<H = reqwest::Client> {
 
 impl<H> ModelLister<H> for MistralModelLister<H>
 where
-    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
+    H: HttpClientExt + Send + Sync + 'static,
 {
     type Client = Client<H>;
 

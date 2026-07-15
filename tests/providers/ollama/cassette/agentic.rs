@@ -14,9 +14,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rig::agent::OutputMode;
+use rig::agent::StructuredOutputMode;
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::streaming::StreamingPrompt;
 use serde_json::json;
 
@@ -63,6 +62,7 @@ async fn structured_output_raw_with_thinking() {
         let agent = client
             .agent(MODEL)
             .output_schema_raw(schema)
+            .structured_output_mode(StructuredOutputMode::Native)
             .additional_params(json!({ "think": true }))
             .build();
 
@@ -222,7 +222,7 @@ async fn streaming_structured_output_with_tools() {
     .await;
 }
 
-/// Explicit `OutputMode::Native` is the opt-out / escape hatch: the schema is
+/// Native structured output keeps the schema at the provider boundary: it is
 /// sent as the provider's native `format` constraint (the pre-#1928 behavior),
 /// which still produces valid structured output. Callers who know their model
 /// handles tools + native structured output together can select it.
@@ -241,7 +241,7 @@ async fn native_mode_emits_structured_output() {
             .preamble("You are a weather assistant.")
             .tool(WeatherTool::new(call_count.clone()))
             .output_schema_raw(schema)
-            .output_mode(OutputMode::Native)
+            .structured_output_mode(StructuredOutputMode::Native)
             .additional_params(json!({ "think": false }))
             .default_max_turns(3)
             .build();
@@ -266,7 +266,7 @@ async fn native_mode_emits_structured_output() {
     .await;
 }
 
-/// `OutputMode::Prompted` injects the schema into the system prompt and parses
+/// Schema-constrained output is parsed after the ECS run commits
 /// the model's final text — no native `format`, no output tool. Useful for
 /// models lacking reliable tool calling or native structured output.
 #[tokio::test]
@@ -281,7 +281,7 @@ async fn prompted_mode_returns_parseable_json() {
         let agent = client
             .agent(MODEL)
             .output_schema_raw(schema)
-            .output_mode(OutputMode::Prompted)
+            .structured_output_mode(StructuredOutputMode::Prompted)
             .additional_params(json!({ "think": false }))
             .build();
 

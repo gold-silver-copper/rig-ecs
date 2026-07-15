@@ -3545,7 +3545,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires GEMINI_API_KEY environment variable"]
     async fn test_gemini_agent_with_image_tool_result_e2e() -> anyhow::Result<()> {
-        use crate::completion::Prompt;
         use crate::prelude::*;
         use crate::providers::gemini;
         use crate::test_utils::MockImageGeneratorTool;

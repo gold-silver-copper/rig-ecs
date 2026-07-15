@@ -54,7 +54,6 @@ use crate::{
     json_utils, message,
     message::{ImageDetail, Text},
     streaming,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -287,7 +286,7 @@ where
         Ok(api_resp
             .embeddings
             .into_iter()
-            .zip(docs.into_iter())
+            .zip(docs)
             .map(|(vec, document)| embeddings::Embedding { document, vec })
             .collect())
     }
@@ -832,7 +831,7 @@ pub struct OllamaModelLister<H = reqwest::Client> {
 
 impl<H> ModelLister<H> for OllamaModelLister<H>
 where
-    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
+    H: HttpClientExt + Send + Sync + 'static,
 {
     type Client = Client<H>;
 

@@ -6,15 +6,12 @@ mod extractor_usage;
 mod models;
 mod multi_extract;
 mod noninteractive_oauth_cassette;
-mod permission_control;
 mod reasoning_roundtrip;
 mod reasoning_tool_roundtrip;
-mod request_hook;
 mod routing;
 mod streaming;
 mod streaming_tools;
 mod structured_output;
-mod typed_prompt_tools;
 
 use assert_fs::TempDir;
 use rig::providers::copilot;

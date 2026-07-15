@@ -142,11 +142,7 @@ impl Tool for Adder {
             .expect("adder schema should deserialize")
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(args.x + args.y)
     }
 }
@@ -171,11 +167,7 @@ impl Tool for Subtract {
             .expect("subtract schema should deserialize")
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(args.x - args.y)
     }
 }
@@ -201,11 +193,7 @@ impl Tool for AlphaSignal {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(ALPHA_SIGNAL_OUTPUT.to_string())
     }
 }
@@ -231,11 +219,7 @@ impl Tool for BetaSignal {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(BETA_SIGNAL_OUTPUT.to_string())
     }
 }
@@ -420,11 +404,11 @@ pub(crate) async fn assert_stream_contains_zero_arg_tool_call_named<R>(
     while let Some(chunk) = stream.next().await {
         match chunk.expect("stream item should be ok") {
             StreamedAssistantContent::Final(_) => saw_final = true,
-            StreamedAssistantContent::ToolCall { tool_call, .. } => {
-                if tool_call.function.name == expected_name {
-                    assert_eq!(tool_call.function.arguments, json!({}));
-                    saw_matching_tool_call = true;
-                }
+            StreamedAssistantContent::ToolCall { tool_call, .. }
+                if tool_call.function.name == expected_name =>
+            {
+                assert_eq!(tool_call.function.arguments, json!({}));
+                saw_matching_tool_call = true;
             }
             _ => {}
         }

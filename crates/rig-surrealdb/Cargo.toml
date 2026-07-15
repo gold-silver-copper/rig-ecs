@@ -9,6 +9,7 @@ license = "MIT"
 workspace = true
 
 [dependencies]
+futures = { workspace = true }
 surrealdb = { workspace = true, features = ["protocol-ws", "kv-mem"] }
 rig-core = { path = "../rig-core", version = "0.40.0", default-features = false, features = [
   "derive",

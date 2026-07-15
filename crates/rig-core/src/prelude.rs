@@ -46,7 +46,7 @@ pub use crate::Embed;
 pub use crate::embeddings::{EmbeddingModel, EmbeddingsBuilder};
 
 // Tools.
-pub use crate::tool::{Tool, ToolSet};
+pub use crate::tool::Tool;
 
 // Vector stores.
 pub use crate::vector_store::VectorStoreIndex;

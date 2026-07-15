@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rig::prelude::*;
-use rig::{completion::Prompt, providers, tool::Tool};
+use rig::{providers, tool::Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -43,11 +43,7 @@ impl Tool for Adder {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         println!("[tool-call] Adding {} and {}", args.x, args.y);
         let result = args.x + args.y;
         Ok(result)
@@ -84,11 +80,7 @@ impl Tool for Subtract {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         println!("[tool-call] Subtracting {} from {}", args.y, args.x);
         let result = args.x - args.y;
         Ok(result)
@@ -105,31 +97,23 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
     let openai_client = providers::openai::Client::from_env()?;
 
-    // Create agent with a single context prompt and two tools
+    // Agents no longer nest an independent runner as a dynamic tool. Compose
+    // capabilities on one ECS agent so calls share one authoritative run.
     let calculator_agent = openai_client
         .agent(providers::openai::GPT_4O)
-        .preamble("You are a calculator here to help the user perform arithmetic operations. Use the tools provided to answer the user's question.")
+        .preamble("You are a helpful calculator. Use the provided tools.")
         .max_tokens(1024)
         .default_max_turns(2)
         .tool(Adder)
         .tool(Subtract)
         .build();
 
-    // Create agent which has the calculator_agent as a tool
-    let agent_using_agent = openai_client
-        .agent(providers::openai::GPT_4O)
-        .preamble("You are a helpful assistant that can solve problems. Use the tool provided to answer the user's question.")
-        .max_tokens(1024)
-        .default_max_turns(2)
-        .dynamic_tool(calculator_agent.into_tool())
-        .build();
-
     // Prompt the agent and print the response
     println!("Calculate 2 - 5");
 
     println!(
-        "OpenAI Agent-Using Agent: {}",
-        agent_using_agent.prompt("Calculate 2 - 5").await?
+        "OpenAI calculator agent: {}",
+        calculator_agent.prompt("Calculate 2 - 5").await?
     );
 
     Ok(())

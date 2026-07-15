@@ -9,7 +9,6 @@ use super::{Client, client::ApiResponse};
 use crate::{
     embeddings::{self, EmbeddingError},
     http_client::HttpClientExt,
-    wasm_compat::WasmCompatSend,
 };
 
 /// `gemini-embedding-001` embedding model (3072 dimensions by default)
@@ -74,7 +73,7 @@ where
     /// <https://ai.google.dev/api/embeddings#batch_embed_contents-SHELL>
     async fn embed_texts(
         &self,
-        documents: impl IntoIterator<Item = String> + WasmCompatSend,
+        documents: impl IntoIterator<Item = String> + Send,
     ) -> Result<Vec<embeddings::Embedding>, EmbeddingError> {
         let documents: Vec<String> = documents.into_iter().collect();
 

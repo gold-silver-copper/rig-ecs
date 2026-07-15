@@ -1,20 +1,11 @@
-//! Shared fixtures for the `agent_run` cassette suites: the arithmetic tools
-//! advertised to Gemini and helpers for hand-driving the sans-IO
-//! [`AgentRun`](rig::agent::run::AgentRun) state machine.
+//! Shared Gemini cassette message and tool-definition helpers.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
-
-use rig::agent::CompletionCall;
-use rig::agent::run::{ModelTurn, PendingToolCall};
-use rig::completion::{Completion, ToolDefinition, Usage};
+use rig::completion::ToolDefinition;
 use rig::message::{AssistantContent, Message, ToolResultContent, UserContent};
-use rig::providers::gemini;
 use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
-
-pub(crate) type GeminiAgent = rig::agent::Agent<gemini::completion::CompletionModel>;
 
 pub(crate) const FORCE_TOOLS_PREAMBLE: &str = "You are a calculator assistant. You MUST use the provided tools for every arithmetic operation instead of computing results yourself. Once you have all the tool results you need, reply with the final numeric answer in plain text.";
 
@@ -59,11 +50,7 @@ impl Tool for Add {
         operation_definition(Self::NAME, "Add x and y together").parameters
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(args.x + args.y)
     }
 }
@@ -84,11 +71,7 @@ impl Tool for Subtract {
         operation_definition(Self::NAME, "Subtract y from x (i.e. x - y)").parameters
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(args.x - args.y)
     }
 }
@@ -111,85 +94,9 @@ impl Tool for Sum {
         operation_definition(Self::NAME, "Add x and y together (alias of add)").parameters
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(args.x + args.y)
     }
-}
-
-pub(crate) fn tool_names(names: &[&str]) -> BTreeSet<String> {
-    names.iter().map(|name| (*name).to_string()).collect()
-}
-
-/// Execute one arithmetic tool call by name, the way a driver would.
-pub(crate) fn execute_arithmetic(name: &str, arguments: &serde_json::Value) -> i64 {
-    let operand = |key: &str| {
-        arguments
-            .get(key)
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or_else(|| panic!("tool args should carry `{key}`: {arguments}")) as i64
-    };
-    let (x, y) = (operand("x"), operand("y"));
-    match name {
-        "add" | "sum" => x + y,
-        "subtract" => x - y,
-        other => panic!("unexpected tool `{other}`"),
-    }
-}
-
-/// Answer every pending call: preresolved results pass through unexecuted,
-/// the rest run the arithmetic tools.
-pub(crate) fn execute_pending_calls(calls: &[PendingToolCall]) -> Vec<UserContent> {
-    calls
-        .iter()
-        .map(|call| {
-            if let Some(result) = call.preresolved_result.clone() {
-                return result;
-            }
-            let output = execute_arithmetic(
-                &call.tool_call.function.name,
-                &call.tool_call.function.arguments,
-            );
-            let content = rig::OneOrMany::one(ToolResultContent::json(serde_json::json!(output)));
-            match call.tool_call.call_id.clone() {
-                Some(call_id) => UserContent::tool_result_with_call_id(
-                    call.tool_call.id.clone(),
-                    call_id,
-                    content,
-                ),
-                None => UserContent::tool_result(call.tool_call.id.clone(), content),
-            }
-        })
-        .collect()
-}
-
-/// One hand-driven, non-streamed model call: send the step's prompt and
-/// history through the agent's completion builder and shape the response into
-/// a [`ModelTurn`] with the given advertised tool names.
-pub(crate) async fn call_model(
-    agent: &GeminiAgent,
-    prompt: Message,
-    history: Vec<Message>,
-    executable: &BTreeSet<String>,
-    allowed: &BTreeSet<String>,
-) -> ModelTurn {
-    let response = agent
-        .completion(prompt, history)
-        .await
-        .expect("completion request should build")
-        .send()
-        .await
-        .expect("gemini completion should succeed");
-    ModelTurn::new(
-        response.message_id.clone(),
-        response.choice.clone(),
-        response.usage,
-        executable.clone(),
-        allowed.clone(),
-    )
 }
 
 pub(crate) fn assistant_tool_call_names(message: &Message) -> Vec<String> {
@@ -245,14 +152,6 @@ pub(crate) fn is_tool_result_user_message(message: &Message) -> bool {
         Message::User { content }
             if content.iter().any(|item| matches!(item, UserContent::ToolResult(_)))
     )
-}
-
-pub(crate) fn sum_completion_call_usage(calls: &[CompletionCall]) -> Usage {
-    let mut total = Usage::new();
-    for call in calls {
-        total += call.usage;
-    }
-    total
 }
 
 /// Assert each assistant message in `messages` records content in canonical

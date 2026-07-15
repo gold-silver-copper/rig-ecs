@@ -73,11 +73,11 @@ async fn stream_tool_call_completed_response_without_output() {
 
             while let Some(chunk) = stream.next().await {
                 match chunk.expect("stream item should be ok") {
-                    StreamedAssistantContent::ToolCall { tool_call, .. } => {
-                        if tool_call.function.name == "ping" {
-                            assert_eq!(tool_call.function.arguments, json!({}));
-                            saw_ping_tool_call = true;
-                        }
+                    StreamedAssistantContent::ToolCall { tool_call, .. }
+                        if tool_call.function.name == "ping" =>
+                    {
+                        assert_eq!(tool_call.function.arguments, json!({}));
+                        saw_ping_tool_call = true;
                     }
                     StreamedAssistantContent::Final(response) => {
                         final_usage = Some(response.usage);

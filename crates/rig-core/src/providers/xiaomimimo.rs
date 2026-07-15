@@ -30,7 +30,6 @@ use crate::model::{Model, ModelList, ModelListingError};
 use crate::providers::anthropic::client::{
     AnthropicBuilder as AnthropicCompatBuilder, AnthropicKey, finish_anthropic_builder,
 };
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 
 /// OpenAI-compatible base URL.
 pub const API_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
@@ -306,7 +305,7 @@ pub struct XiaomiMimoModelLister<H = reqwest::Client> {
 
 impl<H> ModelLister<H> for XiaomiMimoModelLister<H>
 where
-    H: HttpClientExt + WasmCompatSend + WasmCompatSync + 'static,
+    H: HttpClientExt + Send + Sync + 'static,
 {
     type Client = Client<H>;
 

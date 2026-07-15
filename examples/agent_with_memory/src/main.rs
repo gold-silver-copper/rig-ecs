@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::Prompt;
 use rig::memory::InMemoryConversationMemory;
 use rig::providers::openai;
 

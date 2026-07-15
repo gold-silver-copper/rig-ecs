@@ -3,7 +3,7 @@
 //! Memory differs from existing agent context features:
 //! - [`crate::agent::AgentBuilder::context`]: static documents always included in prompts.
 //! - [`crate::agent::AgentBuilder::dynamic_context`]: RAG documents fetched from a vector store.
-//! - [`crate::agent::prompt_request::PromptRequest::history`]: caller-managed message history.
+//! - [`crate::agent::AgentPromptRequest::history`]: caller-managed message history.
 //! - **Memory** (this module): Rig-managed history loaded and saved automatically per
 //!   conversation id.
 //!
@@ -40,18 +40,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{
-    completion::Message,
-    wasm_compat::{WasmBoxedFuture, WasmCompatSend, WasmCompatSync},
-};
+use futures::future::BoxFuture;
+
+use crate::completion::Message;
 
 /// Boxed error source for memory backend failures.
-#[cfg(not(target_family = "wasm"))]
 pub type MemoryBackendError = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-/// Boxed error source for memory backend failures.
-#[cfg(target_family = "wasm")]
-pub type MemoryBackendError = Box<dyn std::error::Error + 'static>;
 
 /// Errors produced by a [`ConversationMemory`] backend.
 #[derive(Debug, thiserror::Error)]
@@ -90,14 +84,14 @@ impl MemoryError {
 ///
 /// Implementations should keep `append` cheap; it runs inline before the agent
 /// returns its response.
-pub trait ConversationMemory: WasmCompatSend + WasmCompatSync {
+pub trait ConversationMemory: Send + Sync {
     /// Load the full conversation history for `conversation_id`.
     ///
     /// Returns an empty `Vec` if the conversation has no stored messages.
     fn load<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>>;
+    ) -> BoxFuture<'a, Result<Vec<Message>, MemoryError>>;
 
     /// Append `messages` to the conversation identified by `conversation_id`.
     ///
@@ -107,13 +101,10 @@ pub trait ConversationMemory: WasmCompatSend + WasmCompatSync {
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>>;
+    ) -> BoxFuture<'a, Result<(), MemoryError>>;
 
     /// Remove all stored messages for `conversation_id`.
-    fn clear<'a>(
-        &'a self,
-        conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>>;
+    fn clear<'a>(&'a self, conversation_id: &'a str) -> BoxFuture<'a, Result<(), MemoryError>>;
 }
 
 impl<M> ConversationMemory for Arc<M>
@@ -123,7 +114,7 @@ where
     fn load<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
+    ) -> BoxFuture<'a, Result<Vec<Message>, MemoryError>> {
         (**self).load(conversation_id)
     }
 
@@ -131,14 +122,11 @@ where
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> BoxFuture<'a, Result<(), MemoryError>> {
         (**self).append(conversation_id, messages)
     }
 
-    fn clear<'a>(
-        &'a self,
-        conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    fn clear<'a>(&'a self, conversation_id: &'a str) -> BoxFuture<'a, Result<(), MemoryError>> {
         (**self).clear(conversation_id)
     }
 }
@@ -150,7 +138,7 @@ where
     fn load<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
+    ) -> BoxFuture<'a, Result<Vec<Message>, MemoryError>> {
         (**self).load(conversation_id)
     }
 
@@ -158,14 +146,11 @@ where
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> BoxFuture<'a, Result<(), MemoryError>> {
         (**self).append(conversation_id, messages)
     }
 
-    fn clear<'a>(
-        &'a self,
-        conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    fn clear<'a>(&'a self, conversation_id: &'a str) -> BoxFuture<'a, Result<(), MemoryError>> {
         (**self).clear(conversation_id)
     }
 }
@@ -175,15 +160,9 @@ where
 /// Implemented automatically for any closure with the right signature; the
 /// trait exists to combine `Fn` with the WASM-compatible `Send`/`Sync` markers
 /// in a single trait object.
-pub trait MessageFilter:
-    Fn(Vec<Message>) -> Vec<Message> + WasmCompatSend + WasmCompatSync
-{
-}
+pub trait MessageFilter: Fn(Vec<Message>) -> Vec<Message> + Send + Sync {}
 
-impl<F> MessageFilter for F where
-    F: Fn(Vec<Message>) -> Vec<Message> + WasmCompatSend + WasmCompatSync
-{
-}
+impl<F> MessageFilter for F where F: Fn(Vec<Message>) -> Vec<Message> + Send + Sync {}
 
 /// A side-channel for messages that a memory policy or adapter removes from
 /// active history during [`ConversationMemory::load`].
@@ -217,7 +196,7 @@ impl<F> MessageFilter for F where
 /// messages again. Hooks that append to durable storage should
 /// deduplicate by content hash, by `(conversation_id, message_id)`,
 /// or by an equivalent stable key.
-pub trait DemotionHook: WasmCompatSend + WasmCompatSync {
+pub trait DemotionHook: Send + Sync {
     /// Receive `messages` that were demoted out of the active window for
     /// `conversation_id`.
     ///
@@ -227,7 +206,7 @@ pub trait DemotionHook: WasmCompatSend + WasmCompatSync {
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>>;
+    ) -> BoxFuture<'a, Result<(), MemoryError>>;
 }
 
 /// A [`DemotionHook`] that does nothing. Useful as a default when an adapter
@@ -240,7 +219,7 @@ impl DemotionHook for NoopDemotionHook {
         &'a self,
         _conversation_id: &'a str,
         _messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> BoxFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move { Ok(()) })
     }
 }
@@ -256,7 +235,7 @@ where
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> BoxFuture<'a, Result<(), MemoryError>> {
         (**self).on_demote(conversation_id, messages)
     }
 }
@@ -293,14 +272,14 @@ where
 /// that have side effects (writing summaries to a vector store, billing an
 /// LLM call) should deduplicate by conversation id and content hash, the
 /// same way [`DemotionHook`] implementations do.
-pub trait Compactor: WasmCompatSend + WasmCompatSync {
+pub trait Compactor: Send + Sync {
     /// The summary value produced by [`Compactor::compact`].
     ///
     /// `Into<Message>` is required so the composing adapter can splice the
     /// artifact at the front of the loaded history. `Clone` is required so
     /// the adapter can keep a private copy as `carry_over` for the next
     /// compaction.
-    type Artifact: Into<Message> + Clone + WasmCompatSend + WasmCompatSync + 'static;
+    type Artifact: Into<Message> + Clone + Send + Sync + 'static;
 
     /// Produce a summary artifact for `evicted`, optionally combining it
     /// with the previous summary in `carry_over`.
@@ -316,7 +295,7 @@ pub trait Compactor: WasmCompatSend + WasmCompatSync {
         conversation_id: &'a str,
         evicted: &'a [Message],
         carry_over: Option<&'a Self::Artifact>,
-    ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>>;
+    ) -> BoxFuture<'a, Result<Self::Artifact, MemoryError>>;
 }
 
 /// Forwarding impl so callers can pass `Arc<C>` wherever a `Compactor` is
@@ -332,7 +311,7 @@ where
         conversation_id: &'a str,
         evicted: &'a [Message],
         carry_over: Option<&'a Self::Artifact>,
-    ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
+    ) -> BoxFuture<'a, Result<Self::Artifact, MemoryError>> {
         (**self).compact(conversation_id, evicted, carry_over)
     }
 }
@@ -390,7 +369,7 @@ impl ConversationMemory for InMemoryConversationMemory {
     fn load<'a>(
         &'a self,
         conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
+    ) -> BoxFuture<'a, Result<Vec<Message>, MemoryError>> {
         Box::pin(async move {
             let messages = {
                 let guard = self.lock()?;
@@ -407,7 +386,7 @@ impl ConversationMemory for InMemoryConversationMemory {
         &'a self,
         conversation_id: &'a str,
         messages: Vec<Message>,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    ) -> BoxFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move {
             let mut guard = self.lock()?;
             guard
@@ -418,10 +397,7 @@ impl ConversationMemory for InMemoryConversationMemory {
         })
     }
 
-    fn clear<'a>(
-        &'a self,
-        conversation_id: &'a str,
-    ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
+    fn clear<'a>(&'a self, conversation_id: &'a str) -> BoxFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move {
             let mut guard = self.lock()?;
             guard.remove(conversation_id);

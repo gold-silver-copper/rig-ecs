@@ -2,8 +2,8 @@ use anyhow::Result;
 use rig::prelude::*;
 use rig::providers::anthropic::{self, Client};
 use rig::{
-    Embed, completion::Prompt, embeddings::EmbeddingsBuilder, message::Message,
-    tool::builtin::ThinkTool, vector_store::in_memory_store::InMemoryVectorStore,
+    Embed, embeddings::EmbeddingsBuilder, tool::builtin::ThinkTool,
+    vector_store::in_memory_store::InMemoryVectorStore,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -80,44 +80,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create vector store index
     let vector_index = vector_store.index(embedding_model);
 
-    // Create specialized research agent that will be used as a tool
-    let research_agent = anthropic_client
-        .agent(anthropic::completion::CLAUDE_SONNET_4_6)
-        .preamble(
-            "You are a specialized research agent focused on environmental science and sustainability.
-            Your role is to provide detailed, accurate information about climate change, renewable energy,
-            sustainable practices, and related topics. Always cite your sources when possible and
-            maintain scientific accuracy in your responses."
-        )
-        .name("research_agent")
-        .build();
-
-    // Create a data analysis agent that will be used as a tool
-    let analysis_agent = anthropic_client
-        .agent(anthropic::completion::CLAUDE_SONNET_4_6)
-        .preamble(
-            "You are a data analysis agent specialized in interpreting environmental and sustainability data.
-            When given data or statistics, you analyze trends, identify patterns, and draw meaningful conclusions.
-            You're skilled at explaining complex data in accessible terms while maintaining scientific accuracy.
-            Always note limitations in the data and avoid overextending conclusions beyond what the evidence supports."
-        )
-        .name("data_analysis_agent")
-        .build();
-
-    // Create a recommendation agent that will be used as a tool
-    let recommendation_agent = anthropic_client
-        .agent(anthropic::completion::CLAUDE_SONNET_4_6)
-        .preamble(
-            "You are a recommendation agent specialized in suggesting practical sustainability solutions.
-            Based on research findings and analysis, you provide actionable recommendations for individuals,
-            organizations, or policymakers. Your suggestions should be specific, feasible, and tailored to
-            the context. Consider factors like cost, implementation difficulty, and potential impact when
-            making recommendations."
-        )
-        .name("recommendation_agent")
-        .build();
-
-    // Create the main orchestrator agent that will use all the tools
+    // Create the ECS agent and install its executable capabilities as entities.
     let orchestrator_agent = anthropic_client
         .agent(anthropic::completion::CLAUDE_SONNET_4_6)
         .preamble(
@@ -142,9 +105,6 @@ async fn main() -> Result<(), anyhow::Error> {
         )
         .tool(ThinkTool)
         .tool(vector_index)
-        .dynamic_tool(research_agent.into_tool())
-        .dynamic_tool(analysis_agent.into_tool())
-        .dynamic_tool(recommendation_agent.into_tool())
         .name("orchestrator_agent")
         .build();
 
@@ -163,40 +123,10 @@ async fn main() -> Result<(), anyhow::Error> {
     println!("Query: {}", query);
     println!("\nProcessing...\n");
 
-    // Send the query to the orchestrator agent with extended details to get chat history
-    let empty_history: &[Message] = &[];
-    let response = orchestrator_agent
-        .prompt(query)
-        .history(empty_history)
-        .max_turns(15) // Allow multiple turns to demonstrate the complex loop
-        .extended_details()
-        .await?;
+    let response = orchestrator_agent.prompt(query).await?;
 
     // Print the final response
-    println!("\nFinal Response:\n{}", response.output);
-
-    // Print the chat history to show the agentic loop
-    println!("\nAgentic Loop Details:");
-    if let Some(messages) = &response.messages {
-        for (i, message) in messages.clone().into_iter().enumerate() {
-            match message {
-                Message::User { content } => println!(
-                    "\nUser [{}]: {}",
-                    i,
-                    serde_json::to_string_pretty(&content)?
-                ),
-                Message::Assistant { content, .. } => println!(
-                    "Assistant [{}]: {}",
-                    i,
-                    serde_json::to_string_pretty(&content)?
-                ),
-                _ => {
-                    // Ignore other message types - the only other type of message that exists is system messages
-                    // which can be ignored
-                }
-            }
-        }
-    }
+    println!("\nFinal Response:\n{response}");
 
     Ok(())
 }

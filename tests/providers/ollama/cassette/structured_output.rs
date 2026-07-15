@@ -4,7 +4,6 @@
 //! local Ollama server.
 
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 
 use super::super::support::with_ollama_cassette;
 use crate::support::{

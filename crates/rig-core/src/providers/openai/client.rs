@@ -7,7 +7,6 @@ use crate::{
     extractor::ExtractorBuilder,
     http_client::{self, HttpClientExt},
     prelude::CompletionClient,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -139,13 +138,7 @@ impl ProviderBuilder for OpenAICompletionsExtBuilder {
 
 impl<H> Client<H>
 where
-    H: HttpClientExt
-        + Clone
-        + std::fmt::Debug
-        + Default
-        + WasmCompatSend
-        + WasmCompatSync
-        + 'static,
+    H: HttpClientExt + Clone + std::fmt::Debug + Default + Send + Sync + 'static,
 {
     /// Create an extractor builder with the given completion model.
     /// Uses the OpenAI Responses API (default behavior).
@@ -154,7 +147,7 @@ where
         model: impl Into<String>,
     ) -> ExtractorBuilder<super::responses_api::ResponsesCompletionModel<H>, U>
     where
-        U: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync,
+        U: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync,
     {
         ExtractorBuilder::new(self.completion_model(model))
     }
@@ -224,13 +217,7 @@ impl Client<reqwest::Client> {
 
 impl<H> CompletionsClient<H>
 where
-    H: HttpClientExt
-        + Clone
-        + std::fmt::Debug
-        + Default
-        + WasmCompatSend
-        + WasmCompatSync
-        + 'static,
+    H: HttpClientExt + Clone + std::fmt::Debug + Default + Send + Sync + 'static,
 {
     /// Create an extractor builder with the given completion model.
     /// Uses the OpenAI Chat Completions API.
@@ -239,7 +226,7 @@ where
         model: impl Into<String>,
     ) -> ExtractorBuilder<super::completion::CompletionModel<H>, U>
     where
-        U: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync,
+        U: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync,
     {
         ExtractorBuilder::new(self.completion_model(model))
     }

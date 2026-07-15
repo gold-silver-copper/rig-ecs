@@ -49,11 +49,7 @@ impl<M: CompletionModel + 'static> Tool for TranslatorTool<M> {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let mut empty_history = Vec::<Message>::new();
         match self.0.chat(&args.prompt, &mut empty_history).await {
             Ok(response) => {
@@ -86,7 +82,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let translator_tool = TranslatorTool(translator_agent);
 
     let multi_agent_system = AgentBuilder::new(model)
-        .preamble(&format!(
+        .preamble(format!(
             "You are a helpful assistant that can work with text in any language. \
             When you receive input that is not in English, or contains grammatical errors \
             use the {} tool first to ensure proper English, then provide your response. \

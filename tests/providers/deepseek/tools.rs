@@ -1,7 +1,6 @@
 //! DeepSeek tools smoke test.
 
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::providers::deepseek;
 
 use super::support::with_deepseek_cassette;

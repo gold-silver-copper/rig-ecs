@@ -6,7 +6,6 @@ use crate::{
     },
     embeddings::EmbeddingsBuilder,
     http_client::{self, HttpClientExt},
-    wasm_compat::*,
 };
 
 use super::{CompletionModel, EmbeddingModel};
@@ -101,7 +100,7 @@ pub enum ApiResponse<T> {
 
 impl<T> Client<T>
 where
-    T: HttpClientExt + Clone + WasmCompatSend + WasmCompatSync + 'static,
+    T: HttpClientExt + Clone + Send + Sync + 'static,
 {
     pub fn embeddings<D: Embed>(
         &self,

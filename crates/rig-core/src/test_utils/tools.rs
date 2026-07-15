@@ -1,6 +1,6 @@
 //! Tool helpers for deterministic tests.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -8,9 +8,8 @@ use serde_json::json;
 use crate::{
     OneOrMany,
     message::{ImageMediaType, ToolResultContent},
-    tool::{Tool, ToolContext, ToolErrorKind, ToolExecutionError, ToolOutput, ToolSet},
+    tool::{Tool, ToolErrorKind, ToolExecutionError, ToolOutput},
     vector_store::{VectorSearchRequest, VectorStoreError, VectorStoreIndex, request::Filter},
-    wasm_compat::WasmCompatSend,
 };
 
 /// Shared error type for mock tools.
@@ -56,78 +55,8 @@ impl Tool for MockAddTool {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(args.x + args.y)
-    }
-}
-
-/// A caller-injected context value, like a session id or auth token carried in
-/// a [`ToolContext`](crate::tool::ToolContext).
-#[derive(Clone)]
-pub struct SessionId(pub String);
-
-/// A mock tool that records whatever it observed in its per-call
-/// [`ToolContext`], so tests can assert the context reached tool execution.
-///
-/// The single `call` method records `session:<id>` (or `no-session`).
-#[derive(Clone, Default)]
-pub struct MockContextProbeTool {
-    /// One entry per call, in call order — lets tests assert across multiple
-    /// tool-call rounds, not just the most recent.
-    seen: Arc<Mutex<Vec<String>>>,
-}
-
-impl MockContextProbeTool {
-    /// What the tool observed on its most recent call, if it has been called.
-    pub fn observed(&self) -> Option<String> {
-        self.seen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .last()
-            .cloned()
-    }
-
-    /// Everything the tool observed, one entry per call in call order.
-    pub fn observations(&self) -> Vec<String> {
-        self.seen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-}
-
-impl Tool for MockContextProbeTool {
-    const NAME: &'static str = "context_probe";
-    type Error = rig::tool::ToolExecutionError;
-    type Args = serde_json::Value;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Records the SessionId observed in its call context".to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({"type": "object", "properties": {}})
-    }
-
-    async fn call(
-        &self,
-        context: &mut ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, ToolExecutionError> {
-        let observed = match context.get::<SessionId>() {
-            Some(session) => format!("session:{}", session.0),
-            None => "no-session".to_string(),
-        };
-        self.seen
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(observed.clone());
-        Ok(observed)
     }
 }
 
@@ -162,21 +91,9 @@ impl Tool for MockSubtractTool {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(args.x - args.y)
     }
-}
-
-/// Create a [`ToolSet`] containing [`MockAddTool`] and [`MockSubtractTool`].
-pub fn mock_math_toolset() -> ToolSet {
-    let mut toolset = ToolSet::default();
-    toolset.add_tool(MockAddTool);
-    toolset.add_tool(MockSubtractTool);
-    toolset
 }
 
 /// A mock tool that returns a multiline string.
@@ -200,11 +117,7 @@ impl Tool for MockStringOutputTool {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok("Hello\nWorld".to_string())
     }
 }
@@ -230,11 +143,7 @@ impl Tool for MockImageOutputTool {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(ToolOutput::content(OneOrMany::one(
             ToolResultContent::image_base64("base64data==", Some(ImageMediaType::PNG), None),
         )))
@@ -263,11 +172,7 @@ impl Tool for MockImageGeneratorTool {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(ToolOutput::content(OneOrMany::one(
             ToolResultContent::image_base64(
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
@@ -299,11 +204,7 @@ impl Tool for MockObjectOutputTool {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(json!({
             "status": "ok",
             "count": 42
@@ -332,11 +233,7 @@ impl Tool for MockExampleTool {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        _input: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _input: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok("Example answer".to_string())
     }
 }
@@ -369,11 +266,7 @@ impl Tool for MockBarrierTool {
         json!({"type": "object", "properties": {}})
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.barrier.wait().await;
         Ok("done".to_string())
     }
@@ -412,11 +305,7 @@ impl Tool for MockControlledTool {
         json!({"type": "object", "properties": {}})
     }
 
-    async fn call(
-        &self,
-        _context: &mut crate::tool::ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.started.notify_one();
         self.allow_finish.notified().await;
         Ok(42)
@@ -440,7 +329,7 @@ impl MockToolIndex {
 impl VectorStoreIndex for MockToolIndex {
     type Filter = Filter<serde_json::Value>;
 
-    async fn top_n<T: for<'a> Deserialize<'a> + WasmCompatSend>(
+    async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
         _req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
@@ -479,7 +368,7 @@ impl BarrierMockToolIndex {
 impl VectorStoreIndex for BarrierMockToolIndex {
     type Filter = Filter<serde_json::Value>;
 
-    async fn top_n<T: for<'a> Deserialize<'a> + WasmCompatSend>(
+    async fn top_n<T: for<'a> Deserialize<'a> + Send>(
         &self,
         _req: VectorSearchRequest,
     ) -> Result<Vec<(f64, String, T)>, VectorStoreError> {
@@ -529,11 +418,7 @@ impl Tool for MockFailingTool {
         json!({ "type": "object", "properties": {} })
     }
 
-    async fn call(
-        &self,
-        _context: &mut ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Err(MockFailure)
     }
 
@@ -565,11 +450,7 @@ impl Tool for MockHandledFailureTool {
         json!({ "type": "object", "properties": {} })
     }
 
-    async fn call(
-        &self,
-        _context: &mut ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Err(MockToolError)
     }
 
@@ -599,11 +480,7 @@ impl Tool for MockDeniedTool {
         json!({ "type": "object", "properties": {} })
     }
 
-    async fn call(
-        &self,
-        _context: &mut ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Err(MockToolError)
     }
 
@@ -611,39 +488,5 @@ impl Tool for MockDeniedTool {
         ToolExecutionError::refused("operator authorization policy rejected the request")
             .with_model_feedback("access to this resource is not permitted")
             .with_source(error)
-    }
-}
-
-/// Cloneable metadata a [`MockMetadataTool`] attaches to its result, used to
-/// verify that result metadata reaches hooks without being sent to the model.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MockRequestId(pub String);
-
-/// A tool whose success carries a [`MockRequestId`] in its result metadata.
-/// Registered under the name `with_meta`.
-#[derive(Clone)]
-pub struct MockMetadataTool;
-
-impl Tool for MockMetadataTool {
-    const NAME: &'static str = "with_meta";
-    type Error = MockToolError;
-    type Args = serde_json::Value;
-    type Output = String;
-
-    fn description(&self) -> String {
-        "Succeeds and attaches request metadata".to_string()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        json!({ "type": "object", "properties": {} })
-    }
-
-    async fn call(
-        &self,
-        context: &mut ToolContext,
-        _args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        context.insert_result(MockRequestId("req-7".to_string()));
-        Ok("done".to_string())
     }
 }

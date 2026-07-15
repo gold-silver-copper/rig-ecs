@@ -2,7 +2,6 @@ use super::{client::ApiResponse, client::Client};
 use crate::{
     embeddings::{self, EmbeddingError},
     http_client::HttpClientExt,
-    wasm_compat::*,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -67,7 +66,7 @@ pub struct EmbeddingModel<T = reqwest::Client> {
 
 impl<T> embeddings::EmbeddingModel for EmbeddingModel<T>
 where
-    T: HttpClientExt + Clone + WasmCompatSend + WasmCompatSync + 'static,
+    T: HttpClientExt + Clone + Send + Sync + 'static,
 {
     const MAX_DOCUMENTS: usize = 96;
     type Client = Client<T>;
@@ -143,7 +142,7 @@ where
                     Ok(response
                         .embeddings
                         .into_iter()
-                        .zip(documents.into_iter())
+                        .zip(documents)
                         .map(|(embedding, document)| embeddings::Embedding {
                             document,
                             vec: embedding.into_iter().filter_map(|n| n.as_f64()).collect(),

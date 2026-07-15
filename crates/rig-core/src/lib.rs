@@ -77,7 +77,7 @@
 //! [ConversationMemory](crate::memory::ConversationMemory) trait. Attach a backend
 //! with [`AgentBuilder::memory`](crate::agent::AgentBuilder::memory) and identify the
 //! conversation per-request via
-//! [`PromptRequest::conversation`](crate::agent::prompt_request::PromptRequest::conversation).
+//! [`AgentPromptRequest::conversation`](crate::agent::AgentPromptRequest::conversation).
 //! The default in-process backend
 //! [InMemoryConversationMemory](crate::memory::InMemoryConversationMemory) is suitable
 //! for tests and single-process agents; reusable history-shaping policies (sliding
@@ -166,15 +166,17 @@ pub mod prelude;
 pub(crate) mod provider_response;
 pub mod providers;
 pub mod rerank;
+pub mod runtime;
 
 pub mod streaming;
 #[cfg(any(test, feature = "test-utils"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "test-utils")))]
 pub mod test_utils;
+#[cfg(feature = "rmcp")]
+pub(crate) mod time;
 pub mod tool;
 pub mod transcription;
 pub mod vector_store;
-pub mod wasm_compat;
 
 // Re-export commonly used types and traits
 pub use completion::message;
@@ -189,3 +191,5 @@ pub use schemars;
 pub use rig_derive::{Embed, rig_tool as tool_macro};
 
 pub mod telemetry;
+/// The exact Bevy ECS version used by Rig.
+pub use bevy_ecs;

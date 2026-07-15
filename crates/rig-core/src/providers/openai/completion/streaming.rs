@@ -132,11 +132,7 @@ where
 impl<Ext, H> GenericCompletionModel<Ext, H>
 where
     crate::client::Client<Ext, H>: HttpClientExt + Clone + 'static,
-    Ext: crate::client::Provider
-        + OpenAICompatibleProvider
-        + Clone
-        + crate::wasm_compat::WasmCompatSend
-        + 'static,
+    Ext: crate::client::Provider + OpenAICompatibleProvider + Clone + Send + 'static,
 {
     pub(crate) async fn stream(
         &self,
@@ -240,14 +236,8 @@ struct OpenAICompatibleProfile<Ext = crate::providers::openai::OpenAICompletions
 
 impl<Ext, U> CompatibleStreamProfile for OpenAICompatibleProfile<Ext, U>
 where
-    Ext: OpenAICompatibleProvider + Clone + crate::wasm_compat::WasmCompatSend,
-    U: Clone
-        + Default
-        + GetTokenUsage
-        + serde::de::DeserializeOwned
-        + crate::wasm_compat::WasmCompatSend
-        + Unpin
-        + 'static,
+    Ext: OpenAICompatibleProvider + Clone + Send,
+    U: Clone + Default + GetTokenUsage + serde::de::DeserializeOwned + Send + Unpin + 'static,
 {
     type Usage = U;
     type Detail = serde_json::Value;

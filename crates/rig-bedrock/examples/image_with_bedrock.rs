@@ -1,7 +1,7 @@
 use reqwest::Client;
 
 use rig_core::{
-    completion::{Prompt, message::Image},
+    completion::message::Image,
     message::{DocumentSourceKind, ImageMediaType},
 };
 

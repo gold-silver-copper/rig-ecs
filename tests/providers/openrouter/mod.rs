@@ -11,15 +11,12 @@ mod cassette {
     mod multi_extract;
     mod multimodal;
     mod openai_responses_compat;
-    mod permission_control;
     mod provider_selection;
     mod reasoning_roundtrip;
     mod reasoning_tool_roundtrip;
-    mod request_hook;
     mod streaming;
     mod streaming_tools;
     mod transcription;
-    mod typed_prompt_tools;
 }
 
 #[cfg(feature = "audio")]

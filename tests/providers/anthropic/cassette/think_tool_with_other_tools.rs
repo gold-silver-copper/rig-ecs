@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use rig::client::CompletionClient;
-use rig::completion::Prompt;
 use rig::message::{AssistantContent, Message};
 use rig::providers::anthropic;
 use rig::tool::Tool;
@@ -58,11 +57,7 @@ impl Tool for Calculator {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         evaluate_expression(&args.expression).map_err(CalculatorError)
     }
@@ -230,11 +225,7 @@ impl Tool for DatabaseLookup {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
 
         let value = match args.query {

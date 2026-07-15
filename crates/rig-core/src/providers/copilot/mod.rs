@@ -38,7 +38,6 @@ use crate::providers::openai;
 use crate::providers::openai::responses_api::{self, CompletionRequest as ResponsesRequest};
 use crate::streaming::{self, RawStreamingChoice, StreamingCompletionResponse};
 use crate::telemetry::{CompletionOperation, CompletionSpanBuilder};
-use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use async_stream::stream;
 use futures::StreamExt;
 use http::Request;
@@ -374,7 +373,7 @@ where
 
 impl<H> Client<H>
 where
-    H: HttpClientExt + Clone + Debug + Default + WasmCompatSend + WasmCompatSync + 'static,
+    H: HttpClientExt + Clone + Debug + Default + Send + Sync + 'static,
 {
     pub async fn authorize(&self) -> Result<(), auth::AuthError> {
         self.ext().auth.auth_context().await.map(|_| ())
@@ -731,7 +730,7 @@ pub struct CompletionModel<H = reqwest::Client> {
 impl<H> CompletionModel<H>
 where
     Client<H>: HttpClientExt + Clone + Debug + 'static,
-    H: Clone + Default + Debug + WasmCompatSend + WasmCompatSync + 'static,
+    H: Clone + Default + Debug + Send + Sync + 'static,
 {
     pub fn new(client: Client<H>, model: impl Into<String>) -> Self {
         Self {
@@ -1227,7 +1226,7 @@ where
 impl<H> completion::CompletionModel for CompletionModel<H>
 where
     Client<H>: HttpClientExt + Clone + Debug + 'static,
-    H: Clone + Default + Debug + WasmCompatSend + WasmCompatSync + 'static,
+    H: Clone + Default + Debug + Send + Sync + 'static,
 {
     type Response = CopilotCompletionResponse;
     type StreamingResponse = CopilotStreamingResponse;
@@ -1295,8 +1294,8 @@ where
 
 impl<H> embeddings::EmbeddingModel for EmbeddingModel<H>
 where
-    Client<H>: HttpClientExt + Clone + Debug + WasmCompatSend + WasmCompatSync + 'static,
-    H: Clone + Default + Debug + WasmCompatSend + WasmCompatSync + 'static,
+    Client<H>: HttpClientExt + Clone + Debug + Send + Sync + 'static,
+    H: Clone + Default + Debug + Send + Sync + 'static,
 {
     const MAX_DOCUMENTS: usize = 1024;
     type Client = Client<H>;
@@ -1396,7 +1395,7 @@ where
             Ok(body
                 .data
                 .into_iter()
-                .zip(documents.into_iter())
+                .zip(documents)
                 .map(|(embedding, document)| embeddings::Embedding {
                     document,
                     vec: embedding
@@ -1458,7 +1457,7 @@ pub struct CopilotModelLister<H = reqwest::Client> {
 
 impl<H> ModelLister<H> for CopilotModelLister<H>
 where
-    H: HttpClientExt + Clone + Debug + Default + WasmCompatSend + WasmCompatSync + 'static,
+    H: HttpClientExt + Clone + Debug + Default + Send + Sync + 'static,
 {
     type Client = Client<H>;
 

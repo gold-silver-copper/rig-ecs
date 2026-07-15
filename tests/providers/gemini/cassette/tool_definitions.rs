@@ -14,8 +14,11 @@ use serde_json::json;
 
 use super::super::agent_run_support::tool_result_texts;
 use super::super::support::with_gemini_cassette;
-use super::super::tools_support::MathError;
 use crate::support::assert_nonempty_response;
+
+#[derive(Debug, thiserror::Error)]
+#[error("tool failed")]
+struct MathError;
 
 #[derive(Deserialize, Serialize)]
 struct TripArgs {
@@ -72,11 +75,7 @@ impl Tool for PlanTrip {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(format!(
             "itinerary booked: {} travellers to {} by {} via {}",
             args.travellers,
@@ -117,11 +116,7 @@ impl Tool for LegacyEcho {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(format!("legacy:{}", args.text))
     }
 }
@@ -149,11 +144,7 @@ impl Tool for ModernEcho {
         })
     }
 
-    async fn call(
-        &self,
-        _context: &mut rig::tool::ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(format!("modern:{}", args.text))
     }
 }

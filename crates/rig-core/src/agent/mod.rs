@@ -1,136 +1,423 @@
-//! This module contains the implementation of the [Agent] struct and its builder.
+//! ECS-native agent construction and observation facades.
 //!
-//! The [Agent] struct represents an LLM agent, which combines an LLM model with a preamble (system prompt),
-//! a set of context documents, and a set of tools. Note: both context documents and tools can be either
-//! static (i.e.: they are always provided) or dynamic (i.e.: they are RAGged at prompt-time).
-//!
-//! The [Agent] struct is highly configurable, allowing the user to define anything from
-//! a simple bot with a specific system prompt to a complex RAG system with a set of dynamic
-//! context documents and tools.
-//!
-//! The [Agent] struct implements the [crate::completion::Completion] and [crate::completion::Prompt] traits,
-//! allowing it to be used for generating completions responses and prompts. The [Agent] struct also
-//! implements the [crate::completion::Chat] trait, which allows it to be used for generating chat completions.
-//!
-//! The [AgentBuilder] implements the builder pattern for creating instances of [Agent].
-//! It allows configuring the model, preamble, context documents, tools, temperature, and additional parameters
-//! before building the agent.
-//!
-//! # Example
-//! ```no_run
-//! use rig_core::{
-//!     client::{CompletionClient, ProviderClient},
-//!     completion::{Chat, Completion, Prompt},
-//!     providers::openai,
-//! };
-//!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let openai = openai::Client::from_env()?;
-//!
-//! // Configure the agent
-//! let agent = openai.agent(openai::GPT_5_2)
-//!     .preamble("System prompt")
-//!     .context("Context document 1")
-//!     .context("Context document 2")
-//!     .temperature(0.8)
-//!     .build();
-//!
-//! // Use the agent for completions and prompts
-//! // Generate a chat completion response from a prompt and chat history
-//! let chat_response = agent.chat("Prompt", &mut Vec::<rig_core::completion::Message>::new()).await?;
-//!
-//! // Generate a prompt completion response from a simple prompt
-//! let prompt_response = agent.prompt("Prompt").await?;
-//!
-//! // Generate a completion request builder from a prompt and chat history. The builder
-//! // will contain the agent's configuration (i.e.: preamble, context documents, tools,
-//! // model parameters, etc.), but these can be overwritten.
-//! let completion_req_builder = agent
-//!     .completion("Prompt", Vec::<rig_core::completion::Message>::new())
-//!     .await?;
-//!
-//! let response = completion_req_builder
-//!     .temperature(0.9) // Overwrite the agent's temperature
-//!     .send()
-//!     .await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! RAG Agent example
-//! ```no_run
-//! use rig_core::{
-//!     client::{CompletionClient, EmbeddingsClient, ProviderClient},
-//!     completion::Prompt,
-//!     embeddings::EmbeddingsBuilder,
-//!     providers::openai,
-//!     vector_store::in_memory_store::InMemoryVectorStore,
-//! };
-//!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! // Initialize OpenAI client
-//! let openai = openai::Client::from_env()?;
-//!
-//! // Initialize OpenAI embedding model
-//! let embedding_model = openai.embedding_model(openai::TEXT_EMBEDDING_3_SMALL);
-//!
-//! // Create vector store, compute embeddings and load them in the store
-//! let mut vector_store = InMemoryVectorStore::default();
-//!
-//! let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
-//!     .documents(vec![
-//!         "Definition of a *flurbo*: A flurbo is a green alien that lives on cold planets",
-//!         "Definition of a *glarb-glarb*: A glarb-glarb is an ancient tool used by the ancestors of the inhabitants of planet Jiro to farm the land.",
-//!         "Definition of a *linglingdong*: A term used by inhabitants of the far side of the moon to describe humans.",
-//!     ])?
-//!     .build()
-//!     .await?;
-//!
-//! vector_store.add_documents(embeddings);
-//!
-//! // Create vector store index
-//! let index = vector_store.index(embedding_model);
-//!
-//! let agent = openai.agent(openai::GPT_5_2)
-//!     .preamble("
-//!         You are a dictionary assistant here to assist the user in understanding the meaning of words.
-//!         You will find additional non-standard word definitions that could be useful below.
-//!     ")
-//!     .dynamic_context(1, index)
-//!     .build();
-//!
-//! // Prompt the agent and print the response
-//! let response = agent.prompt("What does \"glarb-glarb\" mean?").await?;
-//! # Ok(())
-//! # }
-//! ```
-mod builder;
-mod completion;
-pub mod hook;
-pub(crate) mod prompt_request;
-pub mod run;
-pub mod runner;
-mod tool;
+//! The types in this module are handles around an authoritative
+//! [`World`](crate::bevy_ecs::world::World). They do not contain a runner,
+//! registry, callback stack, or duplicated orchestration state.
 
-/// Fallback display name used in telemetry spans and logs when an agent has no
-/// configured name.
-pub(crate) const UNKNOWN_AGENT_NAME: &str = "Unnamed Agent";
+use std::{future::IntoFuture, pin::Pin};
 
-pub use crate::message::Text;
-pub use builder::{AgentBuilder, NoToolConfig, WithBuilderTools, WithToolServerHandle};
-pub use completion::Agent;
-pub use hook::CompletionCall as CompletionCallEvent;
-pub use hook::{
-    AgentHook, CompletionCallAction, CompletionResponse as CompletionResponseEvent, HookContext,
-    HookStack, InvalidToolCallAction, InvalidToolCallContext, ModelTurnFinished, ObservationAction,
-    RequestPatch, RunId, Scratchpad, StepEventKind, StreamResponseFinish, TextDelta, ToolCall,
-    ToolCallAction, ToolCallDelta, ToolResultAction, ToolResultEvent,
+use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::{
+    OneOrMany,
+    completion::{
+        AssistantContent, CompletionError, CompletionModel, GetTokenUsage, Message, PromptError,
+        Usage,
+    },
+    runtime::adapters::{LocalAgentError, LocalStreamEvent},
+    streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat, StreamingPrompt},
 };
-pub use prompt_request::streaming::{
-    MultiTurnStreamItem, StreamingError, StreamingPromptRequest, StreamingResult, stream_to_stdout,
+
+pub use crate::message::{Text, ToolCall};
+pub use crate::runtime::adapters::{
+    AgentBuilder, AgentFacade as Agent, AgentPromptRequest, ExtendedAgentPromptRequest,
+    StructuredOutputMode,
 };
-pub use prompt_request::{
-    CompletionCall, PromptRequest, PromptResponse, TypedPromptRequest, TypedPromptResponse,
-};
-pub use run::{AgentRun, AgentRunStep, ModelTurn, ModelTurnOutcome, OutputMode, PendingToolCall};
-pub use runner::AgentRunner;
+
+/// Details for one model operation committed by a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CompletionCall {
+    /// Zero-based model-operation index.
+    pub call_index: usize,
+    /// Provider-reported usage for this operation.
+    pub usage: Usage,
+}
+
+impl CompletionCall {
+    /// Creates one operation record.
+    pub fn new(call_index: usize, usage: Usage) -> Self {
+        Self { call_index, usage }
+    }
+}
+
+/// Terminal response observed from an ECS run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct PromptResponse {
+    /// Concatenated assistant text.
+    pub output: String,
+    /// Usage accumulated by the run.
+    pub usage: Usage,
+    /// Successfully committed model operations.
+    pub completion_calls: Vec<CompletionCall>,
+    /// Optional canonical history when requested by a chat facade.
+    pub messages: Option<Vec<Message>>,
+    /// Canonical final assistant content.
+    pub content: OneOrMany<AssistantContent>,
+}
+
+impl PromptResponse {
+    /// Creates a terminal text response.
+    pub fn new(output: impl Into<String>, usage: Usage) -> Self {
+        let output = output.into();
+        Self {
+            content: OneOrMany::one(AssistantContent::text(output.clone())),
+            output,
+            usage,
+            completion_calls: Vec::new(),
+            messages: None,
+        }
+    }
+
+    /// Creates an empty response.
+    pub fn empty() -> Self {
+        Self::new(String::new(), Usage::default())
+    }
+
+    /// Attaches canonical messages to an already constructed response.
+    pub fn with_messages(mut self, messages: Vec<Message>) -> Self {
+        self.messages = Some(messages);
+        self
+    }
+
+    /// Returns concatenated final text.
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    /// Returns aggregate run usage.
+    pub fn usage(&self) -> Usage {
+        self.usage
+    }
+
+    /// Returns canonical history when the caller requested it.
+    pub fn messages(&self) -> Option<&[Message]> {
+        self.messages.as_deref()
+    }
+
+    /// Returns final structured assistant content.
+    pub fn content(&self) -> &OneOrMany<AssistantContent> {
+        &self.content
+    }
+
+    /// Returns committed model-operation details.
+    pub fn completion_calls(&self) -> &[CompletionCall] {
+        &self.completion_calls
+    }
+
+    /// Returns the number of committed model operations.
+    pub fn requests(&self) -> usize {
+        self.completion_calls.len()
+    }
+}
+
+impl std::fmt::Display for PromptResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.output.fmt(formatter)
+    }
+}
+
+/// Ordered observation emitted by a streaming ECS run.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum MultiTurnStreamItem<R> {
+    /// Incremental assistant content.
+    StreamAssistantItem(StreamedAssistantContent<R>),
+    /// A tool call whose logical ECS batch committed successfully.
+    ToolExecutionCommitted {
+        /// Exact call accepted by the immutable tool decision.
+        tool_call: ToolCall,
+        /// Runtime-local call correlation identity.
+        internal_call_id: String,
+    },
+    /// A canonical tool result committed to the run transcript.
+    StreamUserItem(StreamedUserContent),
+    /// Details for one committed model operation.
+    CompletionCall(CompletionCall),
+    /// Terminal output from the same run state used by blocking execution.
+    FinalResponse(PromptResponse),
+}
+
+impl<R> MultiTurnStreamItem<R> {
+    /// Creates a terminal response item from canonical content.
+    pub fn final_response(content: OneOrMany<AssistantContent>, usage: Usage) -> Self {
+        let output = content
+            .iter()
+            .filter_map(|item| match item {
+                AssistantContent::Text(text) => Some(text.text.as_str()),
+                AssistantContent::ToolCall(_)
+                | AssistantContent::Reasoning(_)
+                | AssistantContent::Image(_) => None,
+            })
+            .collect::<String>();
+        let mut response = PromptResponse::new(output, usage);
+        response.content = content;
+        Self::FinalResponse(response)
+    }
+}
+
+/// Failure observed while streaming one ECS run.
+#[derive(Debug, Error)]
+pub enum StreamingError {
+    /// Low-level provider failure.
+    #[error(transparent)]
+    Completion(#[from] CompletionError),
+    /// Canonical run failure.
+    #[error("agent stream failed: {0}")]
+    Agent(#[from] LocalAgentError),
+    /// High-level prompt failure.
+    #[error(transparent)]
+    Prompt(#[from] Box<PromptError>),
+}
+
+/// Boxed observation stream for a single ECS run.
+pub type StreamingResult<R> =
+    Pin<Box<dyn Stream<Item = Result<MultiTurnStreamItem<R>, StreamingError>> + Send>>;
+
+/// Construction value for starting a streaming run.
+pub struct StreamingPromptRequest<M>
+where
+    M: CompletionModel,
+{
+    agent: Agent<M>,
+    prompt: Message,
+    history: Vec<Message>,
+    max_model_calls: Option<u32>,
+    tool_concurrency: usize,
+    conversation: Result<Option<crate::runtime::StableId>, crate::runtime::IdentityError>,
+}
+
+impl<M> StreamingPromptRequest<M>
+where
+    M: CompletionModel,
+{
+    /// Creates a request using the agent's authoritative world.
+    pub fn new(agent: &Agent<M>, prompt: impl Into<Message>) -> Self {
+        Self {
+            agent: agent.clone(),
+            prompt: prompt.into(),
+            history: Vec::new(),
+            max_model_calls: None,
+            tool_concurrency: usize::MAX,
+            conversation: Ok(None),
+        }
+    }
+
+    /// Supplies caller-owned history copied into the run at ingress.
+    pub fn history<I>(mut self, history: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: std::borrow::Borrow<Message>,
+    {
+        self.history = history
+            .into_iter()
+            .map(|message| std::borrow::Borrow::borrow(&message).clone())
+            .collect();
+        self
+    }
+
+    /// Overrides the run's model-call budget.
+    pub fn max_turns(mut self, max_turns: usize) -> Self {
+        self.max_model_calls = Some(u32::try_from(max_turns).unwrap_or(u32::MAX));
+        self
+    }
+
+    /// Sets the host-side upper bound for concurrent tool effects.
+    ///
+    /// Tool results are still committed in canonical logical-batch order.
+    pub fn tool_concurrency(mut self, concurrency: usize) -> Self {
+        assert!(
+            concurrency > 0,
+            "tool concurrency must be greater than zero"
+        );
+        self.tool_concurrency = concurrency;
+        self
+    }
+
+    /// Routes the stream through an ECS conversation-memory relationship.
+    pub fn conversation(mut self, conversation: impl Into<String>) -> Self {
+        self.conversation = crate::runtime::StableId::new(conversation).map(Some);
+        self
+    }
+
+    async fn send(self) -> StreamingResult<M::StreamingResponse>
+    where
+        M: 'static,
+    {
+        let conversation = match self.conversation {
+            Ok(conversation) => conversation,
+            Err(error) => {
+                return Box::pin(futures::stream::once(async move {
+                    Err(StreamingError::Agent(LocalAgentError::Identity(error)))
+                }));
+            }
+        };
+        let source = self.agent.stream_run_with_history(
+            self.prompt,
+            self.history,
+            self.max_model_calls,
+            conversation,
+            self.tool_concurrency,
+        );
+        Box::pin(source.map(|event| {
+            event
+                .map_err(StreamingError::from)
+                .map(|event| match event {
+                    LocalStreamEvent::Delta(text) => MultiTurnStreamItem::StreamAssistantItem(
+                        StreamedAssistantContent::Text(Text::from(text)),
+                    ),
+                    LocalStreamEvent::ToolCall {
+                        tool_call,
+                        internal_call_id,
+                    } => MultiTurnStreamItem::StreamAssistantItem(
+                        StreamedAssistantContent::ToolCall {
+                            tool_call,
+                            internal_call_id,
+                        },
+                    ),
+                    LocalStreamEvent::ToolCommitted {
+                        tool_call,
+                        internal_call_id,
+                    } => MultiTurnStreamItem::ToolExecutionCommitted {
+                        tool_call,
+                        internal_call_id,
+                    },
+                    LocalStreamEvent::ToolCallDelta {
+                        id,
+                        internal_call_id,
+                        content,
+                    } => MultiTurnStreamItem::StreamAssistantItem(
+                        StreamedAssistantContent::ToolCallDelta {
+                            id,
+                            internal_call_id,
+                            content,
+                        },
+                    ),
+                    LocalStreamEvent::Reasoning(reasoning) => {
+                        MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Reasoning(reasoning),
+                        )
+                    }
+                    LocalStreamEvent::ReasoningDelta { id, reasoning } => {
+                        MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::ReasoningDelta { id, reasoning },
+                        )
+                    }
+                    LocalStreamEvent::Unknown(value) => MultiTurnStreamItem::StreamAssistantItem(
+                        StreamedAssistantContent::Unknown(value),
+                    ),
+                    LocalStreamEvent::ToolResult {
+                        tool_result,
+                        internal_call_id,
+                    } => MultiTurnStreamItem::StreamUserItem(StreamedUserContent::tool_result(
+                        tool_result,
+                        internal_call_id,
+                    )),
+                    LocalStreamEvent::Finished {
+                        output,
+                        transcript,
+                        completion_calls,
+                    } => {
+                        let mut response = PromptResponse::new(
+                            output.text,
+                            Usage {
+                                input_tokens: output.usage.input_tokens,
+                                output_tokens: output.usage.output_tokens,
+                                total_tokens: output.usage.input_tokens
+                                    + output.usage.output_tokens,
+                                ..Usage::default()
+                            },
+                        );
+                        response.completion_calls = completion_calls
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, usage)| {
+                                CompletionCall::new(
+                                    index,
+                                    Usage {
+                                        input_tokens: usage.input_tokens,
+                                        output_tokens: usage.output_tokens,
+                                        total_tokens: usage.input_tokens + usage.output_tokens,
+                                        ..Usage::default()
+                                    },
+                                )
+                            })
+                            .collect();
+                        response.messages =
+                            crate::runtime::adapters::transcript_messages(&transcript).ok();
+                        MultiTurnStreamItem::FinalResponse(response)
+                    }
+                })
+        }))
+    }
+}
+
+impl<M> IntoFuture for StreamingPromptRequest<M>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + GetTokenUsage,
+{
+    type Output = StreamingResult<M::StreamingResponse>;
+    type IntoFuture = futures::future::BoxFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.send())
+    }
+}
+
+impl<M> StreamingPrompt<M, M::StreamingResponse> for Agent<M>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + GetTokenUsage,
+{
+    fn stream_prompt(&self, prompt: impl Into<Message> + Send) -> StreamingPromptRequest<M> {
+        StreamingPromptRequest::new(self, prompt)
+    }
+}
+
+impl<M> StreamingChat<M, M::StreamingResponse> for Agent<M>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Send + GetTokenUsage,
+{
+    fn stream_chat<I, T>(
+        &self,
+        prompt: impl Into<Message> + Send,
+        chat_history: I,
+    ) -> StreamingPromptRequest<M>
+    where
+        I: IntoIterator<Item = T> + Send,
+        T: Into<Message>,
+    {
+        StreamingPromptRequest::new(self, prompt).history(chat_history.into_iter().map(Into::into))
+    }
+}
+
+/// Prints assistant text and returns the terminal response.
+pub async fn stream_to_stdout<R>(
+    stream: &mut StreamingResult<R>,
+) -> Result<PromptResponse, std::io::Error>
+where
+    R: Clone,
+{
+    let mut final_response = PromptResponse::empty();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+                print!("{}", text.text);
+            }
+            Ok(MultiTurnStreamItem::FinalResponse(response)) => final_response = response,
+            Ok(
+                MultiTurnStreamItem::StreamAssistantItem(_)
+                | MultiTurnStreamItem::ToolExecutionCommitted { .. }
+                | MultiTurnStreamItem::StreamUserItem(_)
+                | MultiTurnStreamItem::CompletionCall(_),
+            ) => {}
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+    }
+    Ok(final_response)
+}
