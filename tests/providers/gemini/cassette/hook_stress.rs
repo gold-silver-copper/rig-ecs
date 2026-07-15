@@ -193,7 +193,10 @@ async fn chained_arg_rewrite_then_result_redaction_blocking() {
             );
             let results = recorder_probe.recorded_results();
             assert_eq!(results.len(), 1);
-            assert_eq!(results[0].2, "15", "raw audit output must remain intact");
+            assert_eq!(
+                results[0].2, REDACTION_MARKER,
+                "finalized observers must receive only policy-approved presentation"
+            );
             assert!(response.contains(REDACTION_MARKER));
             assert!(!response.contains("15"));
         },
