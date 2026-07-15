@@ -1529,7 +1529,8 @@ where
                                             operation,
                                             generation,
                                             sequence,
-                                            text: text.text,
+                                            provider_correlation: None,
+                                            kind: crate::runtime::EffectDeltaKind::Text(text.text),
                                         }) {
                                             stream_error = Some(CanonicalError::Provider {
                                                 message: format!("stream delta ingress failed: {error}"),
@@ -1543,6 +1544,18 @@ where
                                             match item {
                                                 StreamItem::Delta { text, .. } => {
                                                     yield LocalStreamEvent::Delta(text);
+                                                }
+                                                StreamItem::ToolCallDelta {
+                                                    id,
+                                                    internal_call_id,
+                                                    content,
+                                                    ..
+                                                } => {
+                                                    yield LocalStreamEvent::ToolCallDelta {
+                                                        id,
+                                                        internal_call_id,
+                                                        content,
+                                                    };
                                                 }
                                                 StreamItem::Finished(StreamTerminal::Completed(output)) => {
                                                     let (transcript, completion_calls) =
@@ -1567,7 +1580,60 @@ where
                                         observed_tool_calls.push((tool_call, internal_call_id));
                                     }
                                     StreamedAssistantContent::ToolCallDelta { id, internal_call_id, content } => {
-                                        yield LocalStreamEvent::ToolCallDelta { id, internal_call_id, content };
+                                        if let Err(error) = agent.submit_delta(&delta_sender, EffectDelta {
+                                            operation,
+                                            generation,
+                                            sequence,
+                                            provider_correlation: Some(id.clone()),
+                                            kind: crate::runtime::EffectDeltaKind::ToolCall {
+                                                id,
+                                                internal_call_id,
+                                                content,
+                                            },
+                                        }) {
+                                            stream_error = Some(CanonicalError::Provider {
+                                                message: format!("stream delta ingress failed: {error}"),
+                                                retryable: true,
+                                            });
+                                            break;
+                                        }
+                                        sequence = sequence.saturating_add(1);
+                                        agent.drive_once()?;
+                                        while let Some(item) = stream.try_recv()? {
+                                            match item {
+                                                StreamItem::Delta { text, .. } => {
+                                                    yield LocalStreamEvent::Delta(text);
+                                                }
+                                                StreamItem::ToolCallDelta {
+                                                    id,
+                                                    internal_call_id,
+                                                    content,
+                                                    ..
+                                                } => {
+                                                    yield LocalStreamEvent::ToolCallDelta {
+                                                        id,
+                                                        internal_call_id,
+                                                        content,
+                                                    };
+                                                }
+                                                StreamItem::Finished(StreamTerminal::Completed(output)) => {
+                                                    let (transcript, completion_calls) =
+                                                        agent.details_for_pending(&pending)?;
+                                                    yield LocalStreamEvent::Finished {
+                                                        output,
+                                                        transcript,
+                                                        completion_calls,
+                                                    };
+                                                    break 'drive;
+                                                }
+                                                StreamItem::Finished(StreamTerminal::Failed(error)) => {
+                                                    Err(LocalAgentError::Canonical(error))?;
+                                                }
+                                                StreamItem::Finished(StreamTerminal::Cancelled) => {
+                                                    Err(LocalAgentError::Cancelled)?;
+                                                }
+                                            }
+                                        }
                                     }
                                     StreamedAssistantContent::Reasoning(reasoning) => {
                                         yield LocalStreamEvent::Reasoning(reasoning);
@@ -1697,6 +1763,16 @@ where
                 while let Some(item) = stream.try_recv()? {
                     match item {
                         StreamItem::Delta { text, .. } => yield LocalStreamEvent::Delta(text),
+                        StreamItem::ToolCallDelta {
+                            id,
+                            internal_call_id,
+                            content,
+                            ..
+                        } => yield LocalStreamEvent::ToolCallDelta {
+                            id,
+                            internal_call_id,
+                            content,
+                        },
                         StreamItem::Finished(StreamTerminal::Completed(output)) => {
                             let (transcript, completion_calls) =
                                 agent.details_for_pending(&pending)?;
@@ -2220,7 +2296,31 @@ where
                             operation: request.operation,
                             generation: request.generation,
                             sequence,
-                            text: text.text,
+                            provider_correlation: None,
+                            kind: crate::runtime::EffectDeltaKind::Text(text.text),
+                        })
+                        .map_err(|error| CanonicalError::Provider {
+                            message: format!("stream delta ingress failed: {error}"),
+                            retryable: true,
+                        })?;
+                    sequence = sequence.saturating_add(1);
+                }
+                StreamedAssistantContent::ToolCallDelta {
+                    id,
+                    internal_call_id,
+                    content,
+                } => {
+                    deltas
+                        .try_send(EffectDelta {
+                            operation: request.operation,
+                            generation: request.generation,
+                            sequence,
+                            provider_correlation: Some(id.clone()),
+                            kind: crate::runtime::EffectDeltaKind::ToolCall {
+                                id,
+                                internal_call_id,
+                                content,
+                            },
                         })
                         .map_err(|error| CanonicalError::Provider {
                             message: format!("stream delta ingress failed: {error}"),
@@ -2229,7 +2329,6 @@ where
                     sequence = sequence.saturating_add(1);
                 }
                 StreamedAssistantContent::ToolCall { .. }
-                | StreamedAssistantContent::ToolCallDelta { .. }
                 | StreamedAssistantContent::Reasoning(_)
                 | StreamedAssistantContent::ReasoningDelta { .. }
                 | StreamedAssistantContent::Final(_)
@@ -2851,7 +2950,10 @@ mod tests {
             assert_eq!(delta.operation, Entity::PLACEHOLDER);
             assert_eq!(delta.generation, 7);
             assert_eq!(delta.sequence, sequence);
-            assert_eq!(delta.text, text);
+            assert_eq!(
+                delta.kind,
+                crate::runtime::EffectDeltaKind::Text(text.to_owned())
+            );
         }
     }
 

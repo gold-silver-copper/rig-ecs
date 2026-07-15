@@ -8,9 +8,9 @@
 use std::time::{Duration, Instant};
 
 use rig_core::runtime::{
-    Agent, AgentHandle, EffectCompletion, EffectDelta, EffectOutput, ModelCapability,
-    ModelEffectOutput, ModelToolCall, Runtime, RuntimeConfig, StableId, TenantId, ToolCapability,
-    ToolEffectOutput, ToolGrant, Usage,
+    Agent, AgentHandle, EffectCompletion, EffectDelta, EffectDeltaKind, EffectOutput,
+    ModelCapability, ModelEffectOutput, ModelToolCall, Runtime, RuntimeConfig, StableId, TenantId,
+    ToolCapability, ToolEffectOutput, ToolGrant, Usage,
 };
 
 const ITERATIONS: usize = 100;
@@ -164,7 +164,8 @@ fn streaming() -> Duration {
                 operation: request.operation,
                 generation: request.generation,
                 sequence,
-                text: "x".to_owned(),
+                provider_correlation: None,
+                kind: EffectDeltaKind::Text("x".to_owned()),
             })
             .expect("delta");
     }

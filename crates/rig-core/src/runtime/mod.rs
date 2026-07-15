@@ -6,6 +6,12 @@
 //! type can contain an ECS borrow.
 
 pub mod adapters;
+mod snapshot;
+
+pub use snapshot::{
+    ActiveRunSnapshot, ActiveRunSnapshotError, RestoredRuns, restore_active_run,
+    snapshot_active_run,
+};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -26,7 +32,9 @@ use bevy_ecs::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{completion::Message as CompletionMessage, message::UserContent};
+use crate::{
+    completion::Message as CompletionMessage, message::UserContent, streaming::ToolCallDeltaContent,
+};
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -416,6 +424,16 @@ pub struct Policy {
     pub revision: u64,
     /// Data interpreted by the policy system.
     pub rule: PolicyRule,
+}
+
+/// Admission status for a policy revision.
+#[derive(Component, Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PolicyStatus {
+    /// Eligible for future policy snapshots.
+    #[default]
+    Enabled,
+    /// Excluded from future snapshots but retained for accepted evaluations.
+    Retired,
 }
 
 /// Built-in policy data. Extensions can add components and systems in [`RigSet::Policy`].
@@ -887,6 +905,20 @@ pub struct PendingInvalidToolCall {
     pub available_tools: Vec<ToolDecision>,
     /// Explicit position in the logical batch.
     pub index: u32,
+    /// Producing model operation retained for audit and resumption.
+    pub source_model_operation: Entity,
+    /// Committed model-call position that emitted this invalid call.
+    pub turn: u32,
+    /// Tool-selection behavior accepted by the producing request.
+    pub tool_choice: Option<ModelToolChoice>,
+    /// Complete canonical history at detection time.
+    pub diagnostic_history: Vec<TranscriptEntry>,
+    /// Whether any provider delta was accepted for the producing operation.
+    pub streaming_origin: bool,
+    /// Retry count before resolving this call.
+    pub retry_count: u32,
+    /// Accepted run-local invalid-call retry limit.
+    pub max_retries: u32,
 }
 
 /// Entity-targeted invocation for one invalid call and one policy.
@@ -1135,6 +1167,236 @@ pub struct ChildRunFinished {
     pub result: Result<String, String>,
 }
 
+/// Observe-only notification for a validated text delta.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct TextDeltaObserved {
+    /// Producing model operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Committed model-call position at ingress.
+    pub turn: u32,
+    /// Explicit operation-local sequence.
+    pub sequence: u64,
+    /// Provider correlation, when supplied.
+    pub provider_correlation: Option<String>,
+    /// Newly validated text.
+    pub delta: String,
+    /// Canonical aggregate including this delta.
+    pub aggregated: String,
+}
+
+/// Observe-only notification for a validated tool-call fragment.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ToolCallDeltaObserved {
+    /// Producing model operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Committed model-call position at ingress.
+    pub turn: u32,
+    /// Explicit operation-local sequence.
+    pub sequence: u64,
+    /// Provider correlation, when supplied.
+    pub provider_correlation: Option<String>,
+    /// Provider-facing tool-call ID.
+    pub id: String,
+    /// Rig correlation ID retained through invalid-call recovery.
+    pub internal_call_id: String,
+    /// Tool name or argument fragment.
+    pub content: ToolCallDeltaContent,
+}
+
+/// Observe-only notification after a streaming provider response settles.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct StreamResponseFinished {
+    /// Producing model operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Exact accepted operation generation.
+    pub generation: u64,
+    /// Canonical final response before response-policy rewriting.
+    pub output: ModelEffectOutput,
+}
+
+/// Observe-only notification after request policy finalizes immutable input.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct CompletionRequestPrepared {
+    /// Model operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Exact immutable request.
+    pub request: ModelEffectInput,
+    /// Accepted request-policy revisions.
+    pub policies: Vec<AcceptedPolicy>,
+}
+
+/// Observe-only notification after a model effect enters the outbox.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ModelDispatched {
+    /// Model operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Exact operation generation.
+    pub generation: u64,
+}
+
+/// Observe-only notification after a model effect completion is validated.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ModelSettled {
+    /// Model operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Exact operation generation.
+    pub generation: u64,
+    /// Canonical outcome before response policy.
+    pub outcome: OperationOutcome,
+}
+
+/// Observe-only notification after response policy finalizes presentation.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct CompletionResponseApplied {
+    /// Model operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Immutable provider-normalized result.
+    pub raw: ModelEffectOutput,
+    /// Effective result accepted for commit.
+    pub effective: ModelEffectOutput,
+}
+
+/// Observe-only notification when an unknown or disallowed call is retained.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct InvalidToolCallDetected {
+    /// Pending tool operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Immutable invalid-call context.
+    pub invalid: PendingInvalidToolCall,
+}
+
+/// Observe-only notification after tool-call policy finalizes immutable input.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ToolCallPrepared {
+    /// Tool operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Exact immutable call.
+    pub call: ToolEffectInput,
+    /// Accepted call-policy revisions.
+    pub policies: Vec<AcceptedPolicy>,
+}
+
+/// Observe-only notification after a real tool effect enters the outbox.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ToolExecutionStarted {
+    /// Tool operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Exact operation generation.
+    pub generation: u64,
+    /// Logical batch position.
+    pub index: u32,
+}
+
+/// Observe-only notification after a real tool effect completion is validated.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ToolExecutionSettled {
+    /// Tool operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Exact operation generation.
+    pub generation: u64,
+    /// Immutable raw outcome before result policy.
+    pub outcome: OperationOutcome,
+}
+
+/// Observe-only notification after tool-result presentation policy finalizes.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ToolResultPresentationFinalized {
+    /// Tool operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Immutable raw result.
+    pub raw: ToolEffectOutput,
+    /// Final model-visible presentation.
+    pub presentation: String,
+}
+
+/// Observe-only notification after an atomic tool batch commits successfully.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ToolBatchCommitted {
+    /// Tool-batch entity.
+    #[event_target]
+    pub batch: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Results in logical call order.
+    pub results: Vec<ToolEffectOutput>,
+}
+
+/// Observe-only notification after a store operation settles and is applied.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct PersistenceSettled {
+    /// Store operation.
+    #[event_target]
+    pub operation: Entity,
+    /// Owning run.
+    pub run: Entity,
+    /// Canonical outcome.
+    pub outcome: OperationOutcome,
+}
+
+/// Observe-only terminal success notification.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct RunCompleted {
+    /// Terminal run.
+    #[event_target]
+    pub run: Entity,
+    /// Canonical output.
+    pub output: RunOutput,
+}
+
+/// Observe-only terminal failure notification.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct RunFailed {
+    /// Terminal run.
+    #[event_target]
+    pub run: Entity,
+    /// Canonical error.
+    pub error: CanonicalError,
+}
+
+/// Observe-only terminal cancellation notification.
+#[derive(EntityEvent, Clone, Copy, Debug)]
+pub struct RunCancelled {
+    /// Terminal run.
+    #[event_target]
+    pub run: Entity,
+}
+
 /// Typed steering result for a streaming text delta.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextDeltaPolicyDecision {
@@ -1265,6 +1527,13 @@ pub enum AgentControl {
     PauseExistingRuns(PauseMode),
 }
 
+/// Per-agent invalid-tool retry budget snapshotted onto each admitted run.
+#[derive(Component, Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InvalidToolCallBudget {
+    /// Maximum `Retry` resolutions before later invalid calls fail closed.
+    pub max_retries: u32,
+}
+
 /// A run's authoritative input and committed transcript.
 #[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunRecord {
@@ -1284,6 +1553,12 @@ pub struct RunRecord {
     pub usage: Usage,
     /// Explicit next committed model-turn position.
     pub next_turn: u32,
+    /// Whether this run was admitted with a streaming subscription.
+    pub streaming: bool,
+    /// Invalid tool calls already resolved with a model retry.
+    pub invalid_tool_call_retries: u32,
+    /// Immutable retry budget accepted when the run was admitted.
+    pub max_invalid_tool_call_retries: u32,
     /// Optional stable conversation identity.
     pub conversation: Option<StableId>,
     /// Prevents repeated memory resolution/load.
@@ -1789,8 +2064,26 @@ pub struct EffectDelta {
     pub generation: u64,
     /// Monotonic sequence within this model operation.
     pub sequence: u64,
-    /// Incremental text value; deltas are not entities.
-    pub text: String,
+    /// Optional provider correlation for diagnostics and audit.
+    pub provider_correlation: Option<String>,
+    /// Owned incremental content; deltas are not entities.
+    pub kind: EffectDeltaKind,
+}
+
+/// Canonical high-volume streaming delta content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffectDeltaKind {
+    /// Incremental assistant text.
+    Text(String),
+    /// Incremental tool name or JSON arguments.
+    ToolCall {
+        /// Provider-facing tool-call ID.
+        id: String,
+        /// Rig correlation ID preserved through repair and execution.
+        internal_call_id: String,
+        /// Tool name or argument fragment.
+        content: ToolCallDeltaContent,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1953,6 +2246,8 @@ pub struct ModelStreamState {
     pub next_sequence: u64,
     /// Accepted text accumulated independently of subscriber delivery.
     pub aggregated_text: String,
+    /// Whether the owning run uses the streaming facade.
+    pub streaming: bool,
 }
 
 /// A committed turn entity.
@@ -2575,6 +2870,17 @@ pub enum StreamItem {
         /// Incremental text.
         text: String,
     },
+    /// Ordered tool-call name or argument fragment.
+    ToolCallDelta {
+        /// Model-operation-local sequence.
+        sequence: u64,
+        /// Provider-facing tool-call ID.
+        id: String,
+        /// Rig correlation ID.
+        internal_call_id: String,
+        /// Tool name or argument fragment.
+        content: ToolCallDeltaContent,
+    },
     /// Terminal run state published after commit.
     Finished(StreamTerminal),
 }
@@ -2961,6 +3267,8 @@ pub struct PersistedAgent {
     pub agent: Agent,
     /// Persisted admission and bulk-control state.
     pub control: AgentControl,
+    /// Optional invalid-tool retry configuration for future runs.
+    pub invalid_tool_call_budget: Option<InvalidToolCallBudget>,
     /// Stable model identity remapped during loading.
     pub model_id: StableId,
     /// Optional structured-output configuration.
@@ -3106,6 +3414,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
         &TenantId,
         &Agent,
         Option<&AgentControl>,
+        Option<&InvalidToolCallBudget>,
         &UsesModel,
         Option<&OutputRequirement>,
         Option<&RetrievalRequirement>,
@@ -3119,6 +3428,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
                 tenant,
                 agent,
                 control,
+                invalid_tool_call_budget,
                 model,
                 output_requirement,
                 retrieval_requirement,
@@ -3134,6 +3444,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
                         tenant: tenant.clone(),
                         agent: agent.clone(),
                         control: control.copied().unwrap_or_default(),
+                        invalid_tool_call_budget: invalid_tool_call_budget.copied(),
                         model_id,
                         output_requirement: output_requirement.cloned(),
                         retrieval_requirement: retrieval_requirement.cloned(),
@@ -3521,6 +3832,9 @@ pub fn restore_domain(
         if let Some(output_requirement) = record.output_requirement {
             entity.insert(output_requirement);
         }
+        if let Some(invalid_tool_call_budget) = record.invalid_tool_call_budget {
+            entity.insert(invalid_tool_call_budget);
+        }
         if let Some(retrieval_requirement) = record.retrieval_requirement {
             entity.insert(retrieval_requirement);
         }
@@ -3700,6 +4014,7 @@ pub fn install_runtime_with_waker(
         (
             prepare_store_operations,
             prepare_model_operations,
+            publish_invalid_call_observations,
             initialize_request_policy_evaluations,
             initialize_invalid_tool_call_policy_evaluations,
             initialize_tool_call_policy_evaluations,
@@ -3721,6 +4036,7 @@ pub fn install_runtime_with_waker(
     );
     schedule.add_systems(
         (
+            publish_prepared_operation_observations,
             dispatch_model_operations,
             dispatch_tool_operations,
             dispatch_discovery_operations,
@@ -3743,6 +4059,7 @@ pub fn install_runtime_with_waker(
         (
             initialize_completion_response_policy_evaluations,
             initialize_tool_result_policy_evaluations,
+            publish_applied_policy_observations,
             commit_store_operations,
             commit_model_operations,
             commit_tool_batches,
@@ -3763,7 +4080,11 @@ pub fn install_runtime_with_waker(
             .in_set(RigSet::Cleanup),
     );
     schedule.add_systems(
-        (publish_terminal_streams, update_runtime_metrics)
+        (
+            publish_run_terminal_observations,
+            publish_terminal_streams,
+            update_runtime_metrics,
+        )
             .chain()
             .in_set(RigSet::Publish),
     );
@@ -3903,8 +4224,26 @@ impl Runtime {
         }
         Ok(self
             .world
-            .spawn((id, tenant, policy, PolicyFor(agent.entity)))
+            .spawn((
+                id,
+                tenant,
+                policy,
+                PolicyStatus::Enabled,
+                PolicyFor(agent.entity),
+            ))
             .id())
+    }
+
+    /// Retires a policy from future snapshots while preserving accepted work.
+    pub fn retire_policy(&mut self, policy: Entity) -> Result<(), SpawnError> {
+        let Some(mut entity) = self.world.get_entity_mut(policy).ok() else {
+            return Err(SpawnError::StaleEntity(policy));
+        };
+        if !entity.contains::<Policy>() {
+            return Err(SpawnError::StaleEntity(policy));
+        }
+        entity.insert(PolicyStatus::Retired);
+        Ok(())
     }
 
     /// Sets an agent's structured-output requirement for future operations.
@@ -3923,6 +4262,25 @@ impl Runtime {
             return Err(SpawnError::StaleEntity(agent.entity));
         }
         entity.insert(requirement);
+        Ok(())
+    }
+
+    /// Sets the invalid-tool retry budget accepted by future runs.
+    pub fn set_invalid_tool_call_budget(
+        &mut self,
+        agent: AgentHandle,
+        max_retries: u32,
+    ) -> Result<(), SpawnError> {
+        if agent.runtime_id != self.handle.runtime_id {
+            return Err(SpawnError::ForeignRuntime);
+        }
+        let Some(mut entity) = self.world.get_entity_mut(agent.entity).ok() else {
+            return Err(SpawnError::StaleEntity(agent.entity));
+        };
+        if !entity.contains::<Agent>() {
+            return Err(SpawnError::StaleEntity(agent.entity));
+        }
+        entity.insert(InvalidToolCallBudget { max_retries });
         Ok(())
     }
 
@@ -4140,6 +4498,25 @@ impl Runtime {
     ) -> Result<RestoredEntities, PersistenceError> {
         restore_domain(&mut self.world, snapshot)
     }
+
+    /// Captures a run and its descendants without serializing runtime entities.
+    pub fn snapshot_active_run(
+        &mut self,
+        run: RunHandle,
+    ) -> Result<ActiveRunSnapshot, ActiveRunSnapshotError> {
+        if run.runtime_id != self.handle.runtime_id {
+            return Err(ActiveRunSnapshotError::NotRun);
+        }
+        snapshot_active_run(&mut self.world, run.entity)
+    }
+
+    /// Restores a validated active-run graph against the current domain.
+    pub fn restore_active_run(
+        &mut self,
+        snapshot: ActiveRunSnapshot,
+    ) -> Result<RestoredRuns, ActiveRunSnapshotError> {
+        restore_active_run(&mut self.world, snapshot)
+    }
 }
 
 /// Entity construction error.
@@ -4201,7 +4578,12 @@ fn ingest_commands(
     mut commands: Commands,
     ingress: Res<CommandIngress>,
     runtime: Res<RuntimeIdentity>,
-    mut agents: Query<(&TenantId, &Agent, Option<&mut AgentControl>)>,
+    mut agents: Query<(
+        &TenantId,
+        &Agent,
+        Option<&InvalidToolCallBudget>,
+        Option<&mut AgentControl>,
+    )>,
     mut runs: Query<(
         &StableId,
         &mut RunState,
@@ -4238,7 +4620,8 @@ fn ingest_commands(
                     .map(TranscriptEntry::Message)
                     .collect::<Vec<_>>();
                 transcript.push(transcript_entry);
-                let record = RunRecord {
+                let streaming = subscriber.is_some();
+                let mut record = RunRecord {
                     transcript,
                     prompt: prompt.message,
                     prompt_text: prompt.text,
@@ -4247,6 +4630,9 @@ fn ingest_commands(
                     observed: false,
                     usage: Usage::default(),
                     next_turn: 0,
+                    streaming,
+                    invalid_tool_call_retries: 0,
+                    max_invalid_tool_call_retries: 0,
                     conversation,
                     memory_loaded: false,
                     memory_store: None,
@@ -4256,11 +4642,13 @@ fn ingest_commands(
                     pending_output: None,
                 };
                 let run = match agents.get_mut(agent) {
-                    Ok((tenant, _, control))
+                    Ok((tenant, _, invalid_budget, control))
                         if control
                             .as_deref()
                             .is_none_or(|control| matches!(control, AgentControl::Running)) =>
                     {
+                        record.max_invalid_tool_call_retries =
+                            invalid_budget.map_or(0, |budget| budget.max_retries);
                         commands
                             .spawn((
                                 run_id,
@@ -4272,7 +4660,7 @@ fn ingest_commands(
                             ))
                             .id()
                     }
-                    Ok((tenant, _, _)) => commands
+                    Ok((tenant, _, _, _)) => commands
                         .spawn((
                             run_id,
                             tenant.clone(),
@@ -4347,7 +4735,7 @@ fn ingest_commands(
                 }
             }
             Ok(RuntimeCommand::SetAgentControl { agent, control }) => {
-                if let Ok((_, _, existing)) = agents.get_mut(agent)
+                if let Ok((_, _, _, existing)) = agents.get_mut(agent)
                     && let Some(mut existing) = existing
                     && *existing != control
                 {
@@ -4972,7 +5360,10 @@ fn prepare_model_operations(
                     phase: OperationPhase::Prepared,
                 },
                 OperationKind::Model,
-                ModelStreamState::default(),
+                ModelStreamState {
+                    streaming: record.streaming,
+                    ..ModelStreamState::default()
+                },
                 decision,
                 PendingModelRequest(ModelEffectInput {
                     decision: ModelDecision {
@@ -5841,6 +6232,14 @@ fn synthetic_invalid_tool_input(
     }
 }
 
+fn tool_choice_allows(choice: Option<&ModelToolChoice>, name: &str) -> bool {
+    match choice {
+        Some(ModelToolChoice::None) => false,
+        Some(ModelToolChoice::Specific(names)) => names.iter().any(|candidate| candidate == name),
+        None | Some(ModelToolChoice::Auto | ModelToolChoice::Required) => true,
+    }
+}
+
 fn settle_invalid_tool_as_feedback(
     world: &mut World,
     operation: Entity,
@@ -5981,7 +6380,13 @@ fn evaluate_invalid_tool_call_policies(world: &mut World) {
                     .invalid
                     .available_tools
                     .iter()
-                    .find(|tool| tool.name == tool_name)
+                    .find(|tool| {
+                        tool.name == tool_name
+                            && tool_choice_allows(
+                                evaluation.invalid.tool_choice.as_ref(),
+                                &tool.name,
+                            )
+                    })
                     .cloned()
                 else {
                     fail_invalid_tool_call(
@@ -6014,6 +6419,24 @@ fn evaluate_invalid_tool_call_policies(world: &mut World) {
                 }
             }
             Some(InvalidToolCallPolicyDecision::Retry(feedback)) => {
+                let retry_allowed = world.get::<RunRecord>(run).is_some_and(|record| {
+                    record.invalid_tool_call_retries < record.max_invalid_tool_call_retries
+                });
+                if !retry_allowed {
+                    fail_invalid_tool_call(
+                        world,
+                        evaluation_entity,
+                        operation,
+                        run,
+                        CanonicalError::UnknownTool(evaluation.invalid.call.name),
+                    );
+                    mark_progress(&mut world.resource_mut::<Progress>());
+                    continue;
+                }
+                if let Some(mut record) = world.get_mut::<RunRecord>(run) {
+                    record.invalid_tool_call_retries =
+                        record.invalid_tool_call_retries.saturating_add(1);
+                }
                 settle_invalid_tool_as_feedback(
                     world,
                     operation,
@@ -6124,18 +6547,24 @@ fn dispatch_model_operations(world: &mut World) {
                 return None;
             }
             let run_id = world.get::<StableId>(run.get())?;
-            Some((run_id.clone(), entity, state.generation, input.clone()))
+            Some((
+                run_id.clone(),
+                run.get(),
+                entity,
+                state.generation,
+                input.clone(),
+            ))
         })
         .collect::<Vec<_>>();
     prepared.sort_by(
-        |(left_id, left_entity, _, _), (right_id, right_entity, _, _)| {
+        |(left_id, _, left_entity, _, _), (right_id, _, right_entity, _, _)| {
             left_id
                 .cmp(right_id)
                 .then_with(|| left_entity.to_bits().cmp(&right_entity.to_bits()))
         },
     );
     let mut made_progress = false;
-    for (_, entity, generation, input) in prepared {
+    for (_, run, entity, generation, input) in prepared {
         let request = EffectRequest {
             operation: entity,
             generation,
@@ -6155,11 +6584,139 @@ fn dispatch_model_operations(world: &mut World) {
             }
         };
         if let Some(phase) = phase {
+            let dispatched = matches!(phase, OperationPhase::InFlight);
             apply_dispatch_phase(world, entity, generation, phase);
+            if dispatched {
+                world.trigger(ModelDispatched {
+                    operation: entity,
+                    run,
+                    generation,
+                });
+            }
         }
     }
     if made_progress {
         mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
+type PreparedModelOperations<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static OperationOf,
+        &'static OperationState,
+        &'static ModelEffectInput,
+        Option<&'static AcceptedPolicies>,
+    ),
+    Added<ModelEffectInput>,
+>;
+
+type PreparedToolOperations<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static OperationOf,
+        &'static OperationState,
+        &'static ToolEffectInput,
+        Option<&'static AcceptedToolCallPolicies>,
+    ),
+    Added<ToolEffectInput>,
+>;
+
+fn publish_prepared_operation_observations(
+    mut commands: Commands,
+    model_operations: PreparedModelOperations<'_, '_>,
+    tool_operations: PreparedToolOperations<'_, '_>,
+) {
+    for (operation, operation_of, state, request, policies) in &model_operations {
+        if matches!(state.phase, OperationPhase::Prepared) {
+            commands.trigger(CompletionRequestPrepared {
+                operation,
+                run: operation_of.get(),
+                request: request.clone(),
+                policies: policies.map_or_else(Vec::new, |value| value.0.clone()),
+            });
+        }
+    }
+    for (operation, operation_of, state, call, policies) in &tool_operations {
+        if matches!(state.phase, OperationPhase::Prepared) {
+            commands.trigger(ToolCallPrepared {
+                operation,
+                run: operation_of.get(),
+                call: call.clone(),
+                policies: policies.map_or_else(Vec::new, |value| value.0.clone()),
+            });
+        }
+    }
+}
+
+fn publish_invalid_call_observations(
+    mut commands: Commands,
+    invalid_calls: Query<
+        (Entity, &OperationOf, &PendingInvalidToolCall),
+        Added<PendingInvalidToolCall>,
+    >,
+) {
+    for (operation, operation_of, invalid) in &invalid_calls {
+        commands.trigger(InvalidToolCallDetected {
+            operation,
+            run: operation_of.get(),
+            invalid: invalid.clone(),
+        });
+    }
+}
+
+fn publish_applied_policy_observations(
+    mut commands: Commands,
+    model_operations: Query<
+        (
+            Entity,
+            &OperationOf,
+            &OperationState,
+            Option<&EffectiveModelOutput>,
+        ),
+        Added<CompletionResponsePolicyDone>,
+    >,
+    tool_operations: Query<
+        (
+            Entity,
+            &OperationOf,
+            &OperationState,
+            Option<&EffectiveToolOutput>,
+        ),
+        Added<ToolResultPolicyDone>,
+    >,
+) {
+    for (operation, operation_of, state, effective) in &model_operations {
+        let OperationPhase::Settled(OperationOutcome::Success(EffectOutput::Model(raw))) =
+            &state.phase
+        else {
+            continue;
+        };
+        let effective = effective.map_or_else(|| raw.clone(), |value| value.0.clone());
+        commands.trigger(CompletionResponseApplied {
+            operation,
+            run: operation_of.get(),
+            raw: raw.clone(),
+            effective,
+        });
+    }
+    for (operation, operation_of, state, effective) in &tool_operations {
+        let OperationPhase::Settled(OperationOutcome::Success(EffectOutput::Tool(raw))) =
+            &state.phase
+        else {
+            continue;
+        };
+        let effective = effective.map_or_else(|| raw.clone(), |value| value.0.clone());
+        commands.trigger(ToolResultPresentationFinalized {
+            operation,
+            run: operation_of.get(),
+            raw: raw.clone(),
+            presentation: effective.presentation,
+        });
     }
 }
 
@@ -6186,15 +6743,16 @@ fn dispatch_tool_operations(world: &mut World) {
             Some((
                 batch.get().to_bits(),
                 input.index,
+                run,
                 entity,
                 state.generation,
                 input.clone(),
             ))
         })
         .collect::<Vec<_>>();
-    prepared.sort_by_key(|(batch, index, entity, _, _)| (*batch, *index, entity.to_bits()));
+    prepared.sort_by_key(|(batch, index, _, entity, _, _)| (*batch, *index, entity.to_bits()));
     let mut made_progress = false;
-    for (_, _, entity, generation, input) in prepared {
+    for (_, index, run, entity, generation, input) in prepared {
         let request = EffectRequest {
             operation: entity,
             generation,
@@ -6214,7 +6772,16 @@ fn dispatch_tool_operations(world: &mut World) {
             }
         };
         if let Some(phase) = phase {
+            let dispatched = matches!(phase, OperationPhase::InFlight);
             apply_dispatch_phase(world, entity, generation, phase);
+            if dispatched {
+                world.trigger(ToolExecutionStarted {
+                    operation: entity,
+                    run,
+                    generation,
+                    index,
+                });
+            }
         }
     }
     if made_progress {
@@ -6450,7 +7017,8 @@ fn apply_effect_ingress(
     for EffectIngressMessage(message) in messages.read() {
         match message {
             EffectIngress::Completion(completion) => {
-                let Ok((kind, _, mut state, _, _)) = operations.get_mut(completion.operation)
+                let Ok((kind, operation_of, mut state, stream_state, _)) =
+                    operations.get_mut(completion.operation)
                 else {
                     continue;
                 };
@@ -6459,6 +7027,20 @@ fn apply_effect_ingress(
                 {
                     continue;
                 }
+                let stream_finished = match (
+                    kind,
+                    operation_of,
+                    stream_state.as_deref(),
+                    &completion.result,
+                ) {
+                    (
+                        OperationKind::Model,
+                        Some(operation_of),
+                        Some(stream_state),
+                        Ok(EffectOutput::Model(output)),
+                    ) if stream_state.streaming => Some((operation_of.get(), output.clone())),
+                    _ => None,
+                };
                 state.phase = OperationPhase::Settled(match &completion.result {
                     Ok(output)
                         if matches!(
@@ -6478,6 +7060,35 @@ fn apply_effect_ingress(
                     Ok(_) => OperationOutcome::Failure(CanonicalError::EffectKindMismatch),
                     Err(error) => OperationOutcome::Failure(error.clone()),
                 });
+                if let (Some(run), OperationPhase::Settled(outcome)) =
+                    (operation_of.map(Relationship::get), &state.phase)
+                {
+                    match kind {
+                        OperationKind::Model => commands.trigger(ModelSettled {
+                            operation: completion.operation,
+                            run,
+                            generation: completion.generation,
+                            outcome: outcome.clone(),
+                        }),
+                        OperationKind::Tool => commands.trigger(ToolExecutionSettled {
+                            operation: completion.operation,
+                            run,
+                            generation: completion.generation,
+                            outcome: outcome.clone(),
+                        }),
+                        OperationKind::Discovery
+                        | OperationKind::Store
+                        | OperationKind::PolicyApproval => {}
+                    }
+                }
+                if let Some((run, output)) = stream_finished {
+                    commands.trigger(StreamResponseFinished {
+                        operation: completion.operation,
+                        run,
+                        generation: completion.generation,
+                        output,
+                    });
+                }
                 mark_progress(&mut progress);
             }
             EffectIngress::Delta(delta) => {
@@ -6502,17 +7113,28 @@ fn apply_effect_ingress(
                     continue;
                 }
                 stream_state.next_sequence = stream_state.next_sequence.saturating_add(1);
-                stream_state.aggregated_text.push_str(&delta.text);
-                let aggregated = stream_state.aggregated_text.clone();
                 if let Some(mut deadline) = deadline {
                     deadline.expires_at = clock.tick.saturating_add(timeout.0);
                 }
                 let run = operation_of.get();
-                let (turn, mut stream_policies) = runs
-                    .get(run)
-                    .ok()
-                    .map(|(run_of, record)| {
-                        let mut ordered = agents
+                let Ok((run_of, record)) = runs.get(run) else {
+                    continue;
+                };
+                let turn = record.next_turn;
+                match &delta.kind {
+                    EffectDeltaKind::Text(text) => {
+                        stream_state.aggregated_text.push_str(text);
+                        let aggregated = stream_state.aggregated_text.clone();
+                        commands.trigger(TextDeltaObserved {
+                            operation: delta.operation,
+                            run,
+                            turn,
+                            sequence: delta.sequence,
+                            provider_correlation: delta.provider_correlation.clone(),
+                            delta: text.clone(),
+                            aggregated: aggregated.clone(),
+                        });
+                        let mut stream_policies = agents
                             .get(run_of.get())
                             .ok()
                             .flatten()
@@ -6521,66 +7143,104 @@ fn apply_effect_ingress(
                             .filter_map(|entity| policies.get(entity).ok())
                             .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::TextDelta))
                             .collect::<Vec<_>>();
-                        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+                        stream_policies.sort_by(|(_, left_id, left), (_, right_id, right)| {
                             left.order
                                 .cmp(&right.order)
                                 .then_with(|| left_id.cmp(right_id))
                         });
-                        (record.next_turn, ordered)
-                    })
-                    .unwrap_or_default();
-                let snapshot = stream_policies
-                    .drain(..)
-                    .map(|(entity, id, policy)| AcceptedPolicy {
-                        id: id.clone(),
-                        entity,
-                        revision: policy.revision,
-                    })
-                    .collect::<Vec<_>>();
-                if !snapshot.is_empty() {
-                    commands.spawn((
-                        EvaluationOfOperation(delta.operation),
-                        AcceptedTextDeltaPolicies(snapshot.clone()),
-                        TextDeltaPolicyEvaluation {
+                        let snapshot = stream_policies
+                            .drain(..)
+                            .map(|(entity, id, policy)| AcceptedPolicy {
+                                id: id.clone(),
+                                entity,
+                                revision: policy.revision,
+                            })
+                            .collect::<Vec<_>>();
+                        if !snapshot.is_empty() {
+                            commands.spawn((
+                                EvaluationOfOperation(delta.operation),
+                                AcceptedTextDeltaPolicies(snapshot.clone()),
+                                TextDeltaPolicyEvaluation {
+                                    run,
+                                    operation: delta.operation,
+                                    policies: snapshot,
+                                    cursor: 0,
+                                    turn,
+                                    sequence: delta.sequence,
+                                    delta: text.clone(),
+                                    aggregated,
+                                    phase: TextDeltaPolicyEvaluationPhase::Evaluating,
+                                },
+                            ));
+                            mark_progress(&mut progress);
+                            continue;
+                        }
+                        publish_stream_item(
+                            &mut commands,
                             run,
+                            StreamItem::Delta {
+                                sequence: delta.sequence,
+                                text: text.clone(),
+                            },
+                            &run_subscriptions,
+                            &mut subscriptions,
+                        );
+                    }
+                    EffectDeltaKind::ToolCall {
+                        id,
+                        internal_call_id,
+                        content,
+                    } => {
+                        commands.trigger(ToolCallDeltaObserved {
                             operation: delta.operation,
-                            policies: snapshot,
-                            cursor: 0,
+                            run,
                             turn,
                             sequence: delta.sequence,
-                            delta: delta.text.clone(),
-                            aggregated,
-                            phase: TextDeltaPolicyEvaluationPhase::Evaluating,
-                        },
-                    ));
-                    mark_progress(&mut progress);
-                    continue;
-                }
-                if let Ok(run_subscriptions) = run_subscriptions.get(operation_of.get()) {
-                    for subscription in run_subscriptions.iter() {
-                        let Ok((sink, mut subscription_state)) =
-                            subscriptions.get_mut(subscription)
-                        else {
-                            continue;
-                        };
-                        if !matches!(*subscription_state, SubscriptionState::Active) {
-                            continue;
-                        }
-                        if sink
-                            .0
-                            .try_send(StreamItem::Delta {
+                            provider_correlation: delta.provider_correlation.clone(),
+                            id: id.clone(),
+                            internal_call_id: internal_call_id.clone(),
+                            content: content.clone(),
+                        });
+                        publish_stream_item(
+                            &mut commands,
+                            run,
+                            StreamItem::ToolCallDelta {
                                 sequence: delta.sequence,
-                                text: delta.text.clone(),
-                            })
-                            .is_err()
-                        {
-                            *subscription_state = SubscriptionState::DroppedSlowConsumer;
-                            commands.entity(subscription).remove::<StreamSink>();
-                        }
+                                id: id.clone(),
+                                internal_call_id: internal_call_id.clone(),
+                                content: content.clone(),
+                            },
+                            &run_subscriptions,
+                            &mut subscriptions,
+                        );
                     }
                 }
                 mark_progress(&mut progress);
             }
+        }
+    }
+}
+
+fn publish_stream_item(
+    commands: &mut Commands,
+    run: Entity,
+    item: StreamItem,
+    run_subscriptions: &Query<&RunSubscriptions>,
+    subscriptions: &mut Query<(&StreamSink, &mut SubscriptionState)>,
+) {
+    let Ok(run_subscriptions) = run_subscriptions.get(run) else {
+        return;
+    };
+    for subscription in run_subscriptions.iter() {
+        let Ok((sink, mut subscription_state)) = subscriptions.get_mut(subscription) else {
+            continue;
+        };
+        if !matches!(*subscription_state, SubscriptionState::Active) {
+            continue;
+        }
+        if sink.0.try_send(item.clone()).is_err() {
+            *subscription_state = SubscriptionState::DroppedSlowConsumer;
+            commands.entity(subscription).remove::<StreamSink>();
         }
     }
 }
@@ -6596,6 +7256,29 @@ fn expire_effects(
             operation.phase =
                 OperationPhase::Settled(OperationOutcome::Failure(CanonicalError::Timeout));
             mark_progress(&mut progress);
+        }
+    }
+}
+
+fn publish_run_terminal_observations(
+    mut commands: Commands,
+    runs: Query<(Entity, &RunState), Changed<RunState>>,
+) {
+    for (run, state) in &runs {
+        match state {
+            RunState::Completed(output) => commands.trigger(RunCompleted {
+                run,
+                output: output.clone(),
+            }),
+            RunState::Failed(error) => commands.trigger(RunFailed {
+                run,
+                error: error.clone(),
+            }),
+            RunState::Cancelled => commands.trigger(RunCancelled { run }),
+            RunState::Queued
+            | RunState::WaitingModel { .. }
+            | RunState::WaitingTools { .. }
+            | RunState::WaitingStore { .. } => {}
         }
     }
 }
@@ -7556,6 +8239,7 @@ fn apply_policy_approval_results(world: &mut World) {
 }
 
 fn commit_store_operations(
+    mut commands: Commands,
     operations: Query<
         (Entity, &OperationOf, &StoreEffectInput, &OperationState),
         With<StoreEffectInput>,
@@ -7630,6 +8314,11 @@ fn commit_store_operations(
                 *run_state = RunState::Failed(CanonicalError::EffectKindMismatch);
             }
         }
+        commands.trigger(PersistenceSettled {
+            operation: operation_entity,
+            run: operation_of.get(),
+            outcome: outcome.clone(),
+        });
         mark_progress(&mut progress);
     }
 }
@@ -7643,6 +8332,7 @@ fn commit_model_operations(
             &OperationOf,
             &OperationState,
             &ModelEffectInput,
+            Option<&ModelStreamState>,
             Option<&EffectiveModelOutput>,
             Option<&CompletionResponsePolicyDone>,
             Option<&AcceptedPolicies>,
@@ -7658,6 +8348,7 @@ fn commit_model_operations(
         operation_of,
         operation,
         input,
+        stream_state,
         effective_output,
         response_policy_done,
         request_policies,
@@ -7812,9 +8503,10 @@ fn commit_model_operations(
                     for (index, call) in output.tool_calls.iter().enumerate() {
                         let index = u32::try_from(index).unwrap_or(u32::MAX);
                         prepared.push(
-                            if let Some(decision) =
-                                input.tools.iter().find(|tool| tool.name == call.name)
-                            {
+                            if let Some(decision) = input.tools.iter().find(|tool| {
+                                tool.name == call.name
+                                    && tool_choice_allows(input.tool_choice.as_ref(), &tool.name)
+                            }) {
                                 PreparedToolOperation::Valid(ToolEffectInput {
                                     decision: decision.clone(),
                                     call_id: call.id.clone(),
@@ -7828,6 +8520,14 @@ fn commit_model_operations(
                                     call: call.clone(),
                                     available_tools: input.tools.clone(),
                                     index,
+                                    source_model_operation: operation_entity,
+                                    turn: committed_turn,
+                                    tool_choice: input.tool_choice.clone(),
+                                    diagnostic_history: record.transcript.clone(),
+                                    streaming_origin: stream_state
+                                        .is_some_and(|state| state.next_sequence > 0),
+                                    retry_count: record.invalid_tool_call_retries,
+                                    max_retries: record.max_invalid_tool_call_retries,
                                 })
                             },
                         );
@@ -7918,7 +8618,8 @@ fn commit_tool_batches(
         Option<&ToolResultPolicyDone>,
     )>,
     source_models: Query<&ModelEffectInput>,
-    mut runs: Query<(&mut RunState, &mut RunRecord, Option<&RunControl>)>,
+    agents: Query<&Agent>,
+    mut runs: Query<(&RunOf, &mut RunState, &mut RunRecord, Option<&RunControl>)>,
     mut progress: ResMut<Progress>,
 ) {
     'batches: for (batch_entity, batch_of, batch_operations, mut batch) in &mut batches {
@@ -7951,7 +8652,7 @@ fn commit_tool_batches(
             continue;
         }
         settled.sort_by_key(|(index, _, _, _)| *index);
-        let Ok((mut run_state, mut record, control)) = runs.get_mut(batch_of.get()) else {
+        let Ok((run_of, mut run_state, mut record, control)) = runs.get_mut(batch_of.get()) else {
             continue;
         };
         if !control_allows_internal_progress(control) {
@@ -8007,6 +8708,29 @@ fn commit_tool_batches(
             mark_progress(&mut progress);
             continue;
         };
+        commands.trigger(ToolBatchCommitted {
+            batch: batch_entity,
+            run: batch_of.get(),
+            results: results.clone(),
+        });
+        let Some(model_call_limit) = agents
+            .get(run_of.get())
+            .ok()
+            .map(|agent| record.max_model_calls.unwrap_or(agent.max_model_calls))
+        else {
+            *run_state = RunState::Failed(CanonicalError::StaleEntity("agent".to_owned()));
+            batch.committed = true;
+            mark_progress(&mut progress);
+            continue;
+        };
+        if record.next_turn >= model_call_limit {
+            *run_state = RunState::Failed(CanonicalError::ModelCallBudget {
+                limit: model_call_limit,
+            });
+            batch.committed = true;
+            mark_progress(&mut progress);
+            continue;
+        }
         let mut next_input = source_input.clone();
         next_input.history = record.transcript.clone();
         next_input.tool_results = results;
@@ -8014,7 +8738,10 @@ fn commit_tool_batches(
             .spawn((
                 OperationOf(batch_of.get()),
                 OperationKind::Model,
-                ModelStreamState::default(),
+                ModelStreamState {
+                    streaming: record.streaming,
+                    ..ModelStreamState::default()
+                },
                 OperationState {
                     generation: 0,
                     phase: OperationPhase::Prepared,
@@ -8055,6 +8782,63 @@ mod tests {
 
     #[derive(Resource, Default)]
     struct FinishedTurns(Vec<ModelTurnFinished>);
+
+    #[derive(Resource, Default)]
+    struct ObservedStreamDeltas {
+        text: Vec<TextDeltaObserved>,
+        tool: Vec<ToolCallDeltaObserved>,
+        finished: Vec<StreamResponseFinished>,
+    }
+
+    #[derive(Resource, Default)]
+    struct LifecycleLog(Vec<&'static str>);
+
+    macro_rules! record_lifecycle_event {
+        ($function:ident, $event:ty, $name:literal) => {
+            fn $function(_: On<$event>, mut log: ResMut<LifecycleLog>) {
+                log.0.push($name);
+            }
+        };
+    }
+
+    record_lifecycle_event!(
+        record_request_prepared,
+        CompletionRequestPrepared,
+        "request-prepared"
+    );
+    record_lifecycle_event!(record_model_dispatched, ModelDispatched, "model-dispatched");
+    record_lifecycle_event!(record_model_settled, ModelSettled, "model-settled");
+    record_lifecycle_event!(
+        record_response_applied,
+        CompletionResponseApplied,
+        "response-applied"
+    );
+    record_lifecycle_event!(
+        record_invalid_detected,
+        InvalidToolCallDetected,
+        "invalid-detected"
+    );
+    record_lifecycle_event!(record_tool_prepared, ToolCallPrepared, "tool-prepared");
+    record_lifecycle_event!(record_tool_started, ToolExecutionStarted, "tool-started");
+    record_lifecycle_event!(record_tool_settled, ToolExecutionSettled, "tool-settled");
+    record_lifecycle_event!(
+        record_result_finalized,
+        ToolResultPresentationFinalized,
+        "result-finalized"
+    );
+    record_lifecycle_event!(
+        record_batch_committed,
+        ToolBatchCommitted,
+        "batch-committed"
+    );
+    record_lifecycle_event!(
+        record_persistence_settled,
+        PersistenceSettled,
+        "persistence-settled"
+    );
+    record_lifecycle_event!(record_run_completed, RunCompleted, "run-completed");
+    record_lifecycle_event!(record_run_failed, RunFailed, "run-failed");
+    record_lifecycle_event!(record_run_cancelled, RunCancelled, "run-cancelled");
 
     fn inspect_request_policy(
         mut event: On<RequestPolicyInvocation>,
@@ -8106,6 +8890,24 @@ mod tests {
 
     fn record_finished_turn(event: On<ModelTurnFinished>, mut turns: ResMut<FinishedTurns>) {
         turns.0.push(event.event().clone());
+    }
+
+    fn record_text_delta(event: On<TextDeltaObserved>, mut observed: ResMut<ObservedStreamDeltas>) {
+        observed.text.push(event.event().clone());
+    }
+
+    fn record_tool_delta(
+        event: On<ToolCallDeltaObserved>,
+        mut observed: ResMut<ObservedStreamDeltas>,
+    ) {
+        observed.tool.push(event.event().clone());
+    }
+
+    fn record_stream_finished(
+        event: On<StreamResponseFinished>,
+        mut observed: ResMut<ObservedStreamDeltas>,
+    ) {
+        observed.finished.push(event.event().clone());
     }
 
     fn id(value: &str) -> StableId {
@@ -8295,6 +9097,83 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_observations_cover_model_tool_batch_and_terminal_boundaries() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime.world_mut().insert_resource(LifecycleLog::default());
+        runtime.world_mut().add_observer(record_request_prepared);
+        runtime.world_mut().add_observer(record_model_dispatched);
+        runtime.world_mut().add_observer(record_model_settled);
+        runtime.world_mut().add_observer(record_response_applied);
+        runtime.world_mut().add_observer(record_invalid_detected);
+        runtime.world_mut().add_observer(record_tool_prepared);
+        runtime.world_mut().add_observer(record_tool_started);
+        runtime.world_mut().add_observer(record_tool_settled);
+        runtime.world_mut().add_observer(record_result_finalized);
+        runtime.world_mut().add_observer(record_batch_committed);
+        runtime.world_mut().add_observer(record_persistence_settled);
+        runtime.world_mut().add_observer(record_run_completed);
+        runtime.world_mut().add_observer(record_run_failed);
+        runtime.world_mut().add_observer(record_run_cancelled);
+
+        let (_, tool) = advance_to_lookup_tool(&mut runtime, agent);
+        let input = tool.tool_input().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: tool.operation,
+                generation: tool.generation,
+                result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                    call_id: input.call_id.clone(),
+                    provider_result_id: input.provider_result_id.clone(),
+                    provider_call_id: input.provider_call_id.clone(),
+                    name: input.decision.name.clone(),
+                    raw: serde_json::json!({"answer": 42}),
+                    presentation: "42".to_owned(),
+                    failure: None,
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "done".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+
+        assert_eq!(
+            runtime.world().resource::<LifecycleLog>().0,
+            vec![
+                "request-prepared",
+                "model-dispatched",
+                "model-settled",
+                "response-applied",
+                "tool-prepared",
+                "tool-started",
+                "tool-settled",
+                "result-finalized",
+                "batch-committed",
+                "request-prepared",
+                "model-dispatched",
+                "model-settled",
+                "response-applied",
+                "run-completed",
+            ]
+        );
+    }
+
+    #[test]
     fn streaming_and_blocking_observe_the_same_terminal_state() {
         let mut runtime = runtime();
         let model = runtime
@@ -8321,7 +9200,8 @@ mod tests {
                 operation: request.operation,
                 generation: request.generation,
                 sequence: 0,
-                text: "he".to_owned(),
+                provider_correlation: None,
+                kind: EffectDeltaKind::Text("he".to_owned()),
             })
             .unwrap();
         deltas
@@ -8329,7 +9209,8 @@ mod tests {
                 operation: request.operation,
                 generation: request.generation,
                 sequence: 1,
-                text: "llo".to_owned(),
+                provider_correlation: None,
+                kind: EffectDeltaKind::Text("llo".to_owned()),
             })
             .unwrap();
         runtime
@@ -8704,7 +9585,8 @@ mod tests {
                     operation: request.operation,
                     generation: request.generation,
                     sequence,
-                    text: text.to_owned(),
+                    provider_correlation: None,
+                    kind: EffectDeltaKind::Text(text.to_owned()),
                 })
                 .unwrap();
         }
@@ -8727,7 +9609,8 @@ mod tests {
                 operation: request.operation,
                 generation: request.generation,
                 sequence: 1,
-                text: "late".to_owned(),
+                provider_correlation: None,
+                kind: EffectDeltaKind::Text("late".to_owned()),
             })
             .unwrap();
         runtime.run_until_stalled().unwrap();
@@ -8744,6 +9627,125 @@ mod tests {
             Some(StreamItem::Finished(StreamTerminal::Completed(_)))
         ));
         assert_eq!(stream.try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn text_and_tool_call_deltas_share_sequence_and_observation_pipeline() {
+        let mut runtime = runtime();
+        runtime
+            .world_mut()
+            .insert_resource(ObservedStreamDeltas::default());
+        runtime.world_mut().add_observer(record_text_delta);
+        runtime.world_mut().add_observer(record_stream_finished);
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let (_, stream) = runtime.handle().prompt_stream(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(request.operation)
+            .observe(record_tool_delta);
+        let deltas = runtime.effects().delta_sender();
+        for delta in [
+            EffectDelta {
+                operation: request.operation,
+                generation: request.generation,
+                sequence: 0,
+                provider_correlation: Some("message-1".to_owned()),
+                kind: EffectDeltaKind::Text("hello".to_owned()),
+            },
+            EffectDelta {
+                operation: request.operation,
+                generation: request.generation,
+                sequence: 1,
+                provider_correlation: Some("call-1".to_owned()),
+                kind: EffectDeltaKind::ToolCall {
+                    id: "call-1".to_owned(),
+                    internal_call_id: "internal-1".to_owned(),
+                    content: ToolCallDeltaContent::Name("lookup".to_owned()),
+                },
+            },
+            EffectDelta {
+                operation: request.operation,
+                generation: request.generation,
+                sequence: 2,
+                provider_correlation: Some("call-1".to_owned()),
+                kind: EffectDeltaKind::ToolCall {
+                    id: "call-1".to_owned(),
+                    internal_call_id: "internal-1".to_owned(),
+                    content: ToolCallDeltaContent::Delta("{\"q\":".to_owned()),
+                },
+            },
+        ] {
+            deltas.try_send(delta).unwrap();
+        }
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "hello".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+
+        assert_eq!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::Delta {
+                sequence: 0,
+                text: "hello".to_owned(),
+            })
+        );
+        assert!(matches!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::ToolCallDelta {
+                sequence: 1,
+                id,
+                internal_call_id,
+                content: ToolCallDeltaContent::Name(name),
+            }) if id == "call-1" && internal_call_id == "internal-1" && name == "lookup"
+        ));
+        assert!(matches!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::ToolCallDelta {
+                sequence: 2,
+                content: ToolCallDeltaContent::Delta(fragment),
+                ..
+            }) if fragment == "{\"q\":"
+        ));
+        let observed = runtime.world().resource::<ObservedStreamDeltas>();
+        assert_eq!(observed.text.len(), 1);
+        assert_eq!(observed.tool.len(), 2);
+        assert_eq!(observed.finished.len(), 1);
+        assert_eq!(
+            observed
+                .text
+                .first()
+                .and_then(|event| event.provider_correlation.as_deref()),
+            Some("message-1")
+        );
+        assert_eq!(observed.tool.first().map(|event| event.sequence), Some(1));
+        assert_eq!(observed.tool.get(1).map(|event| event.sequence), Some(2));
     }
 
     #[test]
@@ -8789,7 +9791,8 @@ mod tests {
                     operation: request.operation,
                     generation: request.generation,
                     sequence,
-                    text: text.to_owned(),
+                    provider_correlation: None,
+                    kind: EffectDeltaKind::Text(text.to_owned()),
                 })
                 .unwrap();
         }
@@ -8843,7 +9846,8 @@ mod tests {
                     operation: request.operation,
                     generation: request.generation,
                     sequence,
-                    text: sequence.to_string(),
+                    provider_correlation: None,
+                    kind: EffectDeltaKind::Text(sequence.to_string()),
                 })
                 .unwrap();
         }
@@ -10459,8 +11463,110 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tool_repair_rejects_target_disallowed_by_tool_choice() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(
+                id("agent"),
+                tenant("a"),
+                Agent {
+                    tool_choice: Some(ModelToolChoice::None),
+                    ..Agent::default()
+                },
+                model,
+            )
+            .unwrap();
+        let tool = runtime
+            .spawn_tool(
+                id("tool"),
+                tenant("a"),
+                ToolCapability {
+                    name: "lookup".to_owned(),
+                    description: "lookup".to_owned(),
+                    parameters: serde_json::json!({"type": "object"}),
+                    order: 0,
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        runtime
+            .grant_tool(
+                id("grant"),
+                tenant("a"),
+                ToolGrant {
+                    order: 0,
+                    enabled: true,
+                },
+                agent,
+                tool,
+            )
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("repair"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::RepairInvalidTool {
+                        from: None,
+                        to: "lookup".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let pending = runtime.handle().prompt(agent, "malicious call").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "missing".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Failed(CanonicalError::UnknownTool(
+                "lookup".to_owned()
+            )))
+        );
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+    }
+
+    #[test]
     fn invalid_tool_retry_returns_feedback_without_tool_dispatch() {
         let (mut runtime, agent) = runtime_with_tool();
+        runtime.set_invalid_tool_call_budget(agent, 1).unwrap();
         runtime
             .spawn_policy(
                 id("retry"),
@@ -10509,6 +11615,74 @@ mod tests {
             "choose an advertised tool"
         );
         assert_eq!(runtime.effects().try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn invalid_tool_retry_enforces_invalid_and_total_model_budgets() {
+        for (invalid_budget, max_model_calls, expected) in [
+            (0, 4, CanonicalError::UnknownTool("missing".to_owned())),
+            (1, 1, CanonicalError::ModelCallBudget { limit: 1 }),
+        ] {
+            let (mut runtime, agent) = runtime_with_tool();
+            runtime
+                .set_invalid_tool_call_budget(agent, invalid_budget)
+                .unwrap();
+            runtime
+                .spawn_policy(
+                    id("retry"),
+                    tenant("a"),
+                    Policy {
+                        order: 0,
+                        revision: 1,
+                        rule: PolicyRule::RetryInvalidTool {
+                            tool: None,
+                            feedback: "retry".to_owned(),
+                        },
+                    },
+                    agent,
+                )
+                .unwrap();
+            let pending = runtime
+                .handle()
+                .prompt_configured(
+                    agent,
+                    "invalid",
+                    Vec::<CompletionMessage>::new(),
+                    None,
+                    Some(max_model_calls),
+                    None,
+                )
+                .unwrap();
+            runtime.run_until_stalled().unwrap();
+            let model = runtime.effects().try_recv().unwrap().unwrap();
+            runtime
+                .effects()
+                .completion_sender()
+                .try_send(EffectCompletion {
+                    operation: model.operation,
+                    generation: model.generation,
+                    result: Ok(EffectOutput::Model(ModelEffectOutput {
+                        assistant_message: None,
+                        text: String::new(),
+                        usage: Usage::default(),
+                        tool_calls: vec![ModelToolCall {
+                            id: "call".to_owned(),
+                            provider_result_id: "call".to_owned(),
+                            provider_call_id: None,
+                            name: "missing".to_owned(),
+                            arguments: serde_json::json!({}),
+                        }],
+                    })),
+                })
+                .unwrap();
+            runtime.run_until_stalled().unwrap();
+            let run = runtime.resolve_run(&pending).unwrap();
+            assert_eq!(
+                runtime.world().get::<RunState>(run.entity()),
+                Some(&RunState::Failed(expected))
+            );
+            assert_eq!(runtime.effects().try_recv().unwrap(), None);
+        }
     }
 
     #[test]
@@ -11781,6 +12955,7 @@ mod tests {
                 tenant: tenant("a"),
                 agent: Agent::default(),
                 control: AgentControl::default(),
+                invalid_tool_call_budget: None,
                 model_id: id("missing"),
                 output_requirement: None,
                 retrieval_requirement: None,
@@ -11953,5 +13128,713 @@ mod tests {
             world.get::<RunState>(run),
             Some(&RunState::Failed(CanonicalError::ExecutorDisconnected))
         );
+    }
+
+    #[test]
+    fn active_run_snapshot_rejects_live_effect_and_resumes_cancelled_checkpoint() {
+        let mut source = runtime();
+        let model = source
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = source
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let domain = source.snapshot().unwrap();
+        let pending = source.handle().prompt(agent, "checkpoint me").unwrap();
+        source.run_until_stalled().unwrap();
+        let original = source.effects().try_recv().unwrap().unwrap();
+        let run = source.resolve_run(&pending).unwrap();
+        assert!(matches!(
+            source.snapshot_active_run(run),
+            Err(ActiveRunSnapshotError::UnsafeInFlightEffect(_))
+        ));
+
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        assert!(matches!(
+            source.world().get::<RunControl>(run.entity()),
+            Some(RunControl::Paused(PauseMode::CancelAndSuspend))
+        ));
+        let snapshot = source.snapshot_active_run(run).unwrap();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("model_entity"));
+        assert!(!encoded.contains("tool_entity"));
+        assert!(!encoded.contains("store_entity"));
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(&encoded).unwrap();
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let restored_runs = restored.restore_active_run(snapshot).unwrap();
+        let restored_entity = restored_runs.0.get(pending.stable_id()).copied().unwrap();
+        let restored_run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: restored_entity,
+        };
+        restored.handle().resume(restored_run).unwrap();
+        restored.run_until_stalled().unwrap();
+        let restored_request = restored.effects().try_recv().unwrap().unwrap();
+        assert!(restored_request.generation > original.generation);
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: restored_request.operation,
+                generation: restored_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "resumed".to_owned(),
+                    usage: Usage {
+                        input_tokens: 2,
+                        output_tokens: 1,
+                    },
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        assert_eq!(
+            restored.observe_run(restored_run).unwrap(),
+            Some(RunState::Completed(RunOutput {
+                text: "resumed".to_owned(),
+                usage: Usage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+            }))
+        );
+        assert_eq!(
+            restored.run_transcript(restored_run),
+            Some(vec![
+                TranscriptEntry::User("checkpoint me".to_owned()),
+                TranscriptEntry::Assistant("resumed".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn active_run_snapshot_restores_request_policy_cursor_and_pending_approval() {
+        let mut source = runtime();
+        let model = source
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = source
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        source
+            .spawn_policy(
+                id("approve-request"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 4,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::Request,
+                        prompt: "approve request".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let domain = source.snapshot().unwrap();
+        let pending = source.handle().prompt(agent, "policy checkpoint").unwrap();
+        source.run_until_stalled().unwrap();
+        let approval = source.effects().try_recv().unwrap().unwrap();
+        assert!(approval.policy_approval_input().is_some());
+        let run = source.resolve_run(&pending).unwrap();
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let runs = restored.restore_active_run(snapshot).unwrap();
+        let run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: runs.0.get(pending.stable_id()).copied().unwrap(),
+        };
+        restored.handle().resume(run).unwrap();
+        restored.run_until_stalled().unwrap();
+        let approval = restored.effects().try_recv().unwrap().unwrap();
+        assert_eq!(approval.policy_approval_input().unwrap().revision, 4);
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: true,
+                    reason: Some("restored approval".to_owned()),
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        let model = restored.effects().try_recv().unwrap().unwrap();
+        assert!(model.model_input().is_some());
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "approved after restore".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        assert!(matches!(
+            restored.observe_run(run).unwrap(),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "approved after restore"
+        ));
+    }
+
+    #[test]
+    fn active_run_snapshot_restores_tool_batch_and_result_policy() {
+        let (mut source, agent) = runtime_with_tool();
+        source
+            .spawn_policy(
+                id("approve-result"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 2,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::ToolResult,
+                        prompt: "approve tool result".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let domain = source.snapshot().unwrap();
+        let (pending, tool) = advance_to_lookup_tool(&mut source, agent);
+        let input = tool.tool_input().unwrap();
+        source
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: tool.operation,
+                generation: tool.generation,
+                result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                    call_id: input.call_id.clone(),
+                    provider_result_id: input.provider_result_id.clone(),
+                    provider_call_id: input.provider_call_id.clone(),
+                    name: input.decision.name.clone(),
+                    raw: serde_json::json!({"answer": 42}),
+                    presentation: "42".to_owned(),
+                    failure: None,
+                })),
+            })
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let approval = source.effects().try_recv().unwrap().unwrap();
+        assert!(approval.policy_approval_input().is_some());
+        let run = source.resolve_run(&pending).unwrap();
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let runs = restored.restore_active_run(snapshot).unwrap();
+        let run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: runs.0.get(pending.stable_id()).copied().unwrap(),
+        };
+        restored.handle().resume(run).unwrap();
+        restored.run_until_stalled().unwrap();
+        let approval = restored.effects().try_recv().unwrap().unwrap();
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: true,
+                    reason: None,
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        let model = restored.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            model
+                .model_input()
+                .unwrap()
+                .tool_results
+                .first()
+                .unwrap()
+                .presentation,
+            "42"
+        );
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "tool batch resumed".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        assert!(matches!(
+            restored.observe_run(run).unwrap(),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "tool batch resumed"
+        ));
+    }
+
+    #[test]
+    fn active_run_snapshot_restores_pending_invalid_call_resolution() {
+        let (mut source, agent) = runtime_with_tool();
+        source
+            .spawn_policy(
+                id("approve-invalid"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::InvalidToolCall,
+                        prompt: "approve invalid repair".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        source
+            .spawn_policy(
+                id("repair-invalid"),
+                tenant("a"),
+                Policy {
+                    order: 1,
+                    revision: 3,
+                    rule: PolicyRule::RepairInvalidTool {
+                        from: Some("lookpu".to_owned()),
+                        to: "lookup".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let domain = source.snapshot().unwrap();
+        let pending = source
+            .handle()
+            .prompt(agent, "repair after restore")
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let model = source.effects().try_recv().unwrap().unwrap();
+        source
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "invalid-call".to_owned(),
+                        provider_result_id: "invalid-result".to_owned(),
+                        provider_call_id: Some("provider-call".to_owned()),
+                        name: "lookpu".to_owned(),
+                        arguments: serde_json::json!({"query": "persist me"}),
+                    }],
+                })),
+            })
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let approval = source.effects().try_recv().unwrap().unwrap();
+        assert!(approval.policy_approval_input().is_some());
+        let run = source.resolve_run(&pending).unwrap();
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let runs = restored.restore_active_run(snapshot).unwrap();
+        let run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: runs.0.get(pending.stable_id()).copied().unwrap(),
+        };
+        restored.handle().resume(run).unwrap();
+        restored.run_until_stalled().unwrap();
+        let approval = restored.effects().try_recv().unwrap().unwrap();
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: true,
+                    reason: None,
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        let tool = restored.effects().try_recv().unwrap().unwrap();
+        let input = tool.tool_input().unwrap();
+        assert_eq!(input.decision.name, "lookup");
+        assert_eq!(input.call_id, "invalid-call");
+        assert_eq!(input.provider_result_id, "invalid-result");
+        assert_eq!(input.provider_call_id.as_deref(), Some("provider-call"));
+        assert_eq!(input.arguments, serde_json::json!({"query": "persist me"}));
+    }
+
+    #[test]
+    fn active_run_snapshot_restores_memory_load_and_terminal_persistence() {
+        let mut source = runtime();
+        let model = source
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = source
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let store = source
+            .spawn_store(
+                id("memory"),
+                tenant("a"),
+                StoreCapability {
+                    kind: "conversation-memory".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        source
+            .grant_store(
+                id("memory-grant"),
+                tenant("a"),
+                StoreGrant {
+                    order: 0,
+                    enabled: true,
+                },
+                agent,
+                store,
+            )
+            .unwrap();
+        let domain = source.snapshot().unwrap();
+        let pending = source
+            .handle()
+            .prompt_in_conversation(agent, id("conversation"), "new question")
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let load = source.effects().try_recv().unwrap().unwrap();
+        assert!(matches!(
+            load.store_input().unwrap().operation,
+            StoreOperation::LoadConversation { .. }
+        ));
+        let run = source.resolve_run(&pending).unwrap();
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let mut middle = runtime();
+        middle.restore(domain).unwrap();
+        let runs = middle.restore_active_run(snapshot).unwrap();
+        let middle_run = RunHandle {
+            runtime_id: middle.handle.runtime_id,
+            entity: runs.0.get(pending.stable_id()).copied().unwrap(),
+        };
+        middle.handle().resume(middle_run).unwrap();
+        middle.run_until_stalled().unwrap();
+        let load = middle.effects().try_recv().unwrap().unwrap();
+        middle
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: load.operation,
+                generation: load.generation,
+                result: Ok(EffectOutput::Store(StoreEffectOutput::LoadedConversation(
+                    vec![
+                        TranscriptEntry::User("old question".to_owned()),
+                        TranscriptEntry::Assistant("old answer".to_owned()),
+                    ],
+                ))),
+            })
+            .unwrap();
+        middle.run_until_stalled().unwrap();
+        let model = middle.effects().try_recv().unwrap().unwrap();
+        middle
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "new answer".to_owned(),
+                    usage: Usage {
+                        input_tokens: 5,
+                        output_tokens: 2,
+                    },
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        middle.run_until_stalled().unwrap();
+        let persist = middle.effects().try_recv().unwrap().unwrap();
+        assert!(matches!(
+            persist.store_input().unwrap().operation,
+            StoreOperation::PersistConversation { .. }
+        ));
+        middle
+            .handle()
+            .pause_with_mode(middle_run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        middle.run_until_stalled().unwrap();
+        let domain = middle.snapshot().unwrap();
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&middle.snapshot_active_run(middle_run).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let runs = restored.restore_active_run(snapshot).unwrap();
+        let run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: runs.0.get(pending.stable_id()).copied().unwrap(),
+        };
+        restored.handle().resume(run).unwrap();
+        restored.run_until_stalled().unwrap();
+        let persist = restored.effects().try_recv().unwrap().unwrap();
+        let store_input = persist.store_input().unwrap();
+        assert!(matches!(
+            store_input.operation,
+            StoreOperation::PersistConversation { .. }
+        ));
+        let StoreOperation::PersistConversation { entries, .. } = &store_input.operation else {
+            return;
+        };
+        assert!(entries.contains(&TranscriptEntry::Assistant("new answer".to_owned())));
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: persist.operation,
+                generation: persist.generation,
+                result: Ok(EffectOutput::Store(StoreEffectOutput::Persisted)),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        assert_eq!(
+            restored.observe_run(run).unwrap(),
+            Some(RunState::Completed(RunOutput {
+                text: "new answer".to_owned(),
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 2,
+                },
+            }))
+        );
+    }
+
+    #[test]
+    fn active_run_snapshot_restores_child_topology_and_result_order() {
+        let mut source = runtime();
+        let model = source
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = source
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let domain = source.snapshot().unwrap();
+        let parent_pending = source.handle().prompt(agent, "parent").unwrap();
+        source.run_until_stalled().unwrap();
+        let _ = source.effects().try_recv().unwrap().unwrap();
+        let parent = source.resolve_run(&parent_pending).unwrap();
+        let first_pending = source
+            .handle()
+            .spawn_child_run(parent, agent, "first child")
+            .unwrap();
+        let second_pending = source
+            .handle()
+            .spawn_child_run(parent, agent, "second child")
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let _ = source.effects().try_recv().unwrap().unwrap();
+        let _ = source.effects().try_recv().unwrap().unwrap();
+        let first = source.resolve_run(&first_pending).unwrap();
+        let second = source.resolve_run(&second_pending).unwrap();
+        for run in [parent, first, second] {
+            source
+                .handle()
+                .pause_with_mode(run, PauseMode::CancelAndSuspend)
+                .unwrap();
+        }
+        source.run_until_stalled().unwrap();
+        let snapshot: ActiveRunSnapshot = serde_json::from_str(
+            &serde_json::to_string(&source.snapshot_active_run(parent).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.runs.len(), 3);
+
+        let mut restored = runtime();
+        restored.restore(domain).unwrap();
+        let runs = restored.restore_active_run(snapshot).unwrap();
+        let handle = |id: &StableId| RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: runs.0.get(id).copied().unwrap(),
+        };
+        let parent = handle(parent_pending.stable_id());
+        let first = handle(first_pending.stable_id());
+        let second = handle(second_pending.stable_id());
+        assert_eq!(
+            restored.world().get::<ParentRun>(first.entity()),
+            Some(&ParentRun(parent.entity()))
+        );
+        assert_eq!(
+            restored.world().get::<ParentRun>(second.entity()),
+            Some(&ParentRun(parent.entity()))
+        );
+        for run in [parent, first, second] {
+            restored.handle().resume(run).unwrap();
+        }
+        restored.run_until_stalled().unwrap();
+        let requests = (0..3)
+            .map(|_| restored.effects().try_recv().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        let operation_for = |run: RunHandle| match restored.world().get::<RunState>(run.entity()) {
+            Some(RunState::WaitingModel { operation }) => Some(*operation),
+            _ => None,
+        };
+        let first_operation = operation_for(first).unwrap();
+        let second_operation = operation_for(second).unwrap();
+        let parent_operation = operation_for(parent).unwrap();
+        let find_request = |operation| {
+            requests
+                .iter()
+                .find(|request| request.operation == operation)
+                .cloned()
+                .unwrap()
+        };
+        for (request, text) in [
+            (find_request(second_operation), "second output"),
+            (find_request(first_operation), "first output"),
+        ] {
+            restored
+                .effects()
+                .completion_sender()
+                .try_send(EffectCompletion {
+                    operation: request.operation,
+                    generation: request.generation,
+                    result: Ok(EffectOutput::Model(ModelEffectOutput {
+                        assistant_message: None,
+                        text: text.to_owned(),
+                        usage: Usage::default(),
+                        tool_calls: Vec::new(),
+                    })),
+                })
+                .unwrap();
+            restored.run_until_stalled().unwrap();
+        }
+        let child_results = restored
+            .world()
+            .get::<RunRecord>(parent.entity())
+            .unwrap()
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::ChildResult { result, .. } => result.as_ref().ok().cloned(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(child_results, vec!["first output", "second output"]);
+        let parent_request = find_request(parent_operation);
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: parent_request.operation,
+                generation: parent_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "parent output".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        assert!(matches!(
+            restored.observe_run(parent).unwrap(),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "parent output"
+        ));
     }
 }

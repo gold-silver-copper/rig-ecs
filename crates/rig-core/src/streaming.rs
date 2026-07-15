@@ -65,7 +65,7 @@ impl Default for PauseControl {
 }
 
 /// The content of a tool call delta - either the tool name or argument data
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Eq, Serialize, PartialEq)]
 pub enum ToolCallDeltaContent {
     /// Tool/function name emitted by the provider.
     Name(String),
