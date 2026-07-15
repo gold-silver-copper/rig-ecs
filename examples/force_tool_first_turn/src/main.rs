@@ -3,7 +3,7 @@
 #[path = "../../ecs_demo.rs"]
 mod ecs_demo;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rig::runtime::{ModelToolChoice, Policy, PolicyRule, RequestPatch};
 
 fn main() -> Result<()> {
@@ -22,9 +22,9 @@ fn main() -> Result<()> {
     )?;
     runtime.handle().prompt(agent, "Look something up")?;
     let request = ecs_demo::next_effect(&mut runtime)?;
-    println!(
-        "effective tool choice: {:?}",
-        request.model_input().unwrap().tool_choice
-    );
+    let model_input = request
+        .model_input()
+        .context("expected the policy-patched model request")?;
+    println!("effective tool choice: {:?}", model_input.tool_choice);
     Ok(())
 }

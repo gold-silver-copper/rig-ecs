@@ -3,7 +3,7 @@
 #[path = "../../ecs_demo.rs"]
 mod ecs_demo;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rig::runtime::{EffectCompletion, EffectOutput, ModelEffectOutput, RunState, Usage};
 
 fn main() -> Result<()> {
@@ -13,13 +13,16 @@ fn main() -> Result<()> {
     runtime.update();
     let run = runtime
         .resolve_run(&pending)
-        .expect("the prompt was ingested");
+        .context("the prompt was not ingested after a schedule pass")?;
     println!(
         "after one pass: {:?}",
         runtime.world().get::<RunState>(run.entity())
     );
 
-    let request = runtime.effects().try_recv()?.expect("model effect");
+    let request = runtime
+        .effects()
+        .try_recv()?
+        .context("the schedule did not emit the expected model effect")?;
     runtime
         .effects()
         .completion_sender()

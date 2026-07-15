@@ -3,7 +3,7 @@
 #[path = "../../ecs_demo.rs"]
 mod ecs_demo;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rig::runtime::{Policy, PolicyRule};
 
 fn main() -> Result<()> {
@@ -25,9 +25,9 @@ fn main() -> Result<()> {
     let model = ecs_demo::next_effect(&mut runtime)?;
     ecs_demo::complete_with_tool(&runtime, &model, "default_api")?;
     let repaired = ecs_demo::next_effect(&mut runtime)?;
-    println!(
-        "repaired to: {}",
-        repaired.tool_input().unwrap().decision.name
-    );
+    let tool_input = repaired
+        .tool_input()
+        .context("expected the repaired tool effect")?;
+    println!("repaired to: {}", tool_input.decision.name);
     Ok(())
 }

@@ -3,7 +3,7 @@
 #[path = "../../ecs_demo.rs"]
 mod ecs_demo;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rig::runtime::{Policy, PolicyRule};
 
 fn main() -> Result<()> {
@@ -27,7 +27,12 @@ fn main() -> Result<()> {
     let tool = ecs_demo::next_effect(&mut runtime)?;
     ecs_demo::complete_tool(&runtime, &tool, "unredacted")?;
     let next_model = ecs_demo::next_effect(&mut runtime)?;
-    let result = &next_model.model_input().unwrap().tool_results[0];
+    let result = next_model
+        .model_input()
+        .context("expected a follow-up model effect")?
+        .tool_results
+        .first()
+        .context("expected the completed tool result in the follow-up request")?;
     println!("raw={}, presentation={}", result.raw, result.presentation);
     Ok(())
 }

@@ -29,7 +29,13 @@ struct RunOffset(i32);
 #[tokio::test]
 async fn same_named_domain_type_remains_a_model_argument() {
     let definition = rig_core::tool::tool_definition(&DomainContextIsAnOrdinaryArgument);
-    assert!(definition.parameters["properties"]["context"].is_object());
+    assert!(
+        definition
+            .parameters
+            .get("properties")
+            .and_then(|properties| properties.get("context"))
+            .is_some_and(serde_json::Value::is_object)
+    );
     let output = DomainContextIsAnOrdinaryArgument
         .call(DomainContextIsAnOrdinaryArgumentParameters {
             context: domain::ToolContext {

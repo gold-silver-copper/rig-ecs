@@ -3,7 +3,7 @@
 #[path = "../../ecs_demo.rs"]
 mod ecs_demo;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rig::runtime::{
     EffectCompletion, EffectOutput, Policy, PolicyApprovalEffectOutput, PolicyPoint, PolicyRule,
 };
@@ -41,9 +41,9 @@ fn main() -> Result<()> {
             })),
         })?;
     let tool = ecs_demo::next_effect(&mut runtime)?;
-    println!(
-        "approved tool: {}",
-        tool.tool_input().unwrap().decision.name
-    );
+    let tool_input = tool
+        .tool_input()
+        .context("expected the approved tool effect")?;
+    println!("approved tool: {}", tool_input.decision.name);
     Ok(())
 }

@@ -3,7 +3,7 @@
 #[path = "../../ecs_demo.rs"]
 mod ecs_demo;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 fn main() -> Result<()> {
     let (mut runtime, agent) = ecs_demo::runtime(true)?;
@@ -11,7 +11,10 @@ fn main() -> Result<()> {
     let model = ecs_demo::next_effect(&mut runtime)?;
     ecs_demo::complete_with_tool(&runtime, &model, "lookup")?;
     let tool = ecs_demo::next_effect(&mut runtime)?;
-    println!("manual arguments: {}", tool.tool_input().unwrap().arguments);
+    let tool_input = tool
+        .tool_input()
+        .context("expected a tool effect after the model requested lookup")?;
+    println!("manual arguments: {}", tool_input.arguments);
     ecs_demo::complete_tool(&runtime, &tool, "manual result")?;
     let next_model = ecs_demo::next_effect(&mut runtime)?;
     ecs_demo::complete_text(&runtime, &next_model, "done")?;
