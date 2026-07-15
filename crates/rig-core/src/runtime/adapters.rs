@@ -2003,6 +2003,7 @@ fn local_prompt_error(error: LocalAgentError) -> PromptError {
             let chat_history = response_messages(&transcript).unwrap_or_default();
             let prompt = chat_history
                 .iter()
+                .rev()
                 .find(|message| matches!(message, Message::User { .. }))
                 .cloned()
                 .unwrap_or_else(|| Message::user(String::new()));
