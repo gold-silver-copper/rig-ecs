@@ -4,6 +4,7 @@ mod tools_support;
 
 mod cassette {
     mod agent;
+    mod agent_run_recovery;
     mod agent_run_stepping;
     mod agent_tools_e2e;
     mod chat_history;

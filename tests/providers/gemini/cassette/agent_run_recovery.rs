@@ -1,54 +1,94 @@
-//! Invalid tool-call recovery on [`AgentRun`] exercised against real Gemini
-//! turns: the model's `add` call is recorded normally on the wire, while the
-//! machine is fed restricted allowed-tool sets to trigger each recovery path
-//! (fail, repair, skip, retry-budget exhaustion, bad repair).
+//! Invalid tool-call recovery through ECS policy entities against Gemini
+//! cassette turns: fail-fast, repair, skip, retry-budget exhaustion, and an
+//! invalid repair target.
 
-use rig::agent::InvalidToolCallAction;
-use rig::agent::run::{AgentRun, AgentRunStep, ModelTurnOutcome};
+use std::sync::{Arc, Mutex};
+
+use rig::bevy_ecs::prelude::On;
 use rig::client::CompletionClient;
 use rig::completion::PromptError;
 use rig::message::ToolChoice;
 use rig::providers::gemini;
+use rig::runtime::{
+    InvalidToolCallDetected, ModelToolChoice, PendingInvalidToolCall, PolicyRule, ToolCallPrepared,
+};
 
 use super::super::agent_run_support::{
-    Add, FORCE_TOOLS_PREAMBLE, Subtract, Sum, assistant_tool_call_names, call_model,
-    execute_pending_calls, history_has_assistant_tool_call, tool_names,
-    user_content_tool_result_texts,
+    Add, FORCE_TOOLS_PREAMBLE, Subtract, Sum, assistant_tool_call_names,
+    history_has_assistant_tool_call, tool_result_texts,
 };
 use super::super::support::with_gemini_cassette;
-use crate::support::{assert_mentions_expected_number, assert_nonempty_response};
+use crate::support::{assert_mentions_expected_number, assert_nonempty_response, install_policy};
 
 const SKIP_REASON: &str = "The add tool is disabled for this request.";
 
-/// Drive a fresh single-tool run to its first `NeedsResolution`, returning
-/// the run mid-resolution.
-async fn run_until_invalid_add_call(
-    agent: &super::super::agent_run_support::GeminiAgent,
-    allowed: &std::collections::BTreeSet<String>,
-    retries: usize,
-) -> AgentRun {
-    let executable = tool_names(&["add"]);
-    let mut run = AgentRun::new("What is 21 + 21? Use the add tool.")
-        .max_turns(2)
-        .max_invalid_tool_call_retries(retries);
-    let AgentRunStep::CallModel {
-        prompt, history, ..
-    } = run.next_step().expect("run should advance")
-    else {
-        panic!("a fresh run starts with a model call");
-    };
-    let outcome = run
-        .model_response(call_model(agent, prompt, history, &executable, allowed).await)
-        .expect("model turn should be ingested");
-    let ModelTurnOutcome::NeedsResolution(context) = outcome else {
-        panic!("the add call must be rejected for this turn: {outcome:?}");
-    };
-    assert_eq!(context.tool_name, "add");
-    run
+#[derive(Clone, Default)]
+struct InvalidCallProbe(Arc<Mutex<Vec<PendingInvalidToolCall>>>);
+
+impl InvalidCallProbe {
+    fn install(&self, agent: &rig::agent::Agent<gemini::completion::CompletionModel>) {
+        let observed = self.clone();
+        agent
+            .with_runtime_mut(move |runtime| {
+                runtime
+                    .world_mut()
+                    .add_observer(move |event: On<InvalidToolCallDetected>| {
+                        observed
+                            .0
+                            .lock()
+                            .expect("invalid-call observations")
+                            .push(event.invalid.clone());
+                    });
+            })
+            .expect("invalid-call observer should install");
+    }
+
+    fn calls(&self) -> Vec<PendingInvalidToolCall> {
+        self.0.lock().expect("invalid-call observations").clone()
+    }
+}
+
+#[derive(Clone, Default)]
+struct PreparedToolProbe(Arc<Mutex<Vec<String>>>);
+
+impl PreparedToolProbe {
+    fn install(&self, agent: &rig::agent::Agent<gemini::completion::CompletionModel>) {
+        let observed = self.clone();
+        agent
+            .with_runtime_mut(move |runtime| {
+                runtime
+                    .world_mut()
+                    .add_observer(move |event: On<ToolCallPrepared>| {
+                        observed
+                            .0
+                            .lock()
+                            .expect("prepared tool observations")
+                            .push(event.call.decision.name.clone());
+                    });
+            })
+            .expect("prepared-tool observer should install");
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.0.lock().expect("prepared tool observations").clone()
+    }
+}
+
+fn set_invalid_retry_budget(
+    agent: &rig::agent::Agent<gemini::completion::CompletionModel>,
+    max_retries: u32,
+) {
+    let handle = agent.handle();
+    agent
+        .with_runtime_mut(move |runtime| runtime.set_invalid_tool_call_budget(handle, max_retries))
+        .expect("runtime access should succeed")
+        .expect("invalid-tool budget should be configured");
 }
 
 #[tokio::test]
 async fn fail_resolution_returns_unknown_tool_call() {
+    let probe = InvalidCallProbe::default();
+    let observed = probe.clone();
     with_gemini_cassette(
         "agent_run_recovery/fail_resolution_returns_unknown_tool_call",
         |client| async move {
@@ -58,114 +98,78 @@ async fn fail_resolution_returns_unknown_tool_call() {
                 .tool(Add)
                 .tool_choice(ToolChoice::Required)
                 .build();
+            probe.install(&agent);
 
-            let mut run = run_until_invalid_add_call(&agent, &tool_names(&[]), 0).await;
-            let error = run
-                .resolve_invalid_tool_call(InvalidToolCallAction::fail())
-                .expect_err("fail resolution must error the run");
-
-            let PromptError::UnknownToolCall {
-                tool_name,
-                available_tools,
-                allowed_tools,
-                chat_history,
-            } = error
-            else {
+            let error = agent
+                .prompt("What is 21 + 21? Use the add tool.")
+                .await
+                .expect_err("an unhandled unknown tool must fail closed");
+            let PromptError::UnknownToolCall { tool_name, .. } = error else {
                 panic!("expected UnknownToolCall, got {error:?}");
             };
-            assert_eq!(tool_name, "add");
-            assert_eq!(available_tools, vec!["add".to_string()]);
-            assert!(allowed_tools.is_empty());
-            assert!(
-                history_has_assistant_tool_call(&chat_history, "add"),
-                "the diagnostic history must include the rejected assistant turn: {chat_history:?}"
+            assert_eq!(tool_name, "missing_add");
+
+            let calls = observed.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].call.name, "missing_add");
+            assert_eq!(
+                calls[0]
+                    .available_tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["add"]
             );
+            assert_eq!(calls[0].tool_choice, Some(ModelToolChoice::Required));
         },
     )
     .await;
 }
+
 #[tokio::test]
 async fn repair_renames_tool_call_and_executes_it() {
+    let probe = PreparedToolProbe::default();
+    let observed = probe.clone();
     with_gemini_cassette(
         "agent_run_recovery/repair_renames_tool_call_and_executes_it",
         |client| async move {
-            // `sum` is registered alongside `add` so the post-repair wire
-            // history references a tool Gemini saw advertised.
             let agent = client
                 .agent(gemini::completion::GEMINI_2_5_FLASH)
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .tool(Add)
                 .tool(Sum)
                 .build();
-            let machine_names = tool_names(&["sum"]);
+            probe.install(&agent);
+            install_policy(
+                &agent,
+                "repair-add-typo",
+                0,
+                1,
+                PolicyRule::RepairInvalidTool {
+                    from: Some("missing_add".to_owned()),
+                    to: "sum".to_owned(),
+                },
+            )
+            .expect("repair policy should install");
 
-            let mut run =
-                AgentRun::new("Use the add tool to compute 2 + 3, then state the result.")
-                    .max_turns(3);
-            let mut repaired_calls = 0_usize;
-
-            let response = loop {
-                match run.next_step().expect("run should advance") {
-                    AgentRunStep::CallModel {
-                        prompt, history, ..
-                    } => {
-                        let repaired_before = repaired_calls;
-                        let mut outcome = run
-                            .model_response(
-                                call_model(&agent, prompt, history, &machine_names, &machine_names)
-                                    .await,
-                            )
-                            .expect("model turn should be ingested");
-                        while let ModelTurnOutcome::NeedsResolution(context) = outcome {
-                            assert_eq!(context.tool_name, "add");
-                            outcome = run
-                                .resolve_invalid_tool_call(InvalidToolCallAction::repair("sum"))
-                                .expect("repair to an allowed tool should be accepted");
-                            repaired_calls += 1;
-                            assert!(repaired_calls < 6, "repair loop did not converge");
-                        }
-                        let ModelTurnOutcome::Continue {
-                            response_hook_suppressed,
-                        } = outcome
-                        else {
-                            panic!("repaired turns continue: {outcome:?}");
-                        };
-                        assert_eq!(
-                            response_hook_suppressed,
-                            repaired_calls > repaired_before,
-                            "exactly the recovered turns suppress the response hook"
-                        );
-                    }
-                    AgentRunStep::CallTools { calls } => {
-                        for call in &calls {
-                            assert_eq!(
-                                call.tool_call.function.name, "sum",
-                                "the repaired name must reach the driver"
-                            );
-                            assert!(call.preresolved_result.is_none());
-                        }
-                        run.tool_results(execute_pending_calls(&calls))
-                            .expect("tool results should be accepted");
-                    }
-                    AgentRunStep::Done(response) => break response,
-                }
-            };
-
-            assert!(repaired_calls >= 1, "at least one call should be repaired");
+            let response = agent
+                .prompt("Use the add tool to compute 2 + 3, then state the result.")
+                .max_turns(3)
+                .extended_details()
+                .await
+                .expect("repair to an accepted tool should complete");
             assert_mentions_expected_number(&response.output, 5);
 
-            // The repaired name is what history records; the original name
-            // never reaches the conversation.
-            let messages = response.messages.clone().expect("run reports its messages");
-            let recorded: Vec<String> = messages
+            let messages = response.messages.expect("canonical messages");
+            let recorded = messages
                 .iter()
                 .flat_map(assistant_tool_call_names)
-                .collect();
-            assert!(recorded.iter().any(|name| name == "sum"), "{recorded:?}");
+                .collect::<Vec<_>>();
             assert!(
-                !recorded.iter().any(|name| name == "add"),
-                "the unrepaired name must not be recorded: {recorded:?}"
+                recorded.iter().any(|name| name == "missing_add"),
+                "provider-significant emitted content stays intact: {recorded:?}"
             );
+            assert_eq!(observed.names(), ["sum"]);
         },
     )
     .await;
@@ -182,82 +186,40 @@ async fn skip_suppresses_every_call_in_the_turn() {
                 .tool(Add)
                 .tool(Subtract)
                 .build();
-            let executable = tool_names(&["add", "subtract"]);
-            // `add` is disallowed for the first turn.
-            let restricted = tool_names(&["subtract"]);
-
-            let mut run = AgentRun::new(
-                "Compute 3 + 5 and 10 - 4. You MUST call the add tool and the subtract tool together in your first response, as two parallel function calls, then report both results.",
+            install_policy(
+                &agent,
+                "skip-missing-add",
+                0,
+                1,
+                PolicyRule::SkipInvalidTool {
+                    tool: Some("missing_add".to_owned()),
+                    reason: SKIP_REASON.to_owned(),
+                },
             )
-            .max_turns(3);
-            let mut skipped_turn_calls: Option<Vec<String>> = None;
+            .expect("skip policy should install");
 
-            let response = loop {
-                match run.next_step().expect("run should advance") {
-                    AgentRunStep::CallModel {
-                        prompt, history, ..
-                    } => {
-                        let (allowed, expect_invalid) = if skipped_turn_calls.is_none() {
-                            (&restricted, true)
-                        } else {
-                            (&executable, false)
-                        };
-                        let mut outcome = run
-                            .model_response(
-                                call_model(&agent, prompt, history, &executable, allowed).await,
-                            )
-                            .expect("model turn should be ingested");
-                        if let ModelTurnOutcome::NeedsResolution(context) = outcome {
-                            assert!(expect_invalid, "only the first turn restricts tools");
-                            assert_eq!(context.tool_name, "add");
-                            outcome = run
-                                .resolve_invalid_tool_call(InvalidToolCallAction::skip(
-                                    SKIP_REASON,
-                                ))
-                                .expect("skip should be accepted");
-                        }
-                        assert!(matches!(outcome, ModelTurnOutcome::Continue { .. }));
-                    }
-                    AgentRunStep::CallTools { calls } => {
-                        if skipped_turn_calls.is_none() {
-                            // Recovery skipped `add`, so no call in this turn
-                            // may execute: each one is preresolved.
-                            let mut names = Vec::new();
-                            for call in &calls {
-                                names.push(call.tool_call.function.name.clone());
-                                let preresolved = call
-                                    .preresolved_result
-                                    .clone()
-                                    .expect("every call in a skipped turn is preresolved");
-                                let texts = user_content_tool_result_texts(&preresolved);
-                                if call.tool_call.function.name == "add" {
-                                    assert!(
-                                        texts.iter().any(|text| text.contains(SKIP_REASON)),
-                                        "the skipped call carries the hook reason: {texts:?}"
-                                    );
-                                } else {
-                                    assert!(
-                                        texts.iter().any(|text| text
-                                            .contains("another tool call in the same assistant turn was invalid")),
-                                        "peers carry the not-executed marker: {texts:?}"
-                                    );
-                                }
-                            }
-                            skipped_turn_calls = Some(names);
-                        }
-                        run.tool_results(execute_pending_calls(&calls))
-                            .expect("tool results should be accepted");
-                    }
-                    AgentRunStep::Done(response) => break response,
-                }
-            };
-
-            let first_turn = skipped_turn_calls.expect("the model should call tools");
-            assert!(
-                first_turn.iter().any(|name| name == "add"),
-                "the skipped add call still reaches the driver: {first_turn:?}"
-            );
+            let response = agent
+                .prompt(
+                    "Compute 3 + 5 and 10 - 4. You MUST call the add tool and the subtract tool together in your first response, as two parallel function calls, then report both results.",
+                )
+                .max_turns(3)
+                .extended_details()
+                .await
+                .expect("the skipped invalid call should become synthetic feedback");
             assert_nonempty_response(&response.output);
+            let messages = response.messages.expect("canonical messages");
+            let presentations = messages
+                .iter()
+                .flat_map(tool_result_texts)
+                .collect::<Vec<_>>();
+            assert!(
+                presentations.iter().any(|text| text.contains(SKIP_REASON)),
+                "{presentations:?}"
+            );
+            assert!(
+                history_has_assistant_tool_call(&messages, "missing_add"),
+                "the provider-emitted invalid call remains auditable"
+            );
         },
     )
     .await;
@@ -274,17 +236,27 @@ async fn retry_with_exhausted_budget_fails_with_unknown_tool_call() {
                 .tool(Add)
                 .tool_choice(ToolChoice::Required)
                 .build();
+            set_invalid_retry_budget(&agent, 0);
+            install_policy(
+                &agent,
+                "retry-missing-add",
+                0,
+                1,
+                PolicyRule::RetryInvalidTool {
+                    tool: Some("missing_add".to_owned()),
+                    feedback: "Try a different tool.".to_owned(),
+                },
+            )
+            .expect("retry policy should install");
 
-            // Zero retry budget: the first retry resolution must fail.
-            let mut run = run_until_invalid_add_call(&agent, &tool_names(&[]), 0).await;
-            let error = run
-                .resolve_invalid_tool_call(InvalidToolCallAction::retry("Try a different tool."))
-                .expect_err("retry without budget must error the run");
-
+            let error = agent
+                .prompt("What is 21 + 21? Use the add tool.")
+                .await
+                .expect_err("retry without budget must fail");
             let PromptError::UnknownToolCall { tool_name, .. } = error else {
                 panic!("expected UnknownToolCall, got {error:?}");
             };
-            assert_eq!(tool_name, "add");
+            assert_eq!(tool_name, "missing_add");
         },
     )
     .await;
@@ -301,25 +273,26 @@ async fn repair_to_disallowed_name_fails_with_unknown_tool_call() {
                 .tool(Add)
                 .tool_choice(ToolChoice::Required)
                 .build();
+            install_policy(
+                &agent,
+                "bad-repair-target",
+                0,
+                1,
+                PolicyRule::RepairInvalidTool {
+                    from: Some("missing_add".to_owned()),
+                    to: "multiply".to_owned(),
+                },
+            )
+            .expect("repair policy should install");
 
-            let mut run = run_until_invalid_add_call(&agent, &tool_names(&["subtract"]), 0).await;
-            let error = run
-                .resolve_invalid_tool_call(InvalidToolCallAction::repair("multiply"))
-                .expect_err("repairing to a disallowed name must error the run");
-
-            let PromptError::UnknownToolCall {
-                tool_name,
-                allowed_tools,
-                ..
-            } = error
-            else {
+            let error = agent
+                .prompt("What is 21 + 21? Use the add tool.")
+                .await
+                .expect_err("repair outside the immutable snapshot must fail");
+            let PromptError::UnknownToolCall { tool_name, .. } = error else {
                 panic!("expected UnknownToolCall, got {error:?}");
             };
-            assert_eq!(
-                tool_name, "multiply",
-                "the error names the rejected repair target"
-            );
-            assert_eq!(allowed_tools, vec!["subtract".to_string()]);
+            assert_eq!(tool_name, "multiply");
         },
     )
     .await;
