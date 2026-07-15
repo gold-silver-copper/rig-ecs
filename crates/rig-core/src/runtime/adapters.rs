@@ -12,15 +12,16 @@ use crate::{
         UserContent,
     },
     runtime::{
-        Agent, AgentHandle, CanonicalError, DiscoveryEffectInput, DiscoveryEffectOutput,
-        DriveError, EffectCompletion, EffectDelta, EffectDeltaSender, EffectInput, EffectIoError,
-        EffectOutput, EffectRequest, ExtensionInstallError, InstallError, ModelCapability,
-        ModelDecision, ModelEffectInput, ModelEffectOutput, ModelToolCall, ModelToolChoice,
-        OutputRequirement, RetrievalRequirement, RetrievedDocument, RigExtension, RunOutput,
-        RunState, Runtime, RuntimeConfig, SpawnError, StableId, StoreCapability, StoreEffectInput,
-        StoreEffectOutput, StoreGrant, StoreOperation, StreamItem, StreamReceiveError,
-        StreamTerminal, SubmitError, TenantId, ToolCapability, ToolEffectInput, ToolEffectOutput,
-        ToolGrant, TranscriptEntry, Usage,
+        ActiveRunSnapshot, ActiveRunSnapshotError, Agent, AgentHandle, CanonicalError,
+        DiscoveryEffectInput, DiscoveryEffectOutput, DriveError, EffectCompletion, EffectDelta,
+        EffectDeltaSender, EffectInput, EffectIoError, EffectOutput, EffectRequest,
+        ExtensionInstallError, InstallError, ModelCapability, ModelDecision, ModelEffectInput,
+        ModelEffectOutput, ModelToolCall, ModelToolChoice, OutputRequirement, PauseMode,
+        RetrievalRequirement, RetrievedDocument, RigExtension, RunOf, RunOutput, RunState, Runtime,
+        RuntimeConfig, SpawnError, StableId, StoreCapability, StoreEffectInput, StoreEffectOutput,
+        StoreGrant, StoreOperation, StreamItem, StreamReceiveError, StreamTerminal, SubmitError,
+        TenantId, ToolCapability, ToolEffectInput, ToolEffectOutput, ToolGrant, TranscriptEntry,
+        Usage,
     },
     streaming::{StreamedAssistantContent, ToolCallDeltaContent},
     tool::IntoToolOutput,
@@ -1206,6 +1207,68 @@ where
         Ok(())
     }
 
+    /// Pauses and serializes one owned run at an ECS safe point.
+    ///
+    /// `CancelAndSuspend` converts live effects into redispatchable prepared
+    /// operations before capture. Other modes retain their documented safety
+    /// checks and may return [`ActiveRunSnapshotError::UnsafeInFlightEffect`].
+    pub fn checkpoint_active_run(
+        &self,
+        run_entity: bevy_ecs::entity::Entity,
+        mode: PauseMode,
+    ) -> Result<ActiveRunSnapshot, LocalAgentError> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| LocalAgentError::RuntimePoisoned)?;
+        let owned_by_agent = runtime
+            .world()
+            .get::<RunOf>(run_entity)
+            .is_some_and(|relation| relation.get() == self.agent.entity());
+        if !owned_by_agent {
+            return Err(ActiveRunSnapshotError::NotRun.into());
+        }
+        let run = runtime.run_handle(run_entity)?;
+        runtime.handle().pause_with_mode(run, mode)?;
+        runtime.run_until_stalled()?;
+        Ok(runtime.snapshot_active_run(run)?)
+    }
+
+    /// Restores one stable-ID checkpoint and drives its root run to completion.
+    ///
+    /// Runtime-only provider and tool executors come from this facade; the
+    /// checkpoint supplies only validated ECS state and stable relationships.
+    pub async fn restore_active_run(
+        &self,
+        snapshot: ActiveRunSnapshot,
+        tool_concurrency: usize,
+    ) -> Result<RunOutput, LocalAgentError> {
+        assert!(
+            tool_concurrency > 0,
+            "tool concurrency must be greater than zero"
+        );
+        let root_run = snapshot.root_run.clone();
+        let pending = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| LocalAgentError::RuntimePoisoned)?;
+            let restored = runtime.restore_active_run(snapshot)?;
+            let entity = restored.0.get(&root_run).copied().ok_or_else(|| {
+                ActiveRunSnapshotError::MissingSnapshotReference(root_run.as_str().to_owned())
+            })?;
+            let run = runtime.run_handle(entity)?;
+            runtime.handle().resume(run)?;
+            crate::runtime::PendingRunHandle {
+                runtime_id: self.agent.runtime_id,
+                stable_id: root_run,
+            }
+        };
+        self.drive_pending(pending, tool_concurrency)
+            .await
+            .map(|result| result.output)
+    }
+
     /// Submits and resolves one prompt through [`crate::runtime::RigSchedule`].
     pub async fn run_prompt(
         &self,
@@ -1269,6 +1332,14 @@ where
                 conversation,
             )?
         };
+        self.drive_pending(pending, tool_concurrency).await
+    }
+
+    async fn drive_pending(
+        &self,
+        pending: crate::runtime::PendingRunHandle,
+        tool_concurrency: usize,
+    ) -> Result<LocalRunResult, LocalAgentError> {
         loop {
             let (requests, completion_sender, _) = self.drive_and_take_effects(&pending)?;
             let mut tool_requests = Vec::new();
@@ -2081,6 +2152,9 @@ pub enum LocalAgentError {
     /// Domain construction failed.
     #[error(transparent)]
     Spawn(#[from] SpawnError),
+    /// Active-run checkpoint validation, capture, or restoration failed.
+    #[error(transparent)]
+    ActiveRunSnapshot(#[from] ActiveRunSnapshotError),
     /// A facade command could not enter the bounded runtime queue.
     #[error(transparent)]
     Submit(#[from] SubmitError),

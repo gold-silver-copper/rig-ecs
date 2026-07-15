@@ -5163,6 +5163,20 @@ impl Runtime {
         })
     }
 
+    /// Validates an advanced world entity and returns a runtime-scoped run handle.
+    pub fn run_handle(&self, entity: Entity) -> Result<RunHandle, ActiveRunSnapshotError> {
+        if self.world.get::<RunOf>(entity).is_none()
+            || self.world.get::<RunState>(entity).is_none()
+            || self.world.get::<RunRecord>(entity).is_none()
+        {
+            return Err(ActiveRunSnapshotError::NotRun);
+        }
+        Ok(RunHandle {
+            runtime_id: self.handle.runtime_id,
+            entity,
+        })
+    }
+
     /// Clones the current run state and releases a terminal result for cleanup.
     pub fn observe_run(&mut self, run: RunHandle) -> Result<Option<RunState>, SubmitError> {
         if run.runtime_id != self.handle.runtime_id {
