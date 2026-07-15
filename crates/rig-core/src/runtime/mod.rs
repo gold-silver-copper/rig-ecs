@@ -5984,7 +5984,12 @@ fn reconcile_agent_control(
 
 fn reconcile_run_control(
     mut commands: Commands,
-    mut runs: Query<(Entity, &mut RunControl, Option<&RunOperations>)>,
+    mut runs: Query<(
+        Entity,
+        &mut RunControl,
+        Option<&RunOperations>,
+        &mut RunState,
+    )>,
     mut operations: Query<(
         &mut OperationState,
         &OperationGeneration,
@@ -5993,7 +5998,7 @@ fn reconcile_run_control(
     cancellations: Res<CancellationOutbox>,
     mut progress: ResMut<Progress>,
 ) {
-    for (_run, mut control, run_operations) in &mut runs {
+    for (_run, mut control, run_operations, mut run_state) in &mut runs {
         let RunControl::PauseRequested(mode) = *control else {
             continue;
         };
@@ -6017,6 +6022,11 @@ fn reconcile_run_control(
                 }
             }
             PauseMode::CancelAndSuspend => {
+                let generation_exhausted = operation_entities.iter().any(|entity| {
+                    operations.get(*entity).is_ok_and(|(state, generation, _)| {
+                        matches!(state.phase, OperationPhase::InFlight) && generation.0 == u64::MAX
+                    })
+                });
                 for operation_entity in operation_entities {
                     let Ok((mut operation, generation, deadline)) =
                         operations.get_mut(operation_entity)
@@ -6030,13 +6040,20 @@ fn reconcile_run_control(
                         operation: operation_entity,
                         generation: generation.0,
                     });
-                    commands
-                        .entity(operation_entity)
-                        .insert(OperationGeneration(generation.0.saturating_add(1)));
-                    operation.phase = OperationPhase::Prepared;
+                    if generation_exhausted {
+                        operation.phase = OperationPhase::Cancelled;
+                    } else if let Some(next_generation) = generation.0.checked_add(1) {
+                        commands
+                            .entity(operation_entity)
+                            .insert(OperationGeneration(next_generation));
+                        operation.phase = OperationPhase::Prepared;
+                    }
                     if deadline.is_some() {
                         commands.entity(operation_entity).remove::<EffectDeadline>();
                     }
+                }
+                if generation_exhausted {
+                    *run_state = RunState::Cancelled;
                 }
                 *control = RunControl::Paused(mode);
                 mark_progress(&mut progress);
@@ -15557,6 +15574,61 @@ mod tests {
                 .get::<OperationGeneration>(request.operation),
             Some(&OperationGeneration(retried.generation))
         );
+    }
+
+    #[test]
+    fn cancel_and_suspend_fails_closed_when_generation_is_exhausted() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(request.operation)
+            .insert(OperationGeneration(u64::MAX));
+
+        runtime
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+
+        assert_eq!(
+            runtime.effects().try_recv_cancellation().unwrap(),
+            Some(EffectCancellation {
+                operation: request.operation,
+                generation: u64::MAX,
+            })
+        );
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Cancelled)
+        );
+        assert_eq!(
+            runtime.world().get::<OperationState>(request.operation),
+            Some(&OperationState {
+                phase: OperationPhase::Cancelled,
+            })
+        );
+        runtime.handle().resume(run).unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(runtime.effects().try_recv().unwrap().is_none());
     }
 
     #[test]
