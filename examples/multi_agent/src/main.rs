@@ -1,104 +1,155 @@
-use anyhow::Result;
-use rig::integrations::cli_chatbot::ChatBotBuilder;
-use rig::prelude::*;
-use rig::providers::openai;
-use rig::{
-    agent::{Agent, AgentBuilder},
-    completion::{Chat, CompletionModel, Message},
-    providers::openai::Client as OpenAIClient,
-    tool::Tool,
+//! Multiple agents and independently controlled runs in one ECS world.
+//!
+//! A general assistant delegates Spanish translation to a translator agent.
+//! The child is freeze-paused after its completion reaches ingress; while it is
+//! paused, an unrelated run on the same assistant completes. Resuming the child
+//! commits its result and releases the parent without any lockstep execution.
+
+use anyhow::{Context, Result};
+use rig::runtime::{
+    Agent, EffectCompletion, EffectOutput, ModelCapability, ModelEffectOutput, PauseMode,
+    RunControl, RunRecord, RunState, Runtime, RuntimeConfig, StableId, TenantId, TranscriptEntry,
+    Usage, WaitingForChildren,
 };
-use serde::Deserialize;
-use serde_json::json;
 
-// Define a wrapper around an agent so that it can be provided to another agent
-// as a tool
-struct TranslatorTool<M: CompletionModel>(Agent<M>);
-
-const TRANSLATOR_TOOL_NAME: &str = "translator";
-
-// The input that will be sent to the translator agent from the main agent
-#[derive(Deserialize)]
-struct TranslatorArgs {
-    prompt: String,
+fn id(value: &str) -> Result<StableId> {
+    Ok(StableId::new(value)?)
 }
 
-impl<M: CompletionModel + 'static> Tool for TranslatorTool<M> {
-    const NAME: &'static str = TRANSLATOR_TOOL_NAME;
+fn complete(runtime: &Runtime, request: &rig::runtime::EffectRequest, text: &str) -> Result<()> {
+    runtime
+        .effects()
+        .completion_sender()
+        .try_send(EffectCompletion {
+            operation: request.operation,
+            generation: request.generation,
+            result: Ok(EffectOutput::Model(ModelEffectOutput {
+                assistant_message: None,
+                text: text.to_owned(),
+                usage: Usage::default(),
+                tool_calls: Vec::new(),
+            })),
+        })?;
+    Ok(())
+}
 
-    type Error = PromptError;
+fn main() -> Result<()> {
+    let tenant = TenantId::new("multi-agent-example")?;
+    let mut runtime = Runtime::new(RuntimeConfig::default())?;
+    let model = runtime.spawn_model(
+        id("shared-model")?,
+        tenant.clone(),
+        ModelCapability {
+            provider: "example".to_owned(),
+            model: "deterministic".to_owned(),
+            revision: 1,
+            retired: false,
+        },
+    )?;
+    let assistant = runtime.spawn_agent(
+        id("assistant")?,
+        tenant.clone(),
+        Agent {
+            name: Some("general assistant".to_owned()),
+            instructions: "Delegate non-English input to the translator".to_owned(),
+            ..Agent::default()
+        },
+        model,
+    )?;
+    let translator = runtime.spawn_agent(
+        id("translator")?,
+        tenant,
+        Agent {
+            name: Some("translator".to_owned()),
+            instructions: "Translate input to English".to_owned(),
+            ..Agent::default()
+        },
+        model,
+    )?;
 
-    type Args = TranslatorArgs;
-    type Output = String;
+    let parent_pending = runtime.handle().prompt(assistant, "¿Cómo estás?")?;
+    runtime.run_until_stalled()?;
+    let parent_request = runtime
+        .effects()
+        .try_recv()?
+        .context("expected the assistant model effect")?;
+    let parent = runtime
+        .resolve_run(&parent_pending)
+        .context("assistant prompt was not admitted")?;
+    let child_pending =
+        runtime
+            .handle()
+            .spawn_child_run(parent, translator, "Translate: ¿Cómo estás?")?;
+    runtime.run_until_stalled()?;
+    let child_request = runtime
+        .effects()
+        .try_recv()?
+        .context("expected the translator model effect")?;
+    let child = runtime
+        .resolve_run(&child_pending)
+        .context("translator child was not admitted")?;
+    runtime
+        .handle()
+        .pause_with_mode(child, PauseMode::FreezeAfterIngress)?;
+    complete(&runtime, &child_request, "How are you?")?;
+    complete(
+        &runtime,
+        &parent_request,
+        "Translated: How are you? Final response: I am well.",
+    )?;
+    runtime.run_until_stalled()?;
+    anyhow::ensure!(
+        runtime.world().get::<RunControl>(child.entity())
+            == Some(&RunControl::Paused(PauseMode::FreezeAfterIngress)),
+        "translator did not freeze after validated ingress"
+    );
+    anyhow::ensure!(
+        runtime
+            .world()
+            .get::<WaitingForChildren>(parent.entity())
+            .is_some(),
+        "parent advanced while its child was paused"
+    );
 
-    fn description(&self) -> String {
-        "Translate any text to English. If already in English, fix grammar and syntax issues."
-            .to_string()
-    }
+    let sibling_pending = runtime
+        .handle()
+        .prompt(assistant, "Answer this unrelated English request")?;
+    runtime.run_until_stalled()?;
+    let sibling_request = runtime
+        .effects()
+        .try_recv()?
+        .context("expected the unrelated sibling effect")?;
+    complete(&runtime, &sibling_request, "unrelated run completed")?;
+    runtime.run_until_stalled()?;
+    let sibling = runtime
+        .resolve_run(&sibling_pending)
+        .context("sibling prompt was not admitted")?;
+    println!(
+        "sibling while translator paused: {:?}",
+        runtime.observe_run(sibling)?
+    );
+    anyhow::ensure!(
+        matches!(
+            runtime.world().get::<RunState>(sibling.entity()),
+            Some(RunState::Completed(_))
+        ),
+        "paused child blocked an unrelated sibling"
+    );
 
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "The text to translate to English"
-                }
-            },
-            "required": ["prompt"]
+    runtime.handle().resume(child)?;
+    runtime.run_until_stalled()?;
+    let translated = runtime
+        .world()
+        .get::<RunRecord>(parent.entity())
+        .context("parent run record disappeared")?
+        .transcript
+        .iter()
+        .find_map(|entry| match entry {
+            TranscriptEntry::ChildResult { result, .. } => result.as_ref().ok(),
+            _ => None,
         })
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let mut empty_history = Vec::<Message>::new();
-        match self.0.chat(&args.prompt, &mut empty_history).await {
-            Ok(response) => {
-                println!("Translated prompt: {response}");
-                Ok(response)
-            }
-            Err(e) => Err(e),
-        }
-    }
-}
-
-/// A multi agent application that consists of two components:
-/// an agent specialized in translating prompt into english and a simple GPT-4 model.
-/// When provided with a prompt in a language besides english, the application will use
-/// the translator agent to translate the prompt in english, before answering it with GPT-4.
-/// The answer in english is returned.
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    // Create OpenAI client
-    let openai_client = OpenAIClient::from_env()?;
-    let model = openai_client.completion_model(openai::GPT_4O);
-
-    let translator_agent = AgentBuilder::new(model.clone())
-                .preamble(
-                    "You are a translator assistant that will translate any input text into english. \
-                    If the text is already in english, simply respond with the original text but fix any mistakes (grammar, syntax, etc.)."
-                )
-                .build();
-
-    let translator_tool = TranslatorTool(translator_agent);
-
-    let multi_agent_system = AgentBuilder::new(model)
-        .preamble(format!(
-            "You are a helpful assistant that can work with text in any language. \
-            When you receive input that is not in English, or contains grammatical errors \
-            use the {} tool first to ensure proper English, then provide your response. \
-            Always show both the translated text and your final response.",
-            TRANSLATOR_TOOL_NAME
-        ))
-        .tool(translator_tool)
-        .build();
-
-    // Spin up a CLI chatbot using the multi-agent system
-    let chatbot = ChatBotBuilder::new()
-        .agent(multi_agent_system)
-        .max_turns(2)
-        .build();
-
-    chatbot.run().await?;
-
+        .context("parent did not receive the translator result")?;
+    println!("translator result: {translated}");
+    println!("parent terminal: {:?}", runtime.observe_run(parent)?);
     Ok(())
 }

@@ -11560,6 +11560,282 @@ mod tests {
     }
 
     #[test]
+    fn request_patch_covers_every_field_without_accumulating_on_later_turns() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let baseline_document = RetrievedDocument {
+            id: "baseline".to_owned(),
+            text: "baseline context".to_owned(),
+            metadata: BTreeMap::new(),
+        };
+        let agent = runtime
+            .spawn_agent(
+                id("agent"),
+                tenant("a"),
+                Agent {
+                    instructions: "baseline instructions".to_owned(),
+                    temperature_bits: Some(0.9_f64.to_bits()),
+                    max_tokens: Some(1_000),
+                    tool_choice: Some(ModelToolChoice::Auto),
+                    additional_params: Some(serde_json::json!({
+                        "baseline": true,
+                        "nested": {"baseline": true}
+                    })),
+                    documents: vec![baseline_document.clone()],
+                    ..Agent::default()
+                },
+                model,
+            )
+            .unwrap();
+        for (order, name) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            let tool = runtime
+                .spawn_tool(
+                    id(&format!("{name}-tool")),
+                    tenant("a"),
+                    ToolCapability {
+                        name: name.to_owned(),
+                        description: name.to_owned(),
+                        parameters: serde_json::json!({"type": "object"}),
+                        order: u32::try_from(order).unwrap(),
+                        revision: 1,
+                        retired: false,
+                    },
+                )
+                .unwrap();
+            runtime
+                .grant_tool(
+                    id(&format!("{name}-grant")),
+                    tenant("a"),
+                    ToolGrant {
+                        order: u32::try_from(order).unwrap(),
+                        enabled: true,
+                    },
+                    agent,
+                    tool,
+                )
+                .unwrap();
+        }
+        let first_document = RetrievedDocument {
+            id: "first".to_owned(),
+            text: "first context".to_owned(),
+            metadata: BTreeMap::new(),
+        };
+        let last_document = RetrievedDocument {
+            id: "last".to_owned(),
+            text: "last context".to_owned(),
+            metadata: BTreeMap::new(),
+        };
+        runtime
+            .spawn_policy(
+                id("z-last"),
+                tenant("a"),
+                Policy {
+                    order: 5,
+                    revision: 2,
+                    rule: PolicyRule::PatchRequest(
+                        RequestPatch::new()
+                            .instructions("last instructions")
+                            .temperature(0.25)
+                            .max_tokens(64)
+                            .tool_choice(ModelToolChoice::Specific(vec!["beta".to_owned()]))
+                            .active_tools(["beta", "gamma"])
+                            .additional_params(serde_json::json!({
+                                "last": true,
+                                "nested": {"last": true}
+                            }))
+                            .extra_context([last_document.clone()])
+                            .history([TranscriptEntry::Assistant("last history".to_owned())]),
+                    ),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("a-first"),
+                tenant("a"),
+                Policy {
+                    order: 5,
+                    revision: 1,
+                    rule: PolicyRule::PatchRequest(
+                        RequestPatch::new()
+                            .instructions("first instructions")
+                            .temperature(0.5)
+                            .max_tokens(128)
+                            .tool_choice(ModelToolChoice::Required)
+                            .active_tools(["alpha", "beta"])
+                            .additional_params(serde_json::json!({
+                                "first": true,
+                                "nested": {"first": true}
+                            }))
+                            .extra_context([first_document.clone()])
+                            .history([TranscriptEntry::Assistant("first history".to_owned())]),
+                    ),
+                },
+                agent,
+            )
+            .unwrap();
+
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let first_model = runtime.effects().try_recv().unwrap().unwrap();
+        let assert_effective = |input: &ModelEffectInput| {
+            assert_eq!(input.instructions, "last instructions");
+            assert_eq!(input.temperature_bits, Some(0.25_f64.to_bits()));
+            assert_eq!(input.max_tokens, Some(64));
+            assert_eq!(
+                input.tool_choice,
+                Some(ModelToolChoice::Specific(vec!["beta".to_owned()]))
+            );
+            assert_eq!(
+                input
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["beta"]
+            );
+            assert_eq!(
+                input.additional_params,
+                Some(serde_json::json!({
+                    "baseline": true,
+                    "first": true,
+                    "last": true,
+                    "nested": {"last": true}
+                }))
+            );
+            assert_eq!(
+                input.documents,
+                vec![
+                    baseline_document.clone(),
+                    first_document.clone(),
+                    last_document.clone(),
+                ]
+            );
+            assert_eq!(
+                input.history,
+                vec![
+                    TranscriptEntry::Assistant("last history".to_owned()),
+                    TranscriptEntry::Message(input.prompt.clone()),
+                ]
+            );
+        };
+        assert_effective(first_model.model_input().unwrap());
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: first_model.operation,
+                generation: first_model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "beta-call".to_owned(),
+                        provider_result_id: "beta-call".to_owned(),
+                        provider_call_id: None,
+                        name: "beta".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let tool = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: tool.operation,
+                generation: tool.generation,
+                result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                    call_id: "beta-call".to_owned(),
+                    provider_result_id: "beta-call".to_owned(),
+                    provider_call_id: None,
+                    name: "beta".to_owned(),
+                    raw: serde_json::json!("ok"),
+                    presentation: "ok".to_owned(),
+                    failure: None,
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let second_model = runtime.effects().try_recv().unwrap().unwrap();
+        assert_effective(second_model.model_input().unwrap());
+
+        let baseline = runtime.world().get::<Agent>(agent.entity()).unwrap();
+        assert_eq!(baseline.instructions, "baseline instructions");
+        assert_eq!(baseline.temperature_bits, Some(0.9_f64.to_bits()));
+        assert_eq!(baseline.max_tokens, Some(1_000));
+        assert_eq!(baseline.tool_choice, Some(ModelToolChoice::Auto));
+        assert_eq!(baseline.documents, vec![baseline_document]);
+        assert_eq!(
+            baseline.additional_params,
+            Some(serde_json::json!({
+                "baseline": true,
+                "nested": {"baseline": true}
+            }))
+        );
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime
+                .world()
+                .get::<RunRecord>(run.entity())
+                .unwrap()
+                .next_turn,
+            1
+        );
+    }
+
+    #[test]
+    fn request_patch_non_object_provider_params_replace_prior_values() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime.handle().prompt(agent, "params").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let mut input = runtime
+            .effects()
+            .try_recv()
+            .unwrap()
+            .unwrap()
+            .model_input()
+            .unwrap()
+            .clone();
+        let mut accumulated = RequestPatch::default();
+        reduce_request_patch(
+            &mut input,
+            &mut accumulated,
+            RequestPatch::new().additional_params(serde_json::json!({"first": true})),
+            &id("first"),
+        );
+        reduce_request_patch(
+            &mut input,
+            &mut accumulated,
+            RequestPatch::new().additional_params(serde_json::json!("replacement")),
+            &id("second"),
+        );
+        assert_eq!(
+            input.additional_params,
+            Some(serde_json::json!("replacement"))
+        );
+        assert_eq!(
+            accumulated.additional_params,
+            Some(serde_json::json!("replacement"))
+        );
+    }
+
+    #[test]
     fn extension_bundle_telemetry_and_system_param_use_native_ecs_state() {
         let mut runtime = runtime();
         let model = runtime
@@ -12313,7 +12589,12 @@ mod tests {
                     name: "lookup".to_owned(),
                     raw: serde_json::json!({"secret": 42}),
                     presentation: "unredacted".to_owned(),
-                    failure: None,
+                    failure: Some(ToolEffectFailure {
+                        message: "operator-only refusal detail".to_owned(),
+                        retryable: Some(false),
+                        kind: crate::tool::ToolErrorKind::PermissionDenied,
+                        refusal: true,
+                    }),
                 })),
             })
             .unwrap();
@@ -12323,6 +12604,15 @@ mod tests {
         let result = &next_model.model_input().unwrap().tool_results[0];
         assert_eq!(result.raw, serde_json::json!({"secret": 42}));
         assert_eq!(result.presentation, "redacted twice");
+        assert_eq!(
+            result.failure,
+            Some(ToolEffectFailure {
+                message: "operator-only refusal detail".to_owned(),
+                retryable: Some(false),
+                kind: crate::tool::ToolErrorKind::PermissionDenied,
+                refusal: true,
+            })
+        );
         let run = runtime.resolve_run(&pending).unwrap();
         assert!(
             runtime

@@ -671,20 +671,20 @@ The table below is the audit map for the pre-ECS runtime. Test names refer to
 | blocking prompt loop | run/model-operation entities progressed by `RigSchedule` | `AgentFacade::prompt`, `RuntimeHandle::prompt` | `model_effect_round_trip_uses_world_resident_schedule` | `agent` |
 | streaming prompt loop | ordered `EffectIngressMessage` deltas plus run subscription entities | `prompt_stream`, `RunStream` | streaming sequence, parity, slow-consumer, and adapter suites | `agent_stream_chat` |
 | completion-call hook | durable request-policy evaluation entity and targeted invocation event | `RequestPatchPolicyBundle`, `RequestPolicyInvocation` | request patch/order/non-sticky tests | `request_hook` |
-| completion-response hook | response-policy evaluation before model commit | `CompletionResponsePolicyInvocation` | completion rewrite/stop tests | `tool_result_outcomes` |
+| completion-response hook | response-policy evaluation before model commit | `CompletionResponsePolicyInvocation` | completion rewrite/stop tests | `request_hook` observes the corresponding applied boundary |
 | model-turn-finished hook | observe-only targeted entity event | `ModelTurnFinished` | `completion_response_policy_runs_before_commit_and_emits_turn_event` | `agent_with_tools_otel` |
 | invalid-tool hook | pending-invalid component plus ordered durable evaluation | repair/retry/skip bundles and invocation event | invalid-tool action, budget, streaming, and snapshot tests | `gemini_default_api_recovery` |
 | tool-call hook | per-operation policy evaluation with immutable tool decision | rewrite/approval/skip bundles | rewrite, approval, skip, and snapshot tests | `agent_with_approval_policy` |
 | tool-result hook | immutable raw effect plus mutable presentation evaluation | `ToolResultRedactionPolicyBundle` | raw/presentation separation and stop tests | `tool_result_outcomes` |
-| hook scratchpad/context | extension-owned typed components and relationship queries | `RigOperationContext`, ordinary `Component` | extension/SystemParam test | `ecs_extension` |
+| hook scratchpad/context | extension-owned typed components and relationship queries | `RigOperationContext`, ordinary `Component` | extension/SystemParam test | `ecs_extension`, `tool_result_outcomes` |
 | asynchronous hooks | approval operation entities and owned effect I/O | `PolicyRule::RequireApproval` | request/tool/result/invalid approval snapshot tests | `agent_with_durable_approval` |
 | tools and dynamic tools | capability and grant entities with revisioned immutable snapshots | agent builder tools, `spawn_tool`, `grant_tool` | collision, retirement, batch, and provider suites | `agent_with_tools`, `rag_dynamic_tools` |
-| MCP/tool-server refresh | discovery-source and discovered-capability relationships | discovery commands and RMCP adapter | generation/retirement and RMCP tests | `rmcp` |
+| MCP/tool-server refresh | discovery-source and discovered-capability relationships | discovery commands and RMCP adapter | generation/retirement tests plus the local live-protocol example | `rmcp` |
 | memory and retrieval | store capability/grant/operation entities | builder `memory` and `dynamic_context` | memory and vector-retrieval tests | `agent_with_memory`, `rag` |
 | structured output | `OutputRequirement` plus run-local retry counters | output schema/mode/retry builder methods | validation, retry, snapshot, provider extraction tests | `extractor` |
-| cancellation and suspension | `RunControl` orthogonal to `RunState` | pause modes, resume, cancel commands | drain/freeze/cancel-and-suspend race tests | `agent_run_stepping` |
+| cancellation and suspension | `RunControl` orthogonal to `RunState` | pause modes, resume, cancel commands | drain/freeze/cancel-and-suspend race tests | `agent_run_stepping`, `multi_agent` |
 | active `AgentRun` serialization | stable-ID `ActiveRunSnapshot` | `snapshot_active_run`, `restore_active_run` | every waiting-phase restoration test | `agent_with_durable_approval` |
-| child-agent delegation | `ParentRun`/`ChildRuns`, `WaitingForChildren`, explicit ordinal | `spawn_child_run` | deterministic result and cancellation tests | `agent_with_agent_tool` |
+| child-agent delegation | `ParentRun`/`ChildRuns`, `WaitingForChildren`, explicit ordinal | `spawn_agent`, `spawn_child_run` | deterministic result and cancellation tests | `agent_with_agent_tool` |
 | telemetry hooks | observe-only entity events and optional typed counters | `LifecycleTelemetryBundle` | lifecycle event ordering and telemetry tests | `agent_with_tools_otel` |
 | provider diagnostics | canonical effect outcome plus provider-owned typed data | effect adapters | provider and adapter suites | provider examples |
 | WASM | identical ECS state with target-specific effect transport only | normal Rust bounds | WASM compile gate | browser-capable core consumers |
@@ -836,11 +836,11 @@ standalone and embedded-world execution. The feature-to-example map is:
 | --- | --- |
 | targeted lifecycle observation / embedded world | `crates/rig-core/examples/ecs_extension.rs` |
 | request patch / deterministic ordering | `request_hook` |
-| tool rewrite, skip, result redaction | `tool_result_outcomes`, `force_tool_first_turn` |
-| approval / durable approval | `agent_with_approval_policy`, `agent_with_durable_approval` |
+| tool rewrite, skip, result redaction | `agent_with_human_in_the_loop`, `agent_with_approval_policy`, `tool_result_outcomes` |
+| approval / durable approval | `agent_with_human_in_the_loop`, `agent_with_approval_policy`, `agent_with_durable_approval` |
 | invalid repair/retry | `gemini_default_api_recovery` |
 | streaming delta observation/cancellation | `agent_stream_chat`, `gemini_stream_kill_token_count` |
-| checkpoint/resume and all pause modes | `agent_run_stepping`, `agent_with_durable_approval` |
+| checkpoint/resume and all pause modes | `agent_run_stepping`, `agent_with_durable_approval`, `multi_agent` |
 | shared world, sibling progress, child delegation | `multi_agent`, `agent_with_agent_tool` |
 
 ## Benchmark matrix

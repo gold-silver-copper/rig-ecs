@@ -66,6 +66,14 @@ fn record_failure(
     event.decision = Some(ToolResultPolicyDecision::Keep);
 }
 
+fn redact_model_presentation(mut event: On<ToolResultPolicyInvocation>) {
+    event.decision = Some(if event.result.failure.is_some() {
+        ToolResultPolicyDecision::Rewrite("system probe unavailable".to_owned())
+    } else {
+        ToolResultPolicyDecision::Keep
+    });
+}
+
 fn stop_fatal_failure(mut event: On<ToolResultPolicyInvocation>, ledgers: Query<&FailureLedger>) {
     let record = ledgers.get(event.run).ok().and_then(|ledger| {
         ledger
@@ -144,11 +152,25 @@ fn install_policies(
         .world_mut()
         .entity_mut(recorder)
         .observe(record_failure);
+    let redaction = runtime.spawn_policy(
+        ecs_demo::id("redact-failure")?,
+        ecs_demo::tenant()?,
+        Policy {
+            order: 1,
+            revision: 1,
+            rule: PolicyRule::Custom(PolicyPoint::ToolResult),
+        },
+        agent,
+    )?;
+    runtime
+        .world_mut()
+        .entity_mut(redaction)
+        .observe(redact_model_presentation);
     let fatal = runtime.spawn_policy(
         ecs_demo::id("stop-fatal-failure")?,
         ecs_demo::tenant()?,
         Policy {
-            order: 1,
+            order: 2,
             revision: 1,
             rule: PolicyRule::Custom(PolicyPoint::ToolResult),
         },

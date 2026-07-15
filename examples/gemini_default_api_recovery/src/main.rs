@@ -5,6 +5,9 @@
 //! separate observation-only listener records the provider emission without
 //! participating in steering.
 
+#[path = "../../ecs_demo.rs"]
+mod ecs_demo;
+
 use std::{
     env,
     sync::{Arc, Mutex},
@@ -19,7 +22,7 @@ use rig::providers::gemini::{
     self,
     completion::gemini_api_types::{AdditionalParameters, GenerationConfig, ThinkingConfig},
 };
-use rig::runtime::{InvalidToolCallDetected, Policy, PolicyRule, StableId, TenantId};
+use rig::runtime::{InvalidToolCallDetected, Policy, PolicyRule, RunState, StableId, TenantId};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
 use rig::tool::Tool;
 use schemars::{JsonSchema, schema_for};
@@ -131,6 +134,44 @@ fn prompt(attempt: usize) -> String {
     )
 }
 
+fn demonstrate_invalid_retry() -> anyhow::Result<()> {
+    let (mut runtime, agent) = ecs_demo::runtime(true)?;
+    runtime.spawn_policy(
+        ecs_demo::id("retry-legacy-tool")?,
+        ecs_demo::tenant()?,
+        Policy {
+            order: 0,
+            revision: 1,
+            rule: PolicyRule::RetryInvalidTool {
+                tool: Some("missing_workspace_api".to_owned()),
+                feedback: "Use an advertised tool name on the next model call".to_owned(),
+            },
+        },
+        agent,
+    )?;
+    let pending = runtime
+        .handle()
+        .prompt(agent, "Demonstrate invalid retry")?;
+    let model = ecs_demo::next_effect(&mut runtime)?;
+    ecs_demo::complete_with_tool(&runtime, &model, "missing_workspace_api")?;
+    let retry_model = ecs_demo::next_effect(&mut runtime)?;
+    let feedback = retry_model
+        .model_input()
+        .and_then(|input| input.tool_results.first())
+        .ok_or_else(|| anyhow::anyhow!("invalid retry did not reach the next model operation"))?;
+    println!("invalid-call retry feedback: {}", feedback.presentation);
+    ecs_demo::complete_text(&runtime, &retry_model, "retry recovered")?;
+    runtime.run_until_stalled()?;
+    let run = runtime
+        .resolve_run(&pending)
+        .ok_or_else(|| anyhow::anyhow!("retry prompt was not admitted"))?;
+    anyhow::ensure!(
+        matches!(runtime.observe_run(run)?, Some(RunState::Completed(_))),
+        "invalid retry did not complete"
+    );
+    Ok(())
+}
+
 async fn consume(
     mut stream: StreamingResult<gemini::streaming::StreamingCompletionResponse>,
     invalid_names: Arc<Mutex<Vec<String>>>,
@@ -174,6 +215,7 @@ async fn consume(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    demonstrate_invalid_retry()?;
     let mut repaired = false;
     for attempt in 1..=attempts() {
         let agent = gemini::Client::from_env()?

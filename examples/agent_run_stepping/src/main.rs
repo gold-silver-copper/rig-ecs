@@ -118,7 +118,77 @@ fn schedule_driven_observation() -> Result<()> {
     Ok(())
 }
 
+fn drain_pause_with_active_sibling() -> Result<()> {
+    println!("=== Part 3: drain pause beside an active sibling ===");
+    let (mut runtime, agent) = ecs_demo::runtime(true)?;
+    let paused_pending = runtime
+        .handle()
+        .prompt(agent, "pause before tool dispatch")?;
+    let sibling_pending = runtime.handle().prompt(agent, "complete independently")?;
+    runtime.run_until_stalled()?;
+    let paused = runtime
+        .resolve_run(&paused_pending)
+        .context("paused run was not admitted")?;
+    let sibling = runtime
+        .resolve_run(&sibling_pending)
+        .context("sibling run was not admitted")?;
+    let paused_operation = match runtime.world().get::<RunState>(paused.entity()) {
+        Some(RunState::WaitingModel { operation }) => *operation,
+        state => anyhow::bail!("paused run is not waiting on a model: {state:?}"),
+    };
+    let sibling_operation = match runtime.world().get::<RunState>(sibling.entity()) {
+        Some(RunState::WaitingModel { operation }) => *operation,
+        state => anyhow::bail!("sibling run is not waiting on a model: {state:?}"),
+    };
+    let requests = [
+        runtime
+            .effects()
+            .try_recv()?
+            .context("missing model request")?,
+        runtime
+            .effects()
+            .try_recv()?
+            .context("missing model request")?,
+    ];
+    let paused_request = requests
+        .iter()
+        .find(|request| request.operation == paused_operation)
+        .context("missing paused request")?;
+    let sibling_request = requests
+        .iter()
+        .find(|request| request.operation == sibling_operation)
+        .context("missing sibling request")?;
+    runtime.handle().pause(paused)?;
+    ecs_demo::complete_with_tool(&runtime, paused_request, "lookup")?;
+    ecs_demo::complete_text(&runtime, sibling_request, "sibling completed while paused")?;
+    runtime.run_until_stalled()?;
+    anyhow::ensure!(
+        matches!(
+            runtime.world().get::<RunState>(sibling.entity()),
+            Some(RunState::Completed(_))
+        ),
+        "drain-paused run blocked its sibling"
+    );
+    anyhow::ensure!(
+        runtime.effects().try_recv()?.is_none(),
+        "drain pause dispatched new tool work"
+    );
+    runtime.handle().resume(paused)?;
+    let tool = ecs_demo::next_effect(&mut runtime)?;
+    ecs_demo::complete_tool(&runtime, &tool, "resumed tool result")?;
+    let final_model = ecs_demo::next_effect(&mut runtime)?;
+    ecs_demo::complete_text(&runtime, &final_model, "drain-paused run completed")?;
+    runtime.run_until_stalled()?;
+    println!(
+        "paused: {:?}, sibling: {:?}",
+        runtime.observe_run(paused)?,
+        runtime.observe_run(sibling)?
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     hand_driven_checkpoint()?;
-    schedule_driven_observation()
+    schedule_driven_observation()?;
+    drain_pause_with_active_sibling()
 }
