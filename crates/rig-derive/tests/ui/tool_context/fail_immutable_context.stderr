@@ -1,0 +1,5 @@
+error: runtime ToolContext parameters were replaced by typed ECS components; attach extension state to the agent, run, policy, or operation instead
+ --> tests/ui/tool_context/fail_immutable_context.rs:7:5
+  |
+7 |     #[rig(context)] context: &ToolContext,
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

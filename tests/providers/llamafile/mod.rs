@@ -6,6 +6,8 @@ mod extractor;
 mod extractor_usage;
 mod loaders;
 mod multi_extract;
+mod permission_control;
+mod request_hook;
 mod streaming;
 mod streaming_tools;
 mod structured_output;

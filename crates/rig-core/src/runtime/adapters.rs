@@ -29,7 +29,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt};
 use serde::de::DeserializeOwned;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     panic::AssertUnwindSafe,
     pin::Pin,
@@ -55,7 +55,7 @@ pub struct CompletionModelAdapter<M> {
 #[derive(Clone)]
 pub struct LocalModelAgent<M> {
     runtime: Arc<Mutex<Runtime>>,
-    driver: Arc<tokio::sync::Mutex<()>>,
+    routed_effects: Arc<Mutex<HashMap<bevy_ecs::entity::Entity, VecDeque<EffectRequest>>>>,
     agent: AgentHandle,
     model: CompletionModelAdapter<M>,
     tools: Arc<HashMap<(StableId, u64), Arc<dyn LocalToolExecutor>>>,
@@ -1065,7 +1065,7 @@ where
         }
         Ok(LocalModelAgent {
             runtime: Arc::new(Mutex::new(runtime)),
-            driver: Arc::new(tokio::sync::Mutex::new(())),
+            routed_effects: Arc::new(Mutex::new(HashMap::new())),
             agent,
             model: CompletionModelAdapter::bound(self.model, model_binding),
             tools: Arc::new(executors),
@@ -1207,11 +1207,6 @@ where
         conversation: Option<StableId>,
         max_model_calls: Option<u32>,
     ) -> Result<LocalRunResult, LocalAgentError> {
-        // One facade owns one effect outbox. Serialize its convenience drivers
-        // so a blocking caller cannot consume a streaming caller's effect (or
-        // vice versa). Hosted users that need concurrent scheduling drive the
-        // shared `Runtime`/effect boundary directly.
-        let _driver = self.driver.lock().await;
         let pending = {
             let runtime = self
                 .runtime
@@ -1227,18 +1222,7 @@ where
             )?
         };
         loop {
-            let (requests, completion_sender) = {
-                let mut runtime = self
-                    .runtime
-                    .lock()
-                    .map_err(|_| LocalAgentError::RuntimePoisoned)?;
-                runtime.run_until_stalled()?;
-                let mut requests = Vec::new();
-                while let Some(request) = runtime.effects().try_recv()? {
-                    requests.push(request);
-                }
-                (requests, runtime.effects().completion_sender())
-            };
+            let (requests, completion_sender, _) = self.drive_and_take_effects(&pending)?;
             let mut tool_requests = Vec::new();
             for request in requests {
                 let operation = request.operation;
@@ -1308,6 +1292,9 @@ where
                         completion_calls,
                     });
                 }
+                Some(RunState::Failed(CanonicalError::ModelCallBudget { limit })) => {
+                    return Err(LocalAgentError::ModelCallBudget { limit, transcript });
+                }
                 Some(RunState::Failed(error)) => return Err(error.into()),
                 Some(RunState::Cancelled) => return Err(LocalAgentError::Cancelled),
                 Some(
@@ -1345,6 +1332,7 @@ where
 
     fn drive_and_take_effects(
         &self,
+        pending: &crate::runtime::PendingRunHandle,
     ) -> Result<
         (
             Vec<EffectRequest>,
@@ -1358,15 +1346,46 @@ where
             .lock()
             .map_err(|_| LocalAgentError::RuntimePoisoned)?;
         runtime.run_until_stalled()?;
-        let mut requests = Vec::new();
+        let root = runtime.resolve_run(pending).map(|run| run.entity());
+        let mut drained = Vec::new();
         while let Some(request) = runtime.effects().try_recv()? {
-            requests.push(request);
+            let mut owner = runtime
+                .world()
+                .get::<crate::runtime::OperationOf>(request.operation)
+                .map(|relation| relation.0)
+                .or(root);
+            while let Some(entity) = owner {
+                let Some(parent) = runtime.world().get::<crate::runtime::ParentRun>(entity) else {
+                    break;
+                };
+                owner = Some(parent.0);
+            }
+            let owner = owner.ok_or_else(|| {
+                LocalAgentError::Canonical(CanonicalError::StaleEntity(format!(
+                    "operation {:?} has no owning run",
+                    request.operation
+                )))
+            })?;
+            drained.push((owner, request));
         }
-        Ok((
-            requests,
-            runtime.effects().completion_sender(),
-            runtime.effects().delta_sender(),
-        ))
+        let completion_sender = runtime.effects().completion_sender();
+        let delta_sender = runtime.effects().delta_sender();
+        drop(runtime);
+
+        let mut routed = self
+            .routed_effects
+            .lock()
+            .map_err(|_| LocalAgentError::RuntimePoisoned)?;
+        for (owner, request) in drained {
+            routed.entry(owner).or_default().push_back(request);
+        }
+        let requests = root
+            .and_then(|root| routed.remove(&root))
+            .map(VecDeque::into_iter)
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok((requests, completion_sender, delta_sender))
     }
 
     fn drive_once(&self) -> Result<(), LocalAgentError> {
@@ -1466,14 +1485,13 @@ where
     {
         let agent = self.clone();
         Box::pin(async_stream::try_stream! {
-            let _driver = agent.driver.lock().await;
             let (pending, stream) = agent.begin_stream(prompt, history, max_model_calls, conversation)?;
             let stream = stream;
             let mut internal_call_ids = HashMap::<String, String>::new();
             let mut streamed_tool_calls = HashMap::<String, ToolCall>::new();
             'drive: loop {
                 let (requests, completion_sender, delta_sender) =
-                    agent.drive_and_take_effects()?;
+                    agent.drive_and_take_effects(&pending)?;
 
                 let mut tool_requests = Vec::new();
                 for request in requests {
@@ -1897,11 +1915,17 @@ fn local_prompt_error(error: LocalAgentError) -> PromptError {
                 chat_history: Box::default(),
             }
         }
-        LocalAgentError::Canonical(CanonicalError::ModelCallBudget { limit }) => {
+        LocalAgentError::ModelCallBudget { limit, transcript } => {
+            let chat_history = response_messages(&transcript).unwrap_or_default();
+            let prompt = chat_history
+                .iter()
+                .find(|message| matches!(message, Message::User { .. }))
+                .cloned()
+                .unwrap_or_else(|| Message::user(String::new()));
             PromptError::MaxTurnsError {
                 max_turns: limit as usize,
-                chat_history: Box::default(),
-                prompt: Box::new(Message::user(String::new())),
+                chat_history: Box::new(chat_history),
+                prompt: Box::new(prompt),
             }
         }
         LocalAgentError::Cancelled => PromptError::PromptCancelled {
@@ -1939,6 +1963,14 @@ pub enum LocalAgentError {
     /// The canonical model operation failed.
     #[error(transparent)]
     Canonical(#[from] CanonicalError),
+    /// A run exhausted its model budget with its canonical history retained.
+    #[error("runtime exhausted its model-call budget of {limit}")]
+    ModelCallBudget {
+        /// Configured model-call limit.
+        limit: u32,
+        /// Complete transcript at the failed transition.
+        transcript: Vec<TranscriptEntry>,
+    },
     /// The run was cancelled before completion.
     #[error("run was cancelled")]
     Cancelled,
@@ -2673,15 +2705,21 @@ mod tests {
     use super::*;
     use crate::{
         bevy_ecs::entity::Entity,
+        completion::{CompletionResponse, Usage as CompletionUsage},
         runtime::{
             EffectIngress, ModelDecision, RuntimeWaker, StableId, StoreDecision, TenantId,
             ToolDecision,
         },
-        test_utils::{MockCompletionModel, MockStreamEvent, MockTurn},
+        streaming::{StreamingCompletionResponse, StreamingResult},
+        test_utils::{MockCompletionModel, MockResponse, MockStreamEvent, MockTurn},
     };
     use serde::Deserialize;
     use std::convert::Infallible;
-    use std::sync::{Arc, mpsc::sync_channel};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::sync_channel,
+    };
 
     #[derive(Clone, Debug)]
     struct AddTool;
@@ -2694,6 +2732,59 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct PanickingTool;
+
+    #[derive(Clone, Default)]
+    struct ConcurrentModel {
+        calls: Arc<AtomicUsize>,
+        release_first: Arc<tokio::sync::Notify>,
+    }
+
+    impl ConcurrentModel {
+        async fn coordinate(&self) -> usize {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.release_first.notified().await;
+            } else {
+                self.release_first.notify_one();
+            }
+            call
+        }
+    }
+
+    impl CompletionModel for ConcurrentModel {
+        type Response = MockResponse;
+        type StreamingResponse = MockResponse;
+        type Client = ();
+
+        fn make(_: &Self::Client, _: impl Into<String>) -> Self {
+            Self::default()
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+            let call = self.coordinate().await;
+            Ok(CompletionResponse {
+                choice: OneOrMany::one(AssistantContent::text(format!("blocking-{call}"))),
+                usage: CompletionUsage::default(),
+                raw_response: MockResponse::new(),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+            let call = self.coordinate().await;
+            let stream: StreamingResult<MockResponse> = Box::pin(futures::stream::iter([
+                MockStreamEvent::text(format!("streaming-{call}")).into_raw_choice(),
+                MockStreamEvent::final_response_with_default_usage().into_raw_choice(),
+            ]));
+            Ok(StreamingCompletionResponse::stream(stream))
+        }
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("operator secret")]
@@ -3073,6 +3164,37 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_streaming_run_does_not_serialize_a_blocking_sibling() {
+        let agent = LocalModelAgent::new(
+            ConcurrentModel::default(),
+            "mock",
+            "concurrent",
+            "be concise",
+        )
+        .unwrap();
+        let streaming_agent = agent.clone();
+        let blocking_agent = agent.clone();
+
+        let (stream_events, blocking_output) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                tokio::join!(
+                    streaming_agent.stream_run("stream").collect::<Vec<_>>(),
+                    blocking_agent.run_prompt("blocking")
+                )
+            })
+            .await
+            .expect("a façade-wide driver lock would deadlock these sibling runs");
+
+        let blocking_output = blocking_output.unwrap();
+        assert!(blocking_output.text.starts_with("blocking-"));
+        assert!(stream_events.iter().any(|event| matches!(
+            event,
+            Ok(LocalStreamEvent::Finished { output, .. })
+                if output.text.starts_with("streaming-")
+        )));
     }
 
     #[tokio::test]

@@ -436,6 +436,10 @@ pub enum PolicyStatus {
     Retired,
 }
 
+fn accepts_new_policy_evaluations(status: Option<&PolicyStatus>) -> bool {
+    !matches!(status, Some(PolicyStatus::Retired))
+}
+
 /// Built-in policy data. Extensions can add components and systems in [`RigSet::Policy`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PolicyRule {
@@ -2408,6 +2412,13 @@ pub enum SubscriptionState {
 
 #[allow(clippy::large_enum_variant)]
 enum RuntimeCommand {
+    SpawnAgent {
+        id: StableId,
+        tenant: TenantId,
+        agent: Agent,
+        model_id: StableId,
+        result: SyncSender<Result<AgentHandle, SpawnError>>,
+    },
     Prompt {
         agent: Entity,
         run_id: StableId,
@@ -2499,6 +2510,22 @@ pub struct PendingRunHandle {
     stable_id: StableId,
 }
 
+/// Result receiver for an agent created through the hosted command boundary.
+pub struct PendingAgentHandle {
+    receiver: Receiver<Result<AgentHandle, SpawnError>>,
+}
+
+impl PendingAgentHandle {
+    /// Returns the spawn outcome once command ingestion has processed it.
+    pub fn try_resolve(&self) -> Result<Option<Result<AgentHandle, SpawnError>>, SubmitError> {
+        match self.receiver.try_recv() {
+            Ok(result) => Ok(Some(result)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(SubmitError::Disconnected),
+        }
+    }
+}
+
 impl PendingRunHandle {
     /// Persistent run identity, usable before command ingestion.
     pub fn stable_id(&self) -> &StableId {
@@ -2533,6 +2560,55 @@ impl RuntimeHandle {
             .map_err(map_command_send_error)?;
         self.waker.notify();
         Ok(())
+    }
+
+    /// Creates an agent through command ingress without exposing mutable world access.
+    ///
+    /// The model is addressed by persistent identity and resolved with tenant
+    /// validation when [`RigSchedule`] ingests the command.
+    pub fn spawn_agent(
+        &self,
+        id: StableId,
+        tenant: TenantId,
+        agent: Agent,
+        model_id: StableId,
+    ) -> Result<PendingAgentHandle, SubmitError> {
+        let (result, receiver) = sync_channel(1);
+        self.submit(RuntimeCommand::SpawnAgent {
+            id,
+            tenant,
+            agent,
+            model_id,
+            result,
+        })?;
+        Ok(PendingAgentHandle { receiver })
+    }
+
+    /// Creates a run with a caller-selected stable identity.
+    pub fn spawn_run(
+        &self,
+        run_id: StableId,
+        agent: AgentHandle,
+        prompt: impl Into<CompletionMessage>,
+    ) -> Result<PendingRunHandle, SubmitError> {
+        if agent.runtime_id != self.runtime_id {
+            return Err(SubmitError::ForeignRuntime);
+        }
+        self.submit(RuntimeCommand::Prompt {
+            agent: agent.entity,
+            run_id: run_id.clone(),
+            prompt: prompt_payload(prompt.into())?,
+            history: Vec::new(),
+            output_schema: None,
+            max_model_calls: None,
+            conversation: None,
+            subscriber: None,
+            parent: None,
+        })?;
+        Ok(PendingRunHandle {
+            runtime_id: self.runtime_id,
+            stable_id: run_id,
+        })
     }
 
     /// Submits a prompt without exposing concurrent world access.
@@ -3286,6 +3362,9 @@ pub struct PersistedPolicy {
     pub tenant: TenantId,
     /// Canonical policy data.
     pub policy: Policy,
+    /// Admission state retained so retired revisions remain addressable after restore.
+    #[serde(default)]
+    pub status: PolicyStatus,
     /// Stable agent identity remapped during loading.
     pub agent_id: StableId,
 }
@@ -3458,10 +3537,16 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
         .map(|(entity, record)| (*entity, record.id.clone()))
         .collect::<HashMap<_, _>>();
 
-    let mut policy_query = world.query::<(&StableId, &TenantId, &Policy, &PolicyFor)>();
+    let mut policy_query = world.query::<(
+        &StableId,
+        &TenantId,
+        &Policy,
+        Option<&PolicyStatus>,
+        &PolicyFor,
+    )>();
     let mut policies = policy_query
         .iter(world)
-        .map(|(id, tenant, policy, relation)| {
+        .map(|(id, tenant, policy, status, relation)| {
             let agent_id = agent_ids
                 .get(&relation.get())
                 .cloned()
@@ -3470,6 +3555,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
                 id: id.clone(),
                 tenant: tenant.clone(),
                 policy: policy.clone(),
+                status: status.copied().unwrap_or_default(),
                 agent_id,
             })
         })
@@ -3852,6 +3938,7 @@ pub fn restore_domain(
                 record.id.clone(),
                 record.tenant,
                 record.policy,
+                record.status,
                 PolicyFor(agent),
             ))
             .id();
@@ -4525,6 +4612,9 @@ pub enum SpawnError {
     /// Stable ID already exists in this world.
     #[error("stable id `{0}` already exists")]
     DuplicateStableId(String),
+    /// A stable relationship target was not present in this world.
+    #[error("missing stable reference `{0}`")]
+    MissingStableReference(String),
     /// Related entity is stale or missing required components.
     #[error("stale entity {0:?}")]
     StaleEntity(Entity),
@@ -4578,6 +4668,8 @@ fn ingest_commands(
     mut commands: Commands,
     ingress: Res<CommandIngress>,
     runtime: Res<RuntimeIdentity>,
+    identities: Query<&StableId>,
+    models: Query<(Entity, &StableId, &TenantId), With<ModelCapability>>,
     mut agents: Query<(
         &TenantId,
         &Agent,
@@ -4597,8 +4689,43 @@ fn ingest_commands(
     let Ok(receiver) = ingress.0.lock() else {
         return;
     };
+    let mut accepted_ids = identities.iter().cloned().collect::<HashSet<_>>();
     loop {
         match receiver.try_recv() {
+            Ok(RuntimeCommand::SpawnAgent {
+                id,
+                tenant,
+                agent,
+                model_id,
+                result,
+            }) => {
+                let spawn_result = if !accepted_ids.insert(id.clone()) {
+                    Err(SpawnError::DuplicateStableId(id.as_str().to_owned()))
+                } else if let Some((model, _, model_tenant)) = models
+                    .iter()
+                    .find(|(_, existing, _)| *existing == &model_id)
+                {
+                    if model_tenant != &tenant {
+                        accepted_ids.remove(&id);
+                        Err(SpawnError::TenantMismatch)
+                    } else {
+                        let entity = commands
+                            .spawn((id, tenant, agent, AgentControl::default(), UsesModel(model)))
+                            .id();
+                        mark_progress(&mut progress);
+                        Ok(AgentHandle {
+                            runtime_id: runtime.0,
+                            entity,
+                        })
+                    }
+                } else {
+                    accepted_ids.remove(&id);
+                    Err(SpawnError::MissingStableReference(
+                        model_id.as_str().to_owned(),
+                    ))
+                };
+                let _ = result.try_send(spawn_result);
+            }
             Ok(RuntimeCommand::Prompt {
                 agent,
                 run_id,
@@ -5405,7 +5532,7 @@ fn initialize_request_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunControl>)>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy)>,
+    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, pending, state) in &operations {
@@ -5425,16 +5552,19 @@ fn initialize_request_policy_evaluations(
             .into_iter()
             .flat_map(|agent_policies| agent_policies.iter())
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::Request))
+            .filter(|(_, _, policy, status)| {
+                accepts_new_policy_evaluations(*status)
+                    && policy.rule.applies_to(PolicyPoint::Request)
+            })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy)| AcceptedPolicy {
+            .map(|(entity, id, policy, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -5943,7 +6073,7 @@ fn initialize_tool_call_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunControl>)>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy)>,
+    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, pending, state) in &operations {
@@ -5963,16 +6093,19 @@ fn initialize_tool_call_policy_evaluations(
             .into_iter()
             .flat_map(|agent_policies| agent_policies.iter())
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::ToolCall))
+            .filter(|(_, _, policy, status)| {
+                accepts_new_policy_evaluations(*status)
+                    && policy.rule.applies_to(PolicyPoint::ToolCall)
+            })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy)| AcceptedPolicy {
+            .map(|(entity, id, policy, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -6157,7 +6290,7 @@ fn initialize_invalid_tool_call_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunControl>)>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy)>,
+    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, invalid, state) in &operations {
@@ -6177,16 +6310,19 @@ fn initialize_invalid_tool_call_policy_evaluations(
             .into_iter()
             .flat_map(|agent_policies| agent_policies.iter())
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::InvalidToolCall))
+            .filter(|(_, _, policy, status)| {
+                accepts_new_policy_evaluations(*status)
+                    && policy.rule.applies_to(PolicyPoint::InvalidToolCall)
+            })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy)| AcceptedPolicy {
+            .map(|(entity, id, policy, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -7009,7 +7145,7 @@ fn apply_effect_ingress(
     timeout: Res<EffectTimeoutTicks>,
     runs: Query<(&RunOf, &RunRecord)>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy)>,
+    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     run_subscriptions: Query<&RunSubscriptions>,
     mut subscriptions: Query<(&StreamSink, &mut SubscriptionState)>,
     mut progress: ResMut<Progress>,
@@ -7141,16 +7277,21 @@ fn apply_effect_ingress(
                             .into_iter()
                             .flat_map(|agent_policies| agent_policies.iter())
                             .filter_map(|entity| policies.get(entity).ok())
-                            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::TextDelta))
+                            .filter(|(_, _, policy, status)| {
+                                accepts_new_policy_evaluations(*status)
+                                    && policy.rule.applies_to(PolicyPoint::TextDelta)
+                            })
                             .collect::<Vec<_>>();
-                        stream_policies.sort_by(|(_, left_id, left), (_, right_id, right)| {
-                            left.order
-                                .cmp(&right.order)
-                                .then_with(|| left_id.cmp(right_id))
-                        });
+                        stream_policies.sort_by(
+                            |(_, left_id, left, _), (_, right_id, right, _)| {
+                                left.order
+                                    .cmp(&right.order)
+                                    .then_with(|| left_id.cmp(right_id))
+                            },
+                        );
                         let snapshot = stream_policies
                             .drain(..)
-                            .map(|(entity, id, policy)| AcceptedPolicy {
+                            .map(|(entity, id, policy, _)| AcceptedPolicy {
                                 id: id.clone(),
                                 entity,
                                 revision: policy.revision,
@@ -7545,7 +7686,7 @@ fn initialize_completion_response_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunControl>)>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy)>,
+    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, request, state) in &operations {
@@ -7567,16 +7708,19 @@ fn initialize_completion_response_policy_evaluations(
             .into_iter()
             .flat_map(|agent_policies| agent_policies.iter())
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::CompletionResponse))
+            .filter(|(_, _, policy, status)| {
+                accepts_new_policy_evaluations(*status)
+                    && policy.rule.applies_to(PolicyPoint::CompletionResponse)
+            })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy)| AcceptedPolicy {
+            .map(|(entity, id, policy, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -7875,7 +8019,7 @@ fn initialize_tool_result_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunControl>)>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy)>,
+    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, input, state) in &operations {
@@ -7897,16 +8041,19 @@ fn initialize_tool_result_policy_evaluations(
             .into_iter()
             .flat_map(|agent_policies| agent_policies.iter())
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::ToolResult))
+            .filter(|(_, _, policy, status)| {
+                accepts_new_policy_evaluations(*status)
+                    && policy.rule.applies_to(PolicyPoint::ToolResult)
+            })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy)| AcceptedPolicy {
+            .map(|(entity, id, policy, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -10431,6 +10578,110 @@ mod tests {
     }
 
     #[test]
+    fn retired_policy_is_retained_for_accepted_work_and_excluded_from_future_snapshots() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let policy = runtime
+            .spawn_policy(
+                id("approval"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 7,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::Request,
+                        prompt: "approve accepted request".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+
+        runtime.handle().prompt(agent, "first").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let approval = runtime.effects().try_recv().unwrap().unwrap();
+        assert!(approval.policy_approval_input().is_some());
+
+        runtime.retire_policy(policy).unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: true,
+                    reason: None,
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(
+            runtime
+                .effects()
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .model_input()
+                .is_some()
+        );
+
+        runtime.handle().prompt(agent, "second").unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(
+            runtime
+                .effects()
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .model_input()
+                .is_some()
+        );
+
+        let snapshot = runtime.snapshot().unwrap();
+        assert_eq!(snapshot.policies[0].status, PolicyStatus::Retired);
+        let mut restored = Runtime::new(RuntimeConfig::default()).unwrap();
+        let restored_entities = restored.restore(snapshot).unwrap();
+        let restored_agent = AgentHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: restored_entities.0[&id("agent")],
+        };
+        let restored_policy = restored_entities.0[&id("approval")];
+        assert_eq!(
+            restored.world().get::<PolicyStatus>(restored_policy),
+            Some(&PolicyStatus::Retired)
+        );
+        restored
+            .handle()
+            .prompt(restored_agent, "after restore")
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        assert!(
+            restored
+                .effects()
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .model_input()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn denied_tool_approval_prevents_tool_dispatch() {
         let (mut runtime, agent) = runtime_with_tool();
         runtime
@@ -12231,6 +12482,96 @@ mod tests {
                 .unwrap()
                 .tool_input()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn hosted_commands_spawn_agent_and_named_run_while_another_run_is_active() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let parent_agent = runtime
+            .spawn_agent(id("parent-agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let parent_pending = runtime
+            .handle()
+            .prompt(parent_agent, "parent stays active")
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let parent_request = runtime.effects().try_recv().unwrap().unwrap();
+        let parent = runtime.resolve_run(&parent_pending).unwrap();
+        assert!(matches!(
+            runtime.observe_run(parent).unwrap(),
+            Some(RunState::WaitingModel { .. })
+        ));
+
+        let pending_agent = runtime
+            .handle()
+            .spawn_agent(
+                id("dynamic-agent"),
+                tenant("a"),
+                Agent {
+                    instructions: "spawned during execution".to_owned(),
+                    ..Agent::default()
+                },
+                id("model"),
+            )
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let dynamic_agent = pending_agent.try_resolve().unwrap().unwrap().unwrap();
+        let dynamic_pending = runtime
+            .handle()
+            .spawn_run(id("dynamic-run"), dynamic_agent, "independent")
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let dynamic_request = runtime.effects().try_recv().unwrap().unwrap();
+        let dynamic_run = runtime.resolve_run(&dynamic_pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<StableId>(dynamic_run.entity()),
+            Some(&id("dynamic-run"))
+        );
+
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: dynamic_request.operation,
+                generation: dynamic_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "dynamic completed".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(matches!(
+            runtime.observe_run(dynamic_run).unwrap(),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "dynamic completed"
+        ));
+        assert!(matches!(
+            runtime.observe_run(parent).unwrap(),
+            Some(RunState::WaitingModel { .. })
+        ));
+        assert_eq!(
+            runtime
+                .world()
+                .get::<OperationState>(parent_request.operation),
+            Some(&OperationState {
+                generation: parent_request.generation,
+                phase: OperationPhase::InFlight,
+            })
         );
     }
 

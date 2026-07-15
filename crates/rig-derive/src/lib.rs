@@ -276,6 +276,31 @@ fn is_option_type(ty: &Type) -> bool {
     false
 }
 
+fn is_removed_runtime_context_type(ty: &Type) -> bool {
+    let ty = match ty {
+        Type::Group(group) => &*group.elem,
+        Type::Paren(paren) => &*paren.elem,
+        Type::Reference(reference) => &*reference.elem,
+        ty => ty,
+    };
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    let segments = type_path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    matches!(
+        segments.as_slice(),
+        [root, tool, context]
+            if matches!(root.as_str(), "rig" | "rig_core")
+                && tool == "tool"
+                && context == "ToolContext"
+    )
+}
+
 fn result_type_tokens(
     return_type: &ReturnType,
 ) -> syn::Result<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
@@ -459,6 +484,20 @@ pub fn rig_tool(args: TokenStream, input: TokenStream) -> TokenStream {
                 .into_compile_error()
                 .into();
         };
+
+        if pat_type
+            .attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("rig"))
+            || is_removed_runtime_context_type(&pat_type.ty)
+        {
+            return syn::Error::new_spanned(
+                pat_type,
+                "runtime ToolContext parameters were replaced by typed ECS components; attach extension state to the agent, run, policy, or operation instead",
+            )
+            .into_compile_error()
+            .into();
+        }
 
         let syn::Pat::Ident(param_ident) = &*pat_type.pat else {
             return syn::Error::new_spanned(

@@ -12,6 +12,256 @@ use rig::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+
+/// Shared ECS lifecycle probe used by provider cassette migrations.
+#[derive(Clone)]
+pub(crate) struct RequestLifecycleProbe {
+    session_id: Arc<str>,
+    pub(crate) request_calls: Arc<AtomicUsize>,
+    pub(crate) response_calls: Arc<AtomicUsize>,
+    pub(crate) seen_request: Arc<Mutex<Option<String>>>,
+    pub(crate) seen_response: Arc<Mutex<Option<String>>>,
+}
+
+impl RequestLifecycleProbe {
+    pub(crate) fn new(session_id: impl Into<Arc<str>>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            request_calls: Arc::new(AtomicUsize::new(0)),
+            response_calls: Arc::new(AtomicUsize::new(0)),
+            seen_request: Arc::new(Mutex::new(None)),
+            seen_response: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn install<M>(
+        &self,
+        agent: &rig::agent::Agent<M>,
+    ) -> Result<(), rig::runtime::adapters::LocalAgentError>
+    where
+        M: rig::completion::CompletionModel,
+    {
+        let request_probe = self.clone();
+        let response_probe = self.clone();
+        agent.with_runtime_mut(move |runtime| {
+            runtime.world_mut().add_observer(
+                move |event: rig::bevy_ecs::observer::On<
+                    rig::runtime::CompletionRequestPrepared,
+                >| {
+                    request_probe.request_calls.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut seen) = request_probe.seen_request.lock() {
+                        *seen = Some(format!(
+                            "{}:{}",
+                            request_probe.session_id,
+                            event.event().request.prompt
+                        ));
+                    }
+                },
+            );
+            runtime.world_mut().add_observer(
+                move |event: rig::bevy_ecs::observer::On<
+                    rig::runtime::CompletionResponseApplied,
+                >| {
+                    response_probe.response_calls.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut seen) = response_probe.seen_response.lock() {
+                        *seen = Some(event.event().effective.text.clone());
+                    }
+                },
+            );
+        })
+    }
+
+    pub(crate) fn assert_observed(&self, prompt: &str) {
+        assert_eq!(self.request_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(self.response_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            self.seen_request
+                .lock()
+                .ok()
+                .and_then(|seen| seen.clone())
+                .is_some_and(|seen| seen.contains(prompt))
+        );
+        assert!(
+            self.seen_response
+                .lock()
+                .ok()
+                .and_then(|seen| seen.clone())
+                .is_some_and(|seen| !seen.is_empty())
+        );
+    }
+}
+
+/// Installs an ordered ECS tool-skip policy and observes committed results.
+#[derive(Clone, Default)]
+pub(crate) struct PermissionControlProbe {
+    pub(crate) committed_results: Arc<AtomicUsize>,
+    pub(crate) last_result: Arc<Mutex<Option<String>>>,
+}
+
+impl PermissionControlProbe {
+    pub(crate) fn install<M>(
+        &self,
+        agent: &rig::agent::Agent<M>,
+    ) -> Result<(), rig::runtime::adapters::LocalAgentError>
+    where
+        M: rig::completion::CompletionModel,
+    {
+        let agent_handle = agent.handle();
+        let observed = self.clone();
+        let policy_id = rig::runtime::StableId::new("permission-skip-head")?;
+        let tenant = rig::runtime::TenantId::new("local")?;
+        let installed = agent.with_runtime_mut(move |runtime| {
+            runtime.spawn_policy(
+                policy_id,
+                tenant,
+                rig::runtime::Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: rig::runtime::PolicyRule::SkipToolCall {
+                        tool: Some("read_file_head".to_owned()),
+                        reason: "Tool 'read_file_head' is currently unavailable. Please use 'read_file_tail' instead to read the file.".to_owned(),
+                    },
+                },
+                agent_handle,
+            )?;
+            runtime.world_mut().add_observer(
+                move |event: rig::bevy_ecs::observer::On<rig::runtime::ToolBatchCommitted>| {
+                    observed
+                        .committed_results
+                        .fetch_add(event.event().results.len(), Ordering::SeqCst);
+                    if let Some(result) = event.event().results.last()
+                        && let Ok(mut last) = observed.last_result.lock()
+                    {
+                        *last = Some(result.presentation.clone());
+                    }
+                },
+            );
+            Ok::<(), rig::runtime::SpawnError>(())
+        })?;
+        installed?;
+        Ok(())
+    }
+
+    pub(crate) fn assert_completed(&self) {
+        assert!(self.committed_results.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            self.last_result.lock().ok().and_then(|last| last.clone()),
+            Some("hello world".to_owned())
+        );
+    }
+}
+
+pub(crate) fn install_policy<M>(
+    agent: &rig::agent::Agent<M>,
+    id: &str,
+    order: u32,
+    revision: u64,
+    rule: rig::runtime::PolicyRule,
+) -> Result<rig::bevy_ecs::entity::Entity, rig::runtime::adapters::LocalAgentError>
+where
+    M: rig::completion::CompletionModel,
+{
+    let policy_id = rig::runtime::StableId::new(id)?;
+    let tenant = rig::runtime::TenantId::new("local")?;
+    let agent_handle = agent.handle();
+    agent
+        .with_runtime_mut(move |runtime| {
+            runtime.spawn_policy(
+                policy_id,
+                tenant,
+                rig::runtime::Policy {
+                    order,
+                    revision,
+                    rule,
+                },
+                agent_handle,
+            )
+        })?
+        .map_err(Into::into)
+}
+
+/// Temporary file used by permission-control provider regressions.
+pub(crate) struct PermissionFile(PathBuf);
+
+impl PermissionFile {
+    pub(crate) fn new(provider: &str, surface: &str) -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "rig-{provider}-permission-{surface}-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "hello world\n")?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PermissionFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("file operation failed")]
+pub(crate) struct PermissionFileError;
+
+#[derive(Deserialize)]
+pub(crate) struct PermissionFileArgs {}
+
+macro_rules! permission_file_tool {
+    ($name:ident, $tool_name:literal, $command:literal, $description:literal) => {
+        #[derive(Deserialize, Serialize)]
+        pub(crate) struct $name(pub(crate) PathBuf);
+
+        impl Tool for $name {
+            const NAME: &'static str = $tool_name;
+            type Error = PermissionFileError;
+            type Args = PermissionFileArgs;
+            type Output = String;
+
+            fn description(&self) -> String {
+                $description.to_owned()
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object", "properties": {}})
+            }
+
+            async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+                let output = std::process::Command::new($command)
+                    .arg("-1")
+                    .arg(&self.0)
+                    .output()
+                    .map_err(|_| PermissionFileError)?;
+                if !output.status.success() {
+                    return Err(PermissionFileError);
+                }
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            }
+        }
+    };
+}
+
+permission_file_tool!(
+    ReadFileHead,
+    "read_file_head",
+    "head",
+    "Read the first line of test.txt using the head command"
+);
+permission_file_tool!(
+    ReadFileTail,
+    "read_file_tail",
+    "tail",
+    "Read the last line of test.txt using the tail command"
+);
 
 pub(crate) const BASIC_PREAMBLE: &str = "You are a concise assistant. Answer directly.";
 pub(crate) const BASIC_PROMPT: &str = "In one or two sentences, explain what Rust programming language is and why memory safety matters.";
