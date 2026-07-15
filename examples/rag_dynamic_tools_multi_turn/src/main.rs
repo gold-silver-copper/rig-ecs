@@ -1,8 +1,10 @@
 use anyhow::Result;
 use rig::{
+    embeddings::{EmbeddingsBuilder, ToolSchema},
     prelude::*,
     providers::openai::{self, Client},
     tool::{Tool, ToolEmbedding},
+    vector_store::in_memory_store::InMemoryVectorStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -135,17 +137,32 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create OpenAI client
     let openai_client = Client::from_env()?;
 
-    // Static and discovered tools use the same ECS capability representation.
-    // This example registers both implementations directly; discovery adapters
-    // reconcile equivalent definitions through `runtime::EcsDiscovery`.
+    let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let add = Add;
+    let subtract = Subtract;
+    let schemas = vec![
+        ToolSchema::try_from(&add)?,
+        ToolSchema::try_from(&subtract)?,
+    ];
+    let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
+        .documents(schemas)?
+        .build()
+        .await?;
+    let vector_store =
+        InMemoryVectorStore::from_documents_with_id_f(embeddings, |tool| tool.name.clone());
+    let index = vector_store.index(embedding_model);
+
+    // Re-run semantic selection before every model operation so later turns
+    // receive a fresh immutable tool snapshot from the same ECS store path.
     let calculator_rag = openai_client
         .agent(openai::GPT_4)
         .preamble(
             "You are a calculator here to help the user perform arithmetic operations.
             Use the tools provided to answer the user's question and do not do any math on your own.",
         )
-        .tool(Add)
-        .tool(Subtract)
+        .retrieved_tool(add)
+        .retrieved_tool(subtract)
+        .retrieved_tools(2, index)
         .build();
 
     // Prompt the agent and print the response

@@ -9692,6 +9692,7 @@ name = "request_hook"
 version = "0.40.0"
 dependencies = [
  "anyhow",
+ "bevy_ecs",
  "rig",
  "tokio",
 ]

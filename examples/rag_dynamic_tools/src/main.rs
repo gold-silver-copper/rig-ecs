@@ -2,8 +2,10 @@ use anyhow::Result;
 use rig::prelude::*;
 use rig::providers::openai;
 use rig::{
+    embeddings::{EmbeddingsBuilder, ToolSchema},
     providers::openai::Client,
     tool::{Tool, ToolEmbedding},
+    vector_store::in_memory_store::InMemoryVectorStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -126,13 +128,29 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Create OpenAI client
     let openai_client = Client::from_env()?;
-    // Tools are capability entities. Dynamic discovery uses the same entity
-    // representation; this concise example installs two static capabilities.
+    let embedding_model = openai_client.embedding_model(openai::TEXT_EMBEDDING_ADA_002);
+    let add = Add;
+    let subtract = Subtract;
+    let schemas = vec![
+        ToolSchema::try_from(&add)?,
+        ToolSchema::try_from(&subtract)?,
+    ];
+    let embeddings = EmbeddingsBuilder::new(embedding_model.clone())
+        .documents(schemas)?
+        .build()
+        .await?;
+    let vector_store =
+        InMemoryVectorStore::from_documents_with_id_f(embeddings, |tool| tool.name.clone());
+    let index = vector_store.index(embedding_model);
+
+    // Candidate tools remain executable ECS capability entities, while a
+    // scheduled store operation selects one immutable per-turn tool snapshot.
     let calculator_rag = openai_client
         .agent(openai::GPT_4)
         .preamble("You are a calculator here to help the user perform arithmetic operations.")
-        .tool(Add)
-        .tool(Subtract)
+        .retrieved_tool(add)
+        .retrieved_tool(subtract)
+        .retrieved_tools(1, index)
         .default_max_turns(2)
         .build();
 
