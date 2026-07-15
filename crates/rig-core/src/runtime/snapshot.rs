@@ -1195,6 +1195,9 @@ pub fn restore_active_run(
             world
                 .entity_mut(run)
                 .insert((ParentRun(parent), ChildOrdinal(ordinal)));
+            if !persisted.child_result_committed {
+                world.entity_mut(parent).insert(WaitingForChildren);
+            }
         } else if persisted.child_ordinal.is_some() {
             return Err(ActiveRunSnapshotError::InvalidSnapshot(format!(
                 "root run `{}` has a child ordinal",

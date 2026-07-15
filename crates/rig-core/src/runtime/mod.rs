@@ -269,6 +269,15 @@ pub struct ParentRun(pub Entity);
 #[relationship_target(relationship = ParentRun)]
 pub struct ChildRuns(Vec<Entity>);
 
+/// Explicit execution dependency that prevents a parent from advancing while
+/// one or more delegated child results are still uncommitted.
+///
+/// The related [`ChildRuns`] collection is the source of truth for the actual
+/// dependency set; this marker makes the parent's readiness directly queryable
+/// without copying entity identifiers into another component.
+#[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitingForChildren;
+
 /// Deterministic creation order for child-result reduction.
 #[derive(Component, Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ChildOrdinal(pub u64);
@@ -440,7 +449,8 @@ fn accepts_new_policy_evaluations(status: Option<&PolicyStatus>) -> bool {
     !matches!(status, Some(PolicyStatus::Retired))
 }
 
-/// Built-in policy data. Extensions can add components and systems in [`RigSet::Policy`].
+/// Built-in policy data. Extensions can add components and systems at the
+/// relevant public policy boundary, such as [`RigSet::InvokeRequestPolicy`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PolicyRule {
     /// Permit progression without modification.
@@ -2268,28 +2278,72 @@ pub struct CommittedTurn {
 pub struct RigSchedule;
 
 /// Public semantic stages for extension ordering.
+///
+/// The variants intentionally describe lifecycle boundaries rather than
+/// private implementation functions. Extensions can order work at a stable
+/// boundary even when the core implementation of that boundary changes.
 #[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RigSet {
-    /// Ingest external commands and effect completions.
-    Ingest,
-    /// Reconcile world structure and stable identities.
+    /// Pull hosted topology and prompt commands into the world.
+    IngestCommands,
+    /// Pull hosted pause, resume, cancellation, and bulk-control commands.
+    IngestControlCommands,
+    /// Pull external effect completions and buffered observations into ECS messages.
+    IngestEffects,
+    /// Reconcile derived topology and stable identities.
     Reconcile,
-    /// Prepare immutable decisions and operation entities.
-    Prepare,
-    /// Apply ordered policy systems.
-    Policy,
-    /// Submit owned external effects.
-    Dispatch,
-    /// Validate and apply effect completions.
-    Apply,
-    /// Commit deterministic outcomes.
-    Commit,
-    /// Persist required state.
+    /// Reconcile changed agent admission and bulk-control state.
+    ReconcileAgentControl,
+    /// Apply requested run-local suspension or resumption.
+    ApplyRunControl,
+    /// Materialize dynamically requested agents, runs, and child relationships.
+    SpawnDynamicAgentsAndRuns,
+    /// Prepare run-local memory, retrieval, and prerequisite operations.
+    PrepareRun,
+    /// Prepare the next immutable model-operation baseline.
+    PrepareModel,
+    /// Snapshot applicable request policies and create durable evaluations.
+    BeginRequestPolicy,
+    /// Invoke the next deterministically selected request policy.
+    InvokeRequestPolicy,
+    /// Reduce request-policy decisions into the effective request.
+    ReduceRequestPolicy,
+    /// Finalize request decisions and publish pre-dispatch observations.
+    FinalizeRequest,
+    /// Dispatch immutable model, store, discovery, and approval effects.
+    DispatchModel,
+    /// Validate and retain model, stream, store, discovery, and approval ingress.
+    ApplyModelCompletion,
+    /// Begin and advance completion-response and text-delta policy evaluation.
+    BeginResponsePolicy,
+    /// Begin and advance invalid-tool resolution.
+    ResolveInvalidTools,
+    /// Commit an accepted model turn or its terminal response.
+    CommitModelTurn,
+    /// Create logical tool batches and snapshot per-call policies.
+    PrepareToolBatch,
+    /// Invoke and reduce ordered tool-call policies.
+    BeginToolCallPolicy,
+    /// Dispatch accepted tool operations.
+    DispatchTools,
+    /// Validate and retain tool completions.
+    ApplyToolCompletions,
+    /// Invoke and reduce ordered tool-result policies.
+    BeginToolResultPolicy,
+    /// Atomically commit settled logical tool batches.
+    CommitToolBatch,
+    /// Commit store persistence and other durable state.
     Persist,
-    /// Publish observations.
+    /// Publish approved deltas, lifecycle observations, and terminal streams.
     Publish,
-    /// Cancel, retire, and clean up.
+    /// Propagate run and operation cancellation.
+    Cancel,
+    /// Reconcile retirement while retaining referenced revisions.
+    Retire,
+    /// Despawn only entities whose retention obligations are satisfied.
     Cleanup,
+    /// Age message buffers and clear per-pass change tracking.
+    MaintainMessages,
 }
 
 /// Bounded runtime queue configuration.
@@ -4064,74 +4118,82 @@ pub fn install_runtime_with_waker(
     });
     schedule.configure_sets(
         (
-            RigSet::Ingest,
+            RigSet::IngestCommands,
+            RigSet::IngestControlCommands,
+            RigSet::IngestEffects,
             RigSet::Reconcile,
-            RigSet::Prepare,
-            RigSet::Policy,
-            RigSet::Dispatch,
-            RigSet::Apply,
-            RigSet::Commit,
-            RigSet::Persist,
-            RigSet::Publish,
-            RigSet::Cleanup,
+            RigSet::ReconcileAgentControl,
+            RigSet::ApplyRunControl,
+            RigSet::SpawnDynamicAgentsAndRuns,
+            RigSet::PrepareRun,
+            RigSet::PrepareModel,
+            RigSet::BeginRequestPolicy,
+            RigSet::InvokeRequestPolicy,
+            RigSet::ReduceRequestPolicy,
+            RigSet::FinalizeRequest,
         )
             .chain(),
     );
-    schedule.add_systems(
+    schedule.configure_sets(
         (
-            advance_runtime_clock,
-            ingest_commands,
-            ingest_observations,
-            ingest_completions,
+            RigSet::DispatchModel,
+            RigSet::ApplyModelCompletion,
+            RigSet::BeginResponsePolicy,
+            RigSet::CommitModelTurn,
+            RigSet::ResolveInvalidTools,
+            RigSet::PrepareToolBatch,
+            RigSet::BeginToolCallPolicy,
+            RigSet::DispatchTools,
+            RigSet::ApplyToolCompletions,
+            RigSet::BeginToolResultPolicy,
+            RigSet::CommitToolBatch,
         )
             .chain()
-            .in_set(RigSet::Ingest),
+            .after(RigSet::FinalizeRequest),
+    );
+    schedule.configure_sets(
+        (
+            RigSet::Persist,
+            RigSet::Publish,
+            RigSet::Cancel,
+            RigSet::Retire,
+            RigSet::Cleanup,
+            RigSet::MaintainMessages,
+        )
+            .chain()
+            .after(RigSet::CommitToolBatch),
     );
     schedule.add_systems(
-        (
-            reconcile_agent_control,
-            reconcile_run_control,
-            reconcile_discovery_operations,
-            reconcile_stable_ids,
-        )
+        (advance_runtime_clock, ingest_commands)
+            .chain()
+            .in_set(RigSet::IngestCommands),
+    );
+    schedule.add_systems(
+        (ingest_observations, ingest_completions)
+            .chain()
+            .in_set(RigSet::IngestEffects),
+    );
+    schedule.add_systems(
+        (reconcile_discovery_operations, reconcile_stable_ids)
             .chain()
             .in_set(RigSet::Reconcile),
     );
+    schedule.add_systems(reconcile_agent_control.in_set(RigSet::ReconcileAgentControl));
+    schedule.add_systems(reconcile_run_control.in_set(RigSet::ApplyRunControl));
+    schedule.add_systems(prepare_store_operations.in_set(RigSet::PrepareRun));
+    schedule.add_systems(prepare_model_operations.in_set(RigSet::PrepareModel));
+    schedule.add_systems(initialize_request_policy_evaluations.in_set(RigSet::BeginRequestPolicy));
+    schedule.add_systems(evaluate_request_policies.in_set(RigSet::InvokeRequestPolicy));
+    schedule.add_systems(publish_prepared_model_observations.in_set(RigSet::FinalizeRequest));
     schedule.add_systems(
         (
-            prepare_store_operations,
-            prepare_model_operations,
-            publish_invalid_call_observations,
-            initialize_request_policy_evaluations,
-            initialize_invalid_tool_call_policy_evaluations,
-            initialize_tool_call_policy_evaluations,
-        )
-            .chain()
-            .in_set(RigSet::Prepare),
-    );
-    schedule.add_systems(
-        (
-            evaluate_request_policies,
-            evaluate_invalid_tool_call_policies,
-            evaluate_tool_call_policies,
-            evaluate_completion_response_policies,
-            evaluate_tool_result_policies,
-            evaluate_text_delta_policies,
-        )
-            .chain()
-            .in_set(RigSet::Policy),
-    );
-    schedule.add_systems(
-        (
-            publish_prepared_operation_observations,
             dispatch_model_operations,
-            dispatch_tool_operations,
             dispatch_discovery_operations,
             dispatch_store_operations,
             dispatch_policy_approval_operations,
         )
             .chain()
-            .in_set(RigSet::Dispatch),
+            .in_set(RigSet::DispatchModel),
     );
     schedule.add_systems(
         (
@@ -4140,32 +4202,53 @@ pub fn install_runtime_with_waker(
             expire_effects,
         )
             .chain()
-            .in_set(RigSet::Apply),
+            .in_set(RigSet::ApplyModelCompletion),
     );
     schedule.add_systems(
         (
             initialize_completion_response_policy_evaluations,
-            initialize_tool_result_policy_evaluations,
-            publish_applied_policy_observations,
-            commit_store_operations,
-            commit_model_operations,
-            commit_tool_batches,
-            commit_child_results,
+            evaluate_completion_response_policies,
+            evaluate_text_delta_policies,
+            publish_applied_model_policy_observations,
         )
             .chain()
-            .in_set(RigSet::Commit),
+            .in_set(RigSet::BeginResponsePolicy),
     );
     schedule.add_systems(
         (
-            propagate_parent_cancellation,
-            propagate_cancellation,
-            cleanup_observed_runs,
-            cleanup_retired_tools,
-            update_effect_messages,
+            publish_invalid_call_observations,
+            initialize_invalid_tool_call_policy_evaluations,
+            evaluate_invalid_tool_call_policies,
         )
             .chain()
-            .in_set(RigSet::Cleanup),
+            .in_set(RigSet::ResolveInvalidTools),
     );
+    schedule.add_systems(
+        (commit_model_operations, commit_child_results)
+            .chain()
+            .in_set(RigSet::CommitModelTurn),
+    );
+    schedule.add_systems(
+        (
+            initialize_tool_call_policy_evaluations,
+            publish_prepared_tool_observations,
+        )
+            .chain()
+            .in_set(RigSet::PrepareToolBatch),
+    );
+    schedule.add_systems(evaluate_tool_call_policies.in_set(RigSet::BeginToolCallPolicy));
+    schedule.add_systems(dispatch_tool_operations.in_set(RigSet::DispatchTools));
+    schedule.add_systems(
+        (
+            initialize_tool_result_policy_evaluations,
+            evaluate_tool_result_policies,
+            publish_applied_tool_policy_observations,
+        )
+            .chain()
+            .in_set(RigSet::BeginToolResultPolicy),
+    );
+    schedule.add_systems(commit_tool_batches.in_set(RigSet::CommitToolBatch));
+    schedule.add_systems(commit_store_operations.in_set(RigSet::Persist));
     schedule.add_systems(
         (
             publish_run_terminal_observations,
@@ -4175,6 +4258,14 @@ pub fn install_runtime_with_waker(
             .chain()
             .in_set(RigSet::Publish),
     );
+    schedule.add_systems(
+        (propagate_parent_cancellation, propagate_cancellation)
+            .chain()
+            .in_set(RigSet::Cancel),
+    );
+    schedule.add_systems(cleanup_retired_tools.in_set(RigSet::Retire));
+    schedule.add_systems(cleanup_observed_runs.in_set(RigSet::Cleanup));
+    schedule.add_systems(update_effect_messages.in_set(RigSet::MaintainMessages));
     world.add_schedule(schedule);
 
     Ok(InstalledRuntime {
@@ -4654,7 +4745,8 @@ fn control_allows_internal_progress(control: Option<&RunControl>) -> bool {
 }
 
 fn world_allows_internal_progress(world: &World, run: Entity) -> bool {
-    control_allows_internal_progress(world.get::<RunControl>(run))
+    world.get::<WaitingForChildren>(run).is_none()
+        && control_allows_internal_progress(world.get::<RunControl>(run))
 }
 
 fn advance_runtime_clock(mut clock: ResMut<RuntimeClock>) {
@@ -4815,6 +4907,7 @@ fn ingest_commands(
                 }
                 if let Some((parent, ordinal)) = parent {
                     if runs.get_mut(parent).is_ok() {
+                        commands.entity(parent).insert(WaitingForChildren);
                         commands
                             .entity(run)
                             .insert((ParentRun(parent), ChildOrdinal(ordinal)));
@@ -5234,16 +5327,20 @@ fn reconcile_stable_ids(world: &mut World) {
     world.resource_mut::<InvariantViolations>().0 = found;
 }
 
+#[allow(clippy::type_complexity)]
 fn prepare_store_operations(
     mut commands: Commands,
-    mut runs: Query<(
-        Entity,
-        &TenantId,
-        &RunOf,
-        &RunControl,
-        &mut RunRecord,
-        &mut RunState,
-    )>,
+    mut runs: Query<
+        (
+            Entity,
+            &TenantId,
+            &RunOf,
+            &RunControl,
+            &mut RunRecord,
+            &mut RunState,
+        ),
+        Without<WaitingForChildren>,
+    >,
     agents: Query<(Option<&AgentStoreGrants>, Option<&RetrievalRequirement>)>,
     grants: Query<(&StableId, &TenantId, &StoreGrant, &StoreGrantForStore)>,
     stores: Query<(&StableId, &TenantId, &StoreCapability)>,
@@ -5357,14 +5454,17 @@ fn prepare_store_operations(
 #[allow(clippy::type_complexity)]
 fn prepare_model_operations(
     mut commands: Commands,
-    mut runs: Query<(
-        Entity,
-        &TenantId,
-        &RunOf,
-        &RunControl,
-        &RunRecord,
-        &mut RunState,
-    )>,
+    mut runs: Query<
+        (
+            Entity,
+            &TenantId,
+            &RunOf,
+            &RunControl,
+            &RunRecord,
+            &mut RunState,
+        ),
+        Without<WaitingForChildren>,
+    >,
     agents: Query<(
         &TenantId,
         &Agent,
@@ -5530,7 +5630,7 @@ fn initialize_request_policy_evaluations(
         (Entity, &OperationOf, &PendingModelRequest, &OperationState),
         Without<RequestPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>)>,
+    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -6071,7 +6171,7 @@ fn initialize_tool_call_policy_evaluations(
         (Entity, &OperationOf, &PendingToolCall, &OperationState),
         Without<ToolCallPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>)>,
+    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -6288,7 +6388,7 @@ fn initialize_invalid_tool_call_policy_evaluations(
         ),
         Without<InvalidToolCallPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>)>,
+    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -6671,6 +6771,7 @@ fn dispatch_model_operations(world: &mut World) {
         .iter(world)
         .filter_map(|(entity, run, input, state)| {
             if !matches!(state.phase, OperationPhase::Prepared)
+                || world.get::<WaitingForChildren>(run.get()).is_some()
                 || !matches!(
                     world.get::<RunControl>(run.get()),
                     Some(RunControl::Running)
@@ -6762,10 +6863,9 @@ type PreparedToolOperations<'world, 'state> = Query<
     Added<ToolEffectInput>,
 >;
 
-fn publish_prepared_operation_observations(
+fn publish_prepared_model_observations(
     mut commands: Commands,
     model_operations: PreparedModelOperations<'_, '_>,
-    tool_operations: PreparedToolOperations<'_, '_>,
 ) {
     for (operation, operation_of, state, request, policies) in &model_operations {
         if matches!(state.phase, OperationPhase::Prepared) {
@@ -6777,6 +6877,12 @@ fn publish_prepared_operation_observations(
             });
         }
     }
+}
+
+fn publish_prepared_tool_observations(
+    mut commands: Commands,
+    tool_operations: PreparedToolOperations<'_, '_>,
+) {
     for (operation, operation_of, state, call, policies) in &tool_operations {
         if matches!(state.phase, OperationPhase::Prepared) {
             commands.trigger(ToolCallPrepared {
@@ -6805,7 +6911,7 @@ fn publish_invalid_call_observations(
     }
 }
 
-fn publish_applied_policy_observations(
+fn publish_applied_model_policy_observations(
     mut commands: Commands,
     model_operations: Query<
         (
@@ -6815,15 +6921,6 @@ fn publish_applied_policy_observations(
             Option<&EffectiveModelOutput>,
         ),
         Added<CompletionResponsePolicyDone>,
-    >,
-    tool_operations: Query<
-        (
-            Entity,
-            &OperationOf,
-            &OperationState,
-            Option<&EffectiveToolOutput>,
-        ),
-        Added<ToolResultPolicyDone>,
     >,
 ) {
     for (operation, operation_of, state, effective) in &model_operations {
@@ -6840,6 +6937,20 @@ fn publish_applied_policy_observations(
             effective,
         });
     }
+}
+
+fn publish_applied_tool_policy_observations(
+    mut commands: Commands,
+    tool_operations: Query<
+        (
+            Entity,
+            &OperationOf,
+            &OperationState,
+            Option<&EffectiveToolOutput>,
+        ),
+        Added<ToolResultPolicyDone>,
+    >,
+) {
     for (operation, operation_of, state, effective) in &tool_operations {
         let OperationPhase::Settled(OperationOutcome::Success(EffectOutput::Tool(raw))) =
             &state.phase
@@ -6868,6 +6979,7 @@ fn dispatch_tool_operations(world: &mut World) {
         .filter_map(|(entity, batch, input, state)| {
             let run = batch_query.get(world, batch.get()).ok()?.get();
             if !matches!(state.phase, OperationPhase::Prepared)
+                || world.get::<WaitingForChildren>(run).is_some()
                 || !matches!(world.get::<RunControl>(run), Some(RunControl::Running))
                 || !matches!(
                     world.get::<RunState>(run),
@@ -6989,6 +7101,7 @@ fn dispatch_store_operations(world: &mut World) {
         .iter(world)
         .filter_map(|(entity, run, input, state)| {
             if !matches!(state.phase, OperationPhase::Prepared)
+                || world.get::<WaitingForChildren>(run.get()).is_some()
                 || !matches!(
                     world.get::<RunControl>(run.get()),
                     Some(RunControl::Running)
@@ -7052,6 +7165,7 @@ fn dispatch_policy_approval_operations(world: &mut World) {
         .iter(world)
         .filter_map(|(entity, run, input, state)| {
             if !matches!(state.phase, OperationPhase::Prepared)
+                || world.get::<WaitingForChildren>(run.get()).is_some()
                 || !matches!(
                     world.get::<RunControl>(run.get()),
                     Some(RunControl::Running)
@@ -7467,7 +7581,7 @@ fn publish_terminal_streams(
 
 fn commit_child_results(
     mut commands: Commands,
-    mut parents: Query<(Entity, &ChildRuns, &mut RunRecord)>,
+    mut parents: Query<(Entity, &ChildRuns, &mut RunRecord), With<WaitingForChildren>>,
     children: Query<(
         &StableId,
         &ChildOrdinal,
@@ -7477,6 +7591,7 @@ fn commit_child_results(
     mut progress: ResMut<Progress>,
 ) {
     for (parent, child_runs, mut parent_record) in &mut parents {
+        let child_count = child_runs.iter().count();
         let mut ordered = child_runs
             .iter()
             .filter_map(|child| {
@@ -7484,6 +7599,7 @@ fn commit_child_results(
                 Some((ordinal.0, child, id.clone(), state, committed.is_some()))
             })
             .collect::<Vec<_>>();
+        let mut all_terminal = ordered.len() == child_count && child_count > 0;
         ordered.sort_by_key(|(ordinal, child, _, _, _)| (*ordinal, child.to_bits()));
         for (ordinal, child, child_id, state, committed) in ordered {
             if committed {
@@ -7496,7 +7612,10 @@ fn commit_child_results(
                 RunState::Queued
                 | RunState::WaitingModel { .. }
                 | RunState::WaitingTools { .. }
-                | RunState::WaitingStore { .. } => break,
+                | RunState::WaitingStore { .. } => {
+                    all_terminal = false;
+                    break;
+                }
             };
             parent_record.transcript.push(TranscriptEntry::ChildResult {
                 ordinal,
@@ -7511,6 +7630,10 @@ fn commit_child_results(
                 ordinal,
                 result,
             });
+            mark_progress(&mut progress);
+        }
+        if all_terminal {
+            commands.entity(parent).remove::<WaitingForChildren>();
             mark_progress(&mut progress);
         }
     }
@@ -7684,7 +7807,7 @@ fn initialize_completion_response_policy_evaluations(
         (Entity, &OperationOf, &ModelEffectInput, &OperationState),
         Without<CompletionResponsePolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>)>,
+    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -8017,7 +8140,7 @@ fn initialize_tool_result_policy_evaluations(
         (Entity, &OperationOf, &ToolEffectInput, &OperationState),
         Without<ToolResultPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunControl>)>,
+    runs: Query<(&RunOf, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
     policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
     mut progress: ResMut<Progress>,
@@ -8391,7 +8514,10 @@ fn commit_store_operations(
         (Entity, &OperationOf, &StoreEffectInput, &OperationState),
         With<StoreEffectInput>,
     >,
-    mut runs: Query<(&mut RunState, &mut RunRecord, Option<&RunControl>)>,
+    mut runs: Query<
+        (&mut RunState, &mut RunRecord, Option<&RunControl>),
+        Without<WaitingForChildren>,
+    >,
     mut progress: ResMut<Progress>,
 ) {
     for (operation_entity, operation_of, input, operation) in &operations {
@@ -8487,7 +8613,10 @@ fn commit_model_operations(
         ),
         With<ModelEffectInput>,
     >,
-    mut runs: Query<(&mut RunState, &mut RunRecord, Option<&RunControl>)>,
+    mut runs: Query<
+        (&mut RunState, &mut RunRecord, Option<&RunControl>),
+        Without<WaitingForChildren>,
+    >,
     mut progress: ResMut<Progress>,
 ) {
     for (
@@ -8766,7 +8895,10 @@ fn commit_tool_batches(
     )>,
     source_models: Query<&ModelEffectInput>,
     agents: Query<&Agent>,
-    mut runs: Query<(&RunOf, &mut RunState, &mut RunRecord, Option<&RunControl>)>,
+    mut runs: Query<
+        (&RunOf, &mut RunState, &mut RunRecord, Option<&RunControl>),
+        Without<WaitingForChildren>,
+    >,
     mut progress: ResMut<Progress>,
 ) {
     'batches: for (batch_entity, batch_of, batch_operations, mut batch) in &mut batches {
@@ -12595,7 +12727,7 @@ mod tests {
             .unwrap();
         let parent_pending = runtime.handle().prompt(agent, "parent").unwrap();
         runtime.run_until_stalled().unwrap();
-        let _parent_request = runtime.effects().try_recv().unwrap().unwrap();
+        let parent_request = runtime.effects().try_recv().unwrap().unwrap();
         let parent = runtime.resolve_run(&parent_pending).unwrap();
         let first_pending = runtime
             .handle()
@@ -12618,6 +12750,39 @@ mod tests {
             runtime.world().get::<ParentRun>(second.entity()),
             Some(&ParentRun(parent.entity()))
         );
+        assert_eq!(
+            runtime.world().get::<WaitingForChildren>(parent.entity()),
+            Some(&WaitingForChildren)
+        );
+
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: parent_request.operation,
+                generation: parent_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "parent output".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(matches!(
+            runtime.world().get::<RunState>(parent.entity()),
+            Some(RunState::WaitingModel { .. })
+        ));
+        assert!(matches!(
+            runtime
+                .world()
+                .get::<OperationState>(parent_request.operation),
+            Some(OperationState {
+                phase: OperationPhase::Settled(_),
+                ..
+            })
+        ));
 
         runtime
             .effects()
@@ -12642,6 +12807,10 @@ mod tests {
                 .transcript
                 .iter()
                 .any(|entry| matches!(entry, TranscriptEntry::ChildResult { .. }))
+        );
+        assert_eq!(
+            runtime.world().get::<WaitingForChildren>(parent.entity()),
+            Some(&WaitingForChildren)
         );
 
         runtime
@@ -12671,6 +12840,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(results, vec!["first output", "second output"]);
+        assert!(
+            runtime
+                .world()
+                .get::<WaitingForChildren>(parent.entity())
+                .is_none()
+        );
+        assert!(matches!(
+            runtime.world().get::<RunState>(parent.entity()),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "parent output"
+        ));
     }
 
     #[test]
@@ -13361,6 +13540,22 @@ mod tests {
             installed.observe_run(&mut world, run).unwrap(),
             Some(RunState::Completed(RunOutput { text, .. })) if text == "embedded result"
         ));
+    }
+
+    #[test]
+    fn rig_schedule_has_no_mandatory_system_ambiguities() {
+        let mut runtime = runtime();
+        runtime
+            .world_mut()
+            .schedule_scope(RigSchedule, |world, schedule| {
+                schedule
+                    .initialize(world)
+                    .expect("the core schedule must build without mandatory ambiguities");
+                assert!(
+                    schedule.graph().conflicting_systems().is_empty(),
+                    "every conflicting core system pair must have explicit ordering"
+                );
+            });
     }
 
     #[test]
@@ -14104,11 +14299,15 @@ mod tests {
             restored.world().get::<ParentRun>(second.entity()),
             Some(&ParentRun(parent.entity()))
         );
+        assert_eq!(
+            restored.world().get::<WaitingForChildren>(parent.entity()),
+            Some(&WaitingForChildren)
+        );
         for run in [parent, first, second] {
             restored.handle().resume(run).unwrap();
         }
         restored.run_until_stalled().unwrap();
-        let requests = (0..3)
+        let requests = (0..2)
             .map(|_| restored.effects().try_recv().unwrap().unwrap())
             .collect::<Vec<_>>();
         let operation_for = |run: RunHandle| match restored.world().get::<RunState>(run.entity()) {
@@ -14117,7 +14316,6 @@ mod tests {
         };
         let first_operation = operation_for(first).unwrap();
         let second_operation = operation_for(second).unwrap();
-        let parent_operation = operation_for(parent).unwrap();
         let find_request = |operation| {
             requests
                 .iter()
@@ -14157,7 +14355,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(child_results, vec!["first output", "second output"]);
-        let parent_request = find_request(parent_operation);
+        assert!(
+            restored
+                .world()
+                .get::<WaitingForChildren>(parent.entity())
+                .is_none()
+        );
+        let parent_request = restored.effects().try_recv().unwrap().unwrap();
         restored
             .effects()
             .completion_sender()

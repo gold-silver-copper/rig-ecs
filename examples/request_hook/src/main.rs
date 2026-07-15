@@ -1,6 +1,6 @@
 //! Demonstrates ECS-native request policy and configuration.
 //!
-//! Policy is data on an entity interpreted in `RigSet::Policy`; request
+//! Policy is data on an entity interpreted at `RigSet::InvokeRequestPolicy`; request
 //! transformation is ordinary agent component configuration snapshotted by
 //! preparation. No callback stack sits outside the schedule.
 
