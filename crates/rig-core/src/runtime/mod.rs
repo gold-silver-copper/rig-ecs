@@ -251,6 +251,23 @@ pub struct RunOf(pub Entity);
 #[relationship_target(relationship = RunOf)]
 pub struct AgentRuns(Vec<Entity>);
 
+/// Relationship from a delegated child run to its parent run.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+#[relationship(relationship_target = ChildRuns)]
+pub struct ParentRun(pub Entity);
+
+/// Child runs delegated by a parent run.
+#[derive(Component, Debug)]
+#[relationship_target(relationship = ParentRun)]
+pub struct ChildRuns(Vec<Entity>);
+
+/// Deterministic creation order for child-result reduction.
+#[derive(Component, Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ChildOrdinal(pub u64);
+
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct ChildResultCommitted;
+
 /// Relationship from a committed turn to its run.
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
 #[relationship(relationship_target = RunTurns)]
@@ -391,6 +408,7 @@ pub struct StoreGrant {
 
 /// Ordered ECS policy instance.
 #[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[component(immutable)]
 pub struct Policy {
     /// Explicit composition order. Stable ID breaks ties.
     pub order: u32,
@@ -407,26 +425,791 @@ pub enum PolicyRule {
     Allow,
     /// Deny prompts containing this substring.
     DenyPromptContains(String),
+    /// Apply a non-sticky patch to each newly prepared model request.
+    PatchRequest(RequestPatch),
+    /// Replace arguments for matching tool calls before dispatch.
+    RewriteToolArguments {
+        /// Optional tool name; `None` applies to every advertised tool.
+        tool: Option<String>,
+        /// Replacement JSON arguments.
+        arguments: serde_json::Value,
+    },
+    /// Skip matching tool calls and return synthetic feedback to the model.
+    SkipToolCall {
+        /// Optional tool name; `None` applies to every advertised tool.
+        tool: Option<String>,
+        /// Model-visible feedback.
+        reason: String,
+    },
+    /// Repair an invalid model-emitted tool name.
+    RepairInvalidTool {
+        /// Optional emitted name; `None` matches every invalid call.
+        from: Option<String>,
+        /// Replacement name resolved against the immutable advertised snapshot.
+        to: String,
+    },
+    /// Retry the model after an invalid tool call.
+    RetryInvalidTool {
+        /// Optional emitted name; `None` matches every invalid call.
+        tool: Option<String>,
+        /// Corrective feedback returned as a synthetic result.
+        feedback: String,
+    },
+    /// Treat an invalid tool call as skipped.
+    SkipInvalidTool {
+        /// Optional emitted name; `None` matches every invalid call.
+        tool: Option<String>,
+        /// Model-visible feedback.
+        reason: String,
+    },
+    /// Rewrite only the model-visible presentation of matching tool results.
+    RewriteToolResult {
+        /// Optional tool name; `None` applies to every result.
+        tool: Option<String>,
+        /// Replacement model-visible presentation.
+        presentation: String,
+    },
+    /// Stop a run after a matching tool result settles but before commit.
+    StopToolResult {
+        /// Optional tool name; `None` applies to every result.
+        tool: Option<String>,
+        /// Audit-only stop reason.
+        reason: String,
+    },
+    /// Replace normalized completion text before the model turn commits.
+    RewriteCompletionText {
+        /// Replacement canonical text.
+        text: String,
+    },
+    /// Stop when normalized completion text contains a substring.
+    StopCompletionContains {
+        /// Substring matched against normalized completion text.
+        needle: String,
+        /// Audit-only stop reason.
+        reason: String,
+    },
+    /// Stop a streaming run when a text delta contains a substring.
+    StopTextDeltaContains {
+        /// Substring matched against the new delta.
+        needle: String,
+        /// Audit-only stop reason.
+        reason: String,
+    },
+    /// Await an external approval operation at one lifecycle point.
+    RequireApproval {
+        /// Lifecycle point whose progression is suspended.
+        point: PolicyPoint,
+        /// Owned prompt sent to the approval executor.
+        prompt: String,
+    },
+    /// Delegate one lifecycle point to an entity-targeted observer.
+    ///
+    /// Runtime-only observers must be rebound after restoring a domain snapshot.
+    Custom(PolicyPoint),
+}
+
+/// Lifecycle point governed by a custom policy entity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PolicyPoint {
+    /// Before a model request is dispatched.
+    Request,
+    /// Before one tool call is dispatched.
+    ToolCall,
+    /// When a model emits a tool call outside its immutable snapshot.
+    InvalidToolCall,
+    /// After tool execution and before transcript commit.
+    ToolResult,
+    /// After a model response settles and before turn commit.
+    CompletionResponse,
+    /// Before an accepted text delta is published to subscribers.
+    TextDelta,
+}
+
+impl PolicyRule {
+    fn applies_to(&self, point: PolicyPoint) -> bool {
+        match self {
+            Self::Allow | Self::DenyPromptContains(_) | Self::PatchRequest(_) => {
+                point == PolicyPoint::Request
+            }
+            Self::RewriteToolArguments { .. } | Self::SkipToolCall { .. } => {
+                point == PolicyPoint::ToolCall
+            }
+            Self::RepairInvalidTool { .. }
+            | Self::RetryInvalidTool { .. }
+            | Self::SkipInvalidTool { .. } => point == PolicyPoint::InvalidToolCall,
+            Self::RewriteToolResult { .. } | Self::StopToolResult { .. } => {
+                point == PolicyPoint::ToolResult
+            }
+            Self::RewriteCompletionText { .. } | Self::StopCompletionContains { .. } => {
+                point == PolicyPoint::CompletionResponse
+            }
+            Self::StopTextDeltaContains { .. } => point == PolicyPoint::TextDelta,
+            Self::RequireApproval {
+                point: approval_point,
+                ..
+            } => *approval_point == point,
+            Self::Custom(custom) => *custom == point,
+        }
+    }
+}
+
+/// Non-sticky changes contributed by one request policy.
+///
+/// Patches are reduced in accepted policy order. Context is appended,
+/// provider parameters are shallow-merged, tool allow-lists are intersected,
+/// and scalar/history values use last-writer-wins semantics. The result is
+/// applied only to the operation being evaluated.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RequestPatch {
+    /// Replacement instructions for this request.
+    pub instructions: Option<String>,
+    /// Sampling temperature encoded as IEEE-754 bits.
+    pub temperature_bits: Option<u64>,
+    /// Replacement output-token limit.
+    pub max_tokens: Option<u64>,
+    /// Replacement tool-selection behavior.
+    pub tool_choice: Option<ModelToolChoice>,
+    /// Allow-list intersected with the snapshotted tools.
+    pub active_tools: Option<Vec<String>>,
+    /// Provider-specific top-level parameters.
+    pub additional_params: Option<serde_json::Value>,
+    /// Context documents appended to the request.
+    pub extra_context: Vec<RetrievedDocument>,
+    /// Replacement canonical history.
+    pub history: Option<Vec<TranscriptEntry>>,
+}
+
+impl RequestPatch {
+    /// Creates an empty patch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces instructions for this operation.
+    pub fn instructions(mut self, value: impl Into<String>) -> Self {
+        self.instructions = Some(value.into());
+        self
+    }
+
+    /// Sets the sampling temperature for this operation.
+    pub fn temperature(mut self, value: f64) -> Self {
+        self.temperature_bits = Some(value.to_bits());
+        self
+    }
+
+    /// Sets the output-token limit for this operation.
+    pub fn max_tokens(mut self, value: u64) -> Self {
+        self.max_tokens = Some(value);
+        self
+    }
+
+    /// Replaces the tool-selection behavior for this operation.
+    pub fn tool_choice(mut self, value: ModelToolChoice) -> Self {
+        self.tool_choice = Some(value);
+        self
+    }
+
+    /// Narrows the tools advertised for this operation.
+    pub fn active_tools<I, S>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.active_tools = Some(values.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Applies provider-specific request parameters.
+    pub fn additional_params(mut self, value: serde_json::Value) -> Self {
+        self.additional_params = Some(value);
+        self
+    }
+
+    /// Appends request-local context documents.
+    pub fn extra_context<I>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = RetrievedDocument>,
+    {
+        self.extra_context.extend(values);
+        self
+    }
+
+    /// Replaces canonical history for this operation.
+    pub fn history<I>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = TranscriptEntry>,
+    {
+        self.history = Some(values.into_iter().collect());
+        self
+    }
+}
+
+/// Typed result returned by a request-policy observer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestPolicyDecision {
+    /// Accept the current effective request unchanged.
+    Continue,
+    /// Merge a non-sticky patch into the effective request.
+    Patch(RequestPatch),
+    /// Fail the run before model dispatch.
+    Stop(String),
+    /// Suspend evaluation on an external approval operation.
+    AwaitApproval(String),
+}
+
+/// Entity-targeted invocation of exactly one policy in deterministic order.
+///
+/// Steering observers set [`Self::decision`]. Audit observers should instead
+/// consume the observation events published after reduction.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct RequestPolicyInvocation {
+    /// Policy entity targeted by this invocation.
+    #[event_target]
+    pub policy: Entity,
+    /// Durable evaluation entity owning the cursor and effective request.
+    pub evaluation: Entity,
+    /// Run being evaluated.
+    pub run: Entity,
+    /// Model operation awaiting a finalized request.
+    pub operation: Entity,
+    /// Current effective request, including all earlier rewrites.
+    pub request: ModelEffectInput,
+    /// Decision written by the policy's single steering observer.
+    pub decision: Option<RequestPolicyDecision>,
+}
+
+/// Observe-only notification emitted immediately before a request policy runs.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct RequestPolicyInvoked {
+    /// Policy entity targeted by the core evaluator.
+    #[event_target]
+    pub policy: Entity,
+    /// Durable evaluation identity.
+    pub evaluation: Entity,
+    /// Stable policy identity.
+    pub policy_id: StableId,
+    /// Exact snapshotted revision.
+    pub revision: u64,
+    /// Deterministic cursor position.
+    pub cursor: usize,
+}
+
+/// Observe-only notification emitted after a request decision is reduced.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct RequestPolicyDecided {
+    /// Policy entity whose decision was reduced.
+    #[event_target]
+    pub policy: Entity,
+    /// Durable evaluation identity.
+    pub evaluation: Entity,
+    /// Stable policy identity.
+    pub policy_id: StableId,
+    /// Exact snapshotted revision.
+    pub revision: u64,
+    /// Decision recorded by the evaluator, or `None` when no responder existed.
+    pub decision: Option<RequestPolicyDecision>,
 }
 
 /// Immutable record of the ordered policy instances applied to an operation.
 #[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
 pub struct AcceptedPolicies(pub Vec<AcceptedPolicy>);
+
+/// Immutable tool-call policy snapshot accepted for one operation.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
+pub struct AcceptedToolCallPolicies(pub Vec<AcceptedPolicy>);
+
+/// Immutable invalid-call policy snapshot accepted for one operation.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
+pub struct AcceptedInvalidToolCallPolicies(pub Vec<AcceptedPolicy>);
 
 /// One accepted policy revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcceptedPolicy {
     /// Persistent policy identity.
     pub id: StableId,
+    /// Runtime-local policy identity retained for correlation.
+    pub entity: Entity,
     /// Exact revision applied.
     pub revision: u64,
 }
 
+/// Relationship from a durable policy evaluation to its operation.
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
-enum PolicyStatus {
-    Pending,
+#[relationship(relationship_target = OperationPolicyEvaluations)]
+pub struct EvaluationOfOperation(pub Entity);
+
+/// Policy evaluations retained by an operation for audit and resumption.
+#[derive(Component, Debug)]
+#[relationship_target(relationship = EvaluationOfOperation)]
+pub struct OperationPolicyEvaluations(Vec<Entity>);
+
+/// Relationship from an asynchronous approval operation to its evaluation.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+#[relationship(relationship_target = EvaluationApprovalOperations)]
+pub struct ApprovalForEvaluation(pub Entity);
+
+/// Approval operations retained by a durable policy evaluation.
+#[derive(Component, Debug)]
+#[relationship_target(relationship = ApprovalForEvaluation)]
+pub struct EvaluationApprovalOperations(Vec<Entity>);
+
+/// Authoritative phase of a request policy evaluation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestPolicyEvaluationPhase {
+    /// The policy at `cursor` is ready to be invoked.
+    Evaluating,
+    /// Waiting for a correlated approval operation.
+    WaitingApproval { operation: Entity, policy: StableId },
+    /// Every snapshotted policy accepted the effective request.
     Accepted,
+    /// A policy stopped the run.
+    Rejected { policy: StableId, reason: String },
 }
+
+/// Durable ordered request-policy state.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct RequestPolicyEvaluation {
+    /// Run whose operation is being evaluated.
+    pub run: Entity,
+    /// Deterministically sorted immutable policy snapshot.
+    pub policies: Vec<AcceptedPolicy>,
+    /// Index of the next policy to invoke.
+    pub cursor: usize,
+    /// Effective request visible to the next policy.
+    pub effective: ModelEffectInput,
+    /// Authoritative evaluation phase.
+    pub phase: RequestPolicyEvaluationPhase,
+}
+
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+struct PendingModelRequest(ModelEffectInput);
+
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct RequestPolicyInitialized;
+
+/// Typed result returned by a tool-call policy observer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolCallPolicyDecision {
+    /// Execute with the current effective arguments.
+    Run,
+    /// Replace arguments before later policies inspect the call.
+    Rewrite(serde_json::Value),
+    /// Do not execute and return model-visible feedback.
+    Skip(String),
+    /// Stop the complete run before dispatch.
+    Stop(String),
+    /// Suspend evaluation on an external approval operation.
+    AwaitApproval(String),
+}
+
+/// Entity-targeted invocation for one tool call and one policy.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ToolCallPolicyInvocation {
+    /// Policy entity targeted by the core evaluator.
+    #[event_target]
+    pub policy: Entity,
+    /// Durable evaluation identity.
+    pub evaluation: Entity,
+    /// Run containing the logical tool batch.
+    pub run: Entity,
+    /// Tool operation awaiting finalized arguments.
+    pub operation: Entity,
+    /// Effective call including all earlier rewrites.
+    pub call: ToolEffectInput,
+    /// Decision written by the policy's steering observer.
+    pub decision: Option<ToolCallPolicyDecision>,
+}
+
+/// Authoritative phase of a tool-call policy evaluation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolCallPolicyEvaluationPhase {
+    /// The policy at `cursor` is ready to run.
+    Evaluating,
+    /// Waiting for a correlated approval operation.
+    WaitingApproval { operation: Entity, policy: StableId },
+    /// The call is accepted for dispatch.
+    Accepted,
+    /// Execution is skipped with synthetic feedback.
+    Skipped(String),
+    /// The run was stopped by policy.
+    Rejected { policy: StableId, reason: String },
+}
+
+/// Durable ordered tool-call policy state.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct ToolCallPolicyEvaluation {
+    /// Run containing the operation.
+    pub run: Entity,
+    /// Deterministically sorted immutable policy snapshot.
+    pub policies: Vec<AcceptedPolicy>,
+    /// Index of the next policy to invoke.
+    pub cursor: usize,
+    /// Effective call visible to the next policy.
+    pub effective: ToolEffectInput,
+    /// Authoritative evaluation phase.
+    pub phase: ToolCallPolicyEvaluationPhase,
+}
+
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+struct PendingToolCall(ToolEffectInput);
+
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct ToolCallPolicyInitialized;
+
+/// Typed resolution for a model-emitted call outside its tool snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvalidToolCallPolicyDecision {
+    /// This policy does not resolve the call; continue ordered evaluation.
+    Continue,
+    /// Preserve fail-fast behavior.
+    Fail,
+    /// Return corrective feedback and retry the model.
+    Retry(String),
+    /// Replace the emitted name with a snapshotted tool name.
+    Repair(String),
+    /// Return synthetic feedback without executing a tool.
+    Skip(String),
+    /// Stop the complete run.
+    Stop(String),
+    /// Suspend evaluation on an external approval operation.
+    AwaitApproval(String),
+}
+
+/// Immutable invalid-call context retained while policy resolution proceeds.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct PendingInvalidToolCall {
+    /// Model-emitted call.
+    pub call: ModelToolCall,
+    /// Exact tools advertised on the producing model operation.
+    pub available_tools: Vec<ToolDecision>,
+    /// Explicit position in the logical batch.
+    pub index: u32,
+}
+
+/// Entity-targeted invocation for one invalid call and one policy.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct InvalidToolCallPolicyInvocation {
+    /// Policy entity targeted by the core evaluator.
+    #[event_target]
+    pub policy: Entity,
+    /// Durable evaluation identity.
+    pub evaluation: Entity,
+    /// Run containing the invalid call.
+    pub run: Entity,
+    /// Operation retaining the invalid-call context.
+    pub operation: Entity,
+    /// Immutable invalid-call context.
+    pub invalid: PendingInvalidToolCall,
+    /// Decision written by the policy's steering observer.
+    pub decision: Option<InvalidToolCallPolicyDecision>,
+}
+
+/// Authoritative invalid-call evaluation phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvalidToolCallPolicyEvaluationPhase {
+    /// The policy at `cursor` is ready to run.
+    Evaluating,
+    /// Waiting for a correlated approval operation.
+    WaitingApproval { operation: Entity, policy: StableId },
+    /// The call was resolved to a real or synthetic result.
+    Resolved,
+    /// No policy resolved the call or one explicitly failed it.
+    Failed,
+    /// A policy stopped the run.
+    Rejected { policy: StableId, reason: String },
+}
+
+/// Durable ordered invalid-call resolution state.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct InvalidToolCallPolicyEvaluation {
+    /// Run containing the operation.
+    pub run: Entity,
+    /// Deterministically sorted immutable policy snapshot.
+    pub policies: Vec<AcceptedPolicy>,
+    /// Index of the next policy to invoke.
+    pub cursor: usize,
+    /// Immutable invalid-call context.
+    pub invalid: PendingInvalidToolCall,
+    /// Authoritative evaluation phase.
+    pub phase: InvalidToolCallPolicyEvaluationPhase,
+}
+
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct InvalidToolCallPolicyInitialized;
+
+enum PreparedToolOperation {
+    Valid(ToolEffectInput),
+    Invalid(PendingInvalidToolCall),
+}
+
+/// Typed result returned by a tool-result policy observer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolResultPolicyDecision {
+    /// Preserve the current effective presentation.
+    Keep,
+    /// Replace only the model-visible presentation.
+    Rewrite(String),
+    /// Stop the run without publishing raw result content.
+    Stop(String),
+    /// Suspend evaluation on an external approval operation.
+    AwaitApproval(String),
+}
+
+/// Entity-targeted invocation for one settled tool result and one policy.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ToolResultPolicyInvocation {
+    /// Policy entity targeted by the core evaluator.
+    #[event_target]
+    pub policy: Entity,
+    /// Durable evaluation identity.
+    pub evaluation: Entity,
+    /// Run containing the result.
+    pub run: Entity,
+    /// Settled tool operation.
+    pub operation: Entity,
+    /// Exact input used by execution.
+    pub input: ToolEffectInput,
+    /// Immutable raw result and current effective presentation.
+    pub result: ToolEffectOutput,
+    /// Decision written by the policy's steering observer.
+    pub decision: Option<ToolResultPolicyDecision>,
+}
+
+/// Authoritative tool-result evaluation phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolResultPolicyEvaluationPhase {
+    /// The policy at `cursor` is ready to run.
+    Evaluating,
+    /// Waiting for a correlated approval operation.
+    WaitingApproval { operation: Entity, policy: StableId },
+    /// The effective presentation is accepted for commit.
+    Accepted,
+    /// A policy stopped the run.
+    Rejected { policy: StableId, reason: String },
+}
+
+/// Durable ordered tool-result policy state.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct ToolResultPolicyEvaluation {
+    /// Run containing the operation.
+    pub run: Entity,
+    /// Deterministically sorted immutable policy snapshot.
+    pub policies: Vec<AcceptedPolicy>,
+    /// Index of the next policy to invoke.
+    pub cursor: usize,
+    /// Exact executed input.
+    pub input: ToolEffectInput,
+    /// Raw result plus current effective presentation.
+    pub effective: ToolEffectOutput,
+    /// Authoritative evaluation phase.
+    pub phase: ToolResultPolicyEvaluationPhase,
+}
+
+/// Immutable tool-result policy snapshot accepted for one operation.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
+pub struct AcceptedToolResultPolicies(pub Vec<AcceptedPolicy>);
+
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct ToolResultPolicyInitialized;
+
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+struct EffectiveToolOutput(ToolEffectOutput);
+
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct ToolResultPolicyDone;
+
+/// Typed result returned by a completion-response policy observer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompletionResponsePolicyDecision {
+    /// Accept the current normalized response.
+    Continue,
+    /// Replace normalized text before later policies and commit.
+    RewriteText(String),
+    /// Stop the run before committing the model turn.
+    Stop(String),
+    /// Suspend evaluation on an external approval operation.
+    AwaitApproval(String),
+}
+
+/// Entity-targeted invocation for one settled model response and one policy.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct CompletionResponsePolicyInvocation {
+    /// Policy entity targeted by the core evaluator.
+    #[event_target]
+    pub policy: Entity,
+    /// Durable evaluation identity.
+    pub evaluation: Entity,
+    /// Run containing the model operation.
+    pub run: Entity,
+    /// Settled model operation.
+    pub operation: Entity,
+    /// Exact request sent to the provider.
+    pub request: ModelEffectInput,
+    /// Current normalized response, including earlier rewrites.
+    pub response: ModelEffectOutput,
+    /// Decision written by the policy's steering observer.
+    pub decision: Option<CompletionResponsePolicyDecision>,
+}
+
+/// Authoritative completion-response evaluation phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompletionResponsePolicyEvaluationPhase {
+    /// The policy at `cursor` is ready to run.
+    Evaluating,
+    /// Waiting for a correlated approval operation.
+    WaitingApproval { operation: Entity, policy: StableId },
+    /// The effective response is accepted for commit.
+    Accepted,
+    /// A policy stopped the run.
+    Rejected { policy: StableId, reason: String },
+}
+
+/// Durable ordered completion-response policy state.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct CompletionResponsePolicyEvaluation {
+    /// Run containing the operation.
+    pub run: Entity,
+    /// Deterministically sorted immutable policy snapshot.
+    pub policies: Vec<AcceptedPolicy>,
+    /// Index of the next policy to invoke.
+    pub cursor: usize,
+    /// Exact dispatched request.
+    pub request: ModelEffectInput,
+    /// Effective normalized response.
+    pub effective: ModelEffectOutput,
+    /// Authoritative evaluation phase.
+    pub phase: CompletionResponsePolicyEvaluationPhase,
+}
+
+/// Immutable completion-response policy snapshot accepted for one operation.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
+pub struct AcceptedCompletionResponsePolicies(pub Vec<AcceptedPolicy>);
+
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletionResponsePolicyInitialized;
+
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+struct EffectiveModelOutput(ModelEffectOutput);
+
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletionResponsePolicyDone;
+
+/// Observe-only event emitted after a model turn commits on either surface.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ModelTurnFinished {
+    /// Run receiving the committed turn.
+    #[event_target]
+    pub run: Entity,
+    /// Model operation that produced the turn.
+    pub operation: Entity,
+    /// Zero-based committed turn index.
+    pub turn: u32,
+    /// Canonical committed output.
+    pub output: ModelEffectOutput,
+    /// Request-policy revisions accepted for the operation.
+    pub request_policies: Vec<AcceptedPolicy>,
+    /// Response-policy revisions accepted for the operation.
+    pub response_policies: Vec<AcceptedPolicy>,
+}
+
+/// Observe-only event emitted when a terminal child result commits to its parent.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct ChildRunFinished {
+    /// Parent run receiving the result.
+    #[event_target]
+    pub parent: Entity,
+    /// Terminal child run.
+    pub child: Entity,
+    /// Stable child identity.
+    pub child_id: StableId,
+    /// Deterministic creation ordinal.
+    pub ordinal: u64,
+    /// Terminal child outcome.
+    pub result: Result<String, String>,
+}
+
+/// Typed steering result for a streaming text delta.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextDeltaPolicyDecision {
+    /// Publish the accepted delta.
+    Continue,
+    /// Stop the run before publishing this delta.
+    Stop(String),
+    /// Suspend evaluation on an external approval operation.
+    AwaitApproval(String),
+}
+
+/// Entity-targeted invocation for one accepted, not-yet-published text delta.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct TextDeltaPolicyInvocation {
+    /// Policy entity targeted by the core evaluator.
+    #[event_target]
+    pub policy: Entity,
+    /// Durable delta evaluation identity.
+    pub evaluation: Entity,
+    /// Run receiving the stream.
+    pub run: Entity,
+    /// Model operation producing the stream.
+    pub operation: Entity,
+    /// Committed model-call index at ingress time.
+    pub turn: u32,
+    /// Monotonic operation-local sequence.
+    pub sequence: u64,
+    /// Newly accepted text.
+    pub delta: String,
+    /// Authoritative aggregate including this delta.
+    pub aggregated: String,
+    /// Decision written by the policy's steering observer.
+    pub decision: Option<TextDeltaPolicyDecision>,
+}
+
+/// Authoritative text-delta evaluation phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextDeltaPolicyEvaluationPhase {
+    /// The policy at `cursor` is ready to run.
+    Evaluating,
+    /// Waiting for a correlated approval operation.
+    WaitingApproval { operation: Entity, policy: StableId },
+    /// The delta was published once.
+    Published,
+    /// A policy stopped the run.
+    Rejected { policy: StableId, reason: String },
+}
+
+/// Durable ordered stream-delta policy state.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct TextDeltaPolicyEvaluation {
+    /// Run receiving the delta.
+    pub run: Entity,
+    /// Producing model operation.
+    pub operation: Entity,
+    /// Deterministically sorted immutable policy snapshot.
+    pub policies: Vec<AcceptedPolicy>,
+    /// Index of the next policy to invoke.
+    pub cursor: usize,
+    /// Committed model-call index at ingress time.
+    pub turn: u32,
+    /// Operation-local sequence.
+    pub sequence: u64,
+    /// New text.
+    pub delta: String,
+    /// Aggregate including the new text.
+    pub aggregated: String,
+    /// Authoritative evaluation phase.
+    pub phase: TextDeltaPolicyEvaluationPhase,
+}
+
+/// Immutable text-delta policy snapshot accepted for one delta.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
+pub struct AcceptedTextDeltaPolicies(pub Vec<AcceptedPolicy>);
 
 /// Authoritative run phase and outcome.
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
@@ -447,8 +1230,43 @@ pub enum RunState {
     Cancelled,
 }
 
+/// Explicit semantics for suspending a run.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PauseMode {
+    /// Stop new dispatch, allow in-flight work to settle and commit to a safe boundary.
+    Drain,
+    /// Retain validated completions but defer policy evaluation and commit until resume.
+    FreezeAfterIngress,
+    /// Cancel in-flight effects and retain a redispatchable prepared checkpoint.
+    CancelAndSuspend,
+}
+
+/// Authoritative run-local control orthogonal to [`RunState`].
+#[derive(Component, Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RunControl {
+    /// Normal progression is eligible.
+    #[default]
+    Running,
+    /// A suspension transition is being reconciled.
+    PauseRequested(PauseMode),
+    /// Progression is suspended while ingress and maintenance remain active.
+    Paused(PauseMode),
+}
+
+/// Admission and bulk-control policy for an agent definition.
+#[derive(Component, Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AgentControl {
+    /// Admit new runs and leave existing runs unchanged.
+    #[default]
+    Running,
+    /// Reject new runs while existing runs continue.
+    RejectNewRuns,
+    /// Reject new runs and request this pause mode for active runs.
+    PauseExistingRuns(PauseMode),
+}
+
 /// A run's authoritative input and committed transcript.
-#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunRecord {
     /// Canonical serialized user message accepted for this run.
     pub prompt: serde_json::Value,
@@ -483,7 +1301,7 @@ pub struct RunRecord {
 }
 
 /// Canonical transcript entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TranscriptEntry {
     /// Original user input.
     User(String),
@@ -520,10 +1338,19 @@ pub enum TranscriptEntry {
         /// Presentation returned to the next model call.
         content: String,
     },
+    /// Deterministically reduced terminal child-run outcome.
+    ChildResult {
+        /// Creation ordinal independent of completion order.
+        ordinal: u64,
+        /// Stable child run identity.
+        run_id: StableId,
+        /// Terminal output or canonical terminal error text.
+        result: Result<String, String>,
+    },
 }
 
 /// Terminal run output.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunOutput {
     /// Final model text.
     pub text: String,
@@ -532,7 +1359,7 @@ pub struct RunOutput {
 }
 
 /// Canonical token usage.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Usage {
     /// Input tokens.
     pub input_tokens: u64,
@@ -540,10 +1367,15 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+fn placeholder_entity() -> Entity {
+    Entity::PLACEHOLDER
+}
+
 /// Immutable decision accepted before model dispatch.
-#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelDecision {
     /// Entity identity is retained for in-memory correlation.
+    #[serde(skip, default = "placeholder_entity")]
     pub model_entity: Entity,
     /// Stable identity is retained for audit and persistence.
     pub model_id: StableId,
@@ -558,9 +1390,10 @@ pub struct ModelDecision {
 }
 
 /// Exact tool capability advertised and retained for one model operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolDecision {
     /// In-memory capability identity.
+    #[serde(skip, default = "placeholder_entity")]
     pub tool_entity: Entity,
     /// Stable capability identity.
     pub tool_id: StableId,
@@ -577,9 +1410,10 @@ pub struct ToolDecision {
 }
 
 /// Exact store capability accepted for a run.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StoreDecision {
     /// In-memory store identity.
+    #[serde(skip, default = "placeholder_entity")]
     pub store_entity: Entity,
     /// Persistent store identity.
     pub store_id: StableId,
@@ -592,7 +1426,7 @@ pub struct StoreDecision {
 }
 
 /// Authoritative lifecycle of an external operation.
-#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OperationState {
     /// Incremented whenever a logical operation is superseded or retried.
     pub generation: u64,
@@ -606,7 +1440,7 @@ struct EffectDeadline {
 }
 
 /// Mutually exclusive operation state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 // Schedules move outcomes between phases once; boxing would add an allocation
 // to every completed effect solely to reduce the enum's stack footprint.
 #[allow(clippy::large_enum_variant)]
@@ -624,7 +1458,7 @@ pub enum OperationPhase {
 }
 
 /// Canonical terminal operation outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum OperationOutcome {
     /// Successful typed effect output.
     Success(EffectOutput),
@@ -633,7 +1467,7 @@ pub enum OperationOutcome {
 }
 
 /// Canonical error safe for policy, telemetry, and persistence.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Error, Eq, PartialEq, Serialize)]
 pub enum CanonicalError {
     /// Referenced entity was absent or stale.
     #[error("stale entity reference: {0}")]
@@ -703,6 +1537,9 @@ pub enum CanonicalError {
         /// Persistent policy identity.
         policy: String,
     },
+    /// Agent admission control rejected a newly submitted run.
+    #[error("agent is not accepting new runs")]
+    AgentAdmissionDenied,
     /// Model requested a tool that was not in its immutable snapshot.
     #[error("unknown or unavailable tool `{0}`")]
     UnknownTool(String),
@@ -742,14 +1579,20 @@ impl EffectRequest {
     pub fn model_input(&self) -> Option<&ModelEffectInput> {
         match &self.input {
             EffectInput::Model(input) => Some(input),
-            EffectInput::Tool(_) | EffectInput::Discovery(_) | EffectInput::Store(_) => None,
+            EffectInput::Tool(_)
+            | EffectInput::Discovery(_)
+            | EffectInput::Store(_)
+            | EffectInput::PolicyApproval(_) => None,
         }
     }
 
     /// Returns tool input when this is a tool operation.
     pub fn tool_input(&self) -> Option<&ToolEffectInput> {
         match &self.input {
-            EffectInput::Model(_) | EffectInput::Discovery(_) | EffectInput::Store(_) => None,
+            EffectInput::Model(_)
+            | EffectInput::Discovery(_)
+            | EffectInput::Store(_)
+            | EffectInput::PolicyApproval(_) => None,
             EffectInput::Tool(input) => Some(input),
         }
     }
@@ -758,7 +1601,10 @@ impl EffectRequest {
     pub fn discovery_input(&self) -> Option<&DiscoveryEffectInput> {
         match &self.input {
             EffectInput::Discovery(input) => Some(input),
-            EffectInput::Model(_) | EffectInput::Tool(_) | EffectInput::Store(_) => None,
+            EffectInput::Model(_)
+            | EffectInput::Tool(_)
+            | EffectInput::Store(_)
+            | EffectInput::PolicyApproval(_) => None,
         }
     }
 
@@ -766,7 +1612,21 @@ impl EffectRequest {
     pub fn store_input(&self) -> Option<&StoreEffectInput> {
         match &self.input {
             EffectInput::Store(input) => Some(input),
-            EffectInput::Model(_) | EffectInput::Tool(_) | EffectInput::Discovery(_) => None,
+            EffectInput::Model(_)
+            | EffectInput::Tool(_)
+            | EffectInput::Discovery(_)
+            | EffectInput::PolicyApproval(_) => None,
+        }
+    }
+
+    /// Returns an approval input when this is a policy operation.
+    pub fn policy_approval_input(&self) -> Option<&PolicyApprovalEffectInput> {
+        match &self.input {
+            EffectInput::PolicyApproval(input) => Some(input),
+            EffectInput::Model(_)
+            | EffectInput::Tool(_)
+            | EffectInput::Discovery(_)
+            | EffectInput::Store(_) => None,
         }
     }
 }
@@ -783,10 +1643,13 @@ pub enum EffectInput {
     Discovery(DiscoveryEffectInput),
     /// Store/memory operation.
     Store(StoreEffectInput),
+    /// External policy/approval decision.
+    PolicyApproval(PolicyApprovalEffectInput),
 }
 
 /// Fully owned model effect input.
-#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[component(immutable)]
 pub struct ModelEffectInput {
     /// Accepted immutable model decision.
     pub decision: ModelDecision,
@@ -817,7 +1680,8 @@ pub struct ModelEffectInput {
 }
 
 /// Fully owned tool execution input assembled from an immutable decision.
-#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[component(immutable)]
 pub struct ToolEffectInput {
     /// Exact capability accepted before the model call.
     pub decision: ToolDecision,
@@ -849,7 +1713,7 @@ pub struct DiscoveryEffectInput {
 }
 
 /// Fully owned store effect input.
-#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StoreEffectInput {
     /// Exact store decision accepted for this run.
     pub decision: StoreDecision,
@@ -857,8 +1721,21 @@ pub struct StoreEffectInput {
     pub operation: StoreOperation,
 }
 
+/// Fully owned approval request crossing the effect boundary.
+#[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PolicyApprovalEffectInput {
+    /// Stable policy identity.
+    pub policy_id: StableId,
+    /// Exact policy revision snapshotted by the evaluation.
+    pub revision: u64,
+    /// Lifecycle point awaiting approval.
+    pub point: PolicyPoint,
+    /// Owned approver-facing prompt.
+    pub prompt: String,
+}
+
 /// Provider-independent conversation store operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum StoreOperation {
     /// Load committed history before model preparation.
     LoadConversation {
@@ -923,7 +1800,7 @@ enum EffectIngress {
 }
 
 /// Typed provider-independent effect result.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum EffectOutput {
     /// Model operation result.
     Model(ModelEffectOutput),
@@ -933,10 +1810,12 @@ pub enum EffectOutput {
     Discovery(DiscoveryEffectOutput),
     /// Store operation result.
     Store(StoreEffectOutput),
+    /// External approval decision.
+    PolicyApproval(PolicyApprovalEffectOutput),
 }
 
 /// Provider-independent model output.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelEffectOutput {
     /// Complete canonical assistant message, including provider-significant
     /// reasoning and correlation data when available.
@@ -950,7 +1829,7 @@ pub struct ModelEffectOutput {
 }
 
 /// Provider-independent requested tool call.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelToolCall {
     /// Provider correlation identifier.
     pub id: String,
@@ -965,7 +1844,7 @@ pub struct ModelToolCall {
 }
 
 /// Provider-independent tool execution result.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolEffectOutput {
     /// Provider correlation identifier copied from the call.
     pub call_id: String,
@@ -984,7 +1863,7 @@ pub struct ToolEffectOutput {
 }
 
 /// Canonical tool failure metadata retained for policy, telemetry, and audit.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolEffectFailure {
     /// Operator-facing diagnostic, which is never copied into the transcript.
     pub message: String,
@@ -997,14 +1876,14 @@ pub struct ToolEffectFailure {
 }
 
 /// Owned discovery result for one source generation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DiscoveryEffectOutput {
     /// Complete capability set observed for this generation.
     pub tools: Vec<DiscoveredTool>,
 }
 
 /// Provider-independent discovered tool definition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DiscoveredTool {
     /// Stable key within the discovery source.
     pub key: String,
@@ -1021,7 +1900,7 @@ pub struct DiscoveredTool {
 }
 
 /// Provider-independent store result.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum StoreEffectOutput {
     /// Loaded committed conversation history.
     LoadedConversation(Vec<TranscriptEntry>),
@@ -1031,6 +1910,15 @@ pub enum StoreEffectOutput {
     Retrieved(Vec<RetrievedDocument>),
 }
 
+/// Provider-independent approval result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PolicyApprovalEffectOutput {
+    /// Whether progression is approved.
+    pub approved: bool,
+    /// Optional audit explanation.
+    pub reason: Option<String>,
+}
+
 /// Operation kind used to reject type-confused completions.
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
 enum OperationKind {
@@ -1038,10 +1926,14 @@ enum OperationKind {
     Tool,
     Discovery,
     Store,
+    PolicyApproval,
 }
 
 #[derive(Component)]
 struct DiscoveryApplied;
+
+#[derive(Component)]
+struct PolicyApprovalApplied;
 
 /// Authoritative state for an atomic logical tool batch.
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
@@ -1055,10 +1947,12 @@ pub struct ToolBatchState {
 }
 
 /// Ordered delta state owned by a model operation entity.
-#[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Component, Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelStreamState {
     /// Next accepted sequence; duplicates and gaps are rejected.
     pub next_sequence: u64,
+    /// Accepted text accumulated independently of subscriber delivery.
+    pub aggregated_text: String,
 }
 
 /// A committed turn entity.
@@ -1228,9 +2122,21 @@ enum RuntimeCommand {
         max_model_calls: Option<u32>,
         conversation: Option<StableId>,
         subscriber: Option<SyncSender<StreamItem>>,
+        parent: Option<(Entity, u64)>,
     },
     Cancel {
         run: Entity,
+    },
+    PauseRun {
+        run: Entity,
+        mode: PauseMode,
+    },
+    ResumeRun {
+        run: Entity,
+    },
+    SetAgentControl {
+        agent: Entity,
+        control: AgentControl,
     },
     RefreshDiscovery {
         source: Entity,
@@ -1354,6 +2260,7 @@ impl RuntimeHandle {
             max_model_calls: None,
             conversation: None,
             subscriber: None,
+            parent: None,
         })?;
         Ok(PendingRunHandle {
             runtime_id: self.runtime_id,
@@ -1395,6 +2302,7 @@ impl RuntimeHandle {
             max_model_calls,
             conversation,
             subscriber: None,
+            parent: None,
         })?;
         Ok(PendingRunHandle {
             runtime_id: self.runtime_id,
@@ -1423,6 +2331,36 @@ impl RuntimeHandle {
             max_model_calls: None,
             conversation: Some(conversation),
             subscriber: None,
+            parent: None,
+        })?;
+        Ok(PendingRunHandle {
+            runtime_id: self.runtime_id,
+            stable_id: run_id,
+        })
+    }
+
+    /// Delegates a child run while the parent and other runs continue independently.
+    pub fn spawn_child_run(
+        &self,
+        parent: RunHandle,
+        agent: AgentHandle,
+        prompt: impl Into<CompletionMessage>,
+    ) -> Result<PendingRunHandle, SubmitError> {
+        if parent.runtime_id != self.runtime_id || agent.runtime_id != self.runtime_id {
+            return Err(SubmitError::ForeignRuntime);
+        }
+        let sequence = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let run_id = StableId::new(format!("run-{}-{sequence}", self.runtime_id))?;
+        self.submit(RuntimeCommand::Prompt {
+            agent: agent.entity,
+            run_id: run_id.clone(),
+            prompt: prompt_payload(prompt.into())?,
+            history: Vec::new(),
+            output_schema: None,
+            max_model_calls: None,
+            conversation: None,
+            subscriber: None,
+            parent: Some((parent.entity, sequence)),
         })?;
         Ok(PendingRunHandle {
             runtime_id: self.runtime_id,
@@ -1451,6 +2389,7 @@ impl RuntimeHandle {
             max_model_calls: None,
             conversation: None,
             subscriber: Some(sender),
+            parent: None,
         })?;
         Ok((
             PendingRunHandle {
@@ -1499,6 +2438,7 @@ impl RuntimeHandle {
             max_model_calls,
             conversation,
             subscriber: Some(sender),
+            parent: None,
         })?;
         Ok((
             PendingRunHandle {
@@ -1521,6 +2461,59 @@ impl RuntimeHandle {
             return Err(SubmitError::ForeignRuntime);
         }
         self.submit(RuntimeCommand::Cancel { run: run.entity })
+    }
+
+    /// Requests the default drain pause for a known run.
+    pub fn pause(&self, run: RunHandle) -> Result<(), SubmitError> {
+        self.pause_with_mode(run, PauseMode::Drain)
+    }
+
+    /// Requests an explicit suspension behavior for a known run.
+    pub fn pause_with_mode(&self, run: RunHandle, mode: PauseMode) -> Result<(), SubmitError> {
+        if run.runtime_id != self.runtime_id {
+            return Err(SubmitError::ForeignRuntime);
+        }
+        self.submit(RuntimeCommand::PauseRun {
+            run: run.entity,
+            mode,
+        })
+    }
+
+    /// Resumes a suspended run without changing its execution phase.
+    pub fn resume(&self, run: RunHandle) -> Result<(), SubmitError> {
+        if run.runtime_id != self.runtime_id {
+            return Err(SubmitError::ForeignRuntime);
+        }
+        self.submit(RuntimeCommand::ResumeRun { run: run.entity })
+    }
+
+    /// Rejects new runs while allowing existing runs to continue.
+    pub fn reject_new_runs(&self, agent: AgentHandle) -> Result<(), SubmitError> {
+        self.set_agent_control(agent, AgentControl::RejectNewRuns)
+    }
+
+    /// Requests suspension of every active run belonging to an agent.
+    pub fn pause_agent(&self, agent: AgentHandle, mode: PauseMode) -> Result<(), SubmitError> {
+        self.set_agent_control(agent, AgentControl::PauseExistingRuns(mode))
+    }
+
+    /// Reopens admission for an agent; paused runs must be resumed explicitly.
+    pub fn resume_agent(&self, agent: AgentHandle) -> Result<(), SubmitError> {
+        self.set_agent_control(agent, AgentControl::Running)
+    }
+
+    fn set_agent_control(
+        &self,
+        agent: AgentHandle,
+        control: AgentControl,
+    ) -> Result<(), SubmitError> {
+        if agent.runtime_id != self.runtime_id {
+            return Err(SubmitError::ForeignRuntime);
+        }
+        self.submit(RuntimeCommand::SetAgentControl {
+            agent: agent.entity,
+            control,
+        })
     }
 
     /// Requests a new generation of dynamic capability discovery.
@@ -1852,7 +2845,9 @@ impl InstalledRuntime {
         if model_tenant != &tenant {
             return Err(SpawnError::TenantMismatch);
         }
-        let entity = world.spawn((id, tenant, agent, UsesModel(model))).id();
+        let entity = world
+            .spawn((id, tenant, agent, AgentControl::default(), UsesModel(model)))
+            .id();
         Ok(AgentHandle {
             runtime_id: self.handle.runtime_id,
             entity,
@@ -1964,6 +2959,8 @@ pub struct PersistedAgent {
     pub tenant: TenantId,
     /// Canonical agent configuration.
     pub agent: Agent,
+    /// Persisted admission and bulk-control state.
+    pub control: AgentControl,
     /// Stable model identity remapped during loading.
     pub model_id: StableId,
     /// Optional structured-output configuration.
@@ -2108,6 +3105,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
         &StableId,
         &TenantId,
         &Agent,
+        Option<&AgentControl>,
         &UsesModel,
         Option<&OutputRequirement>,
         Option<&RetrievalRequirement>,
@@ -2115,7 +3113,16 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
     let agent_rows = agent_query
         .iter(world)
         .map(
-            |(entity, id, tenant, agent, model, output_requirement, retrieval_requirement)| {
+            |(
+                entity,
+                id,
+                tenant,
+                agent,
+                control,
+                model,
+                output_requirement,
+                retrieval_requirement,
+            )| {
                 let model_id = model_ids
                     .get(&model.get())
                     .cloned()
@@ -2126,6 +3133,7 @@ pub fn snapshot_domain(world: &mut World) -> Result<DomainSnapshot, PersistenceE
                         id: id.clone(),
                         tenant: tenant.clone(),
                         agent: agent.clone(),
+                        control: control.copied().unwrap_or_default(),
                         model_id,
                         output_requirement: output_requirement.cloned(),
                         retrieval_requirement: retrieval_requirement.cloned(),
@@ -2507,6 +3515,7 @@ pub fn restore_domain(
             record.id.clone(),
             record.tenant,
             record.agent,
+            record.control,
             UsesModel(model),
         ));
         if let Some(output_requirement) = record.output_requirement {
@@ -2645,6 +3654,7 @@ pub fn install_runtime_with_waker(
     world.insert_resource(EffectTimeoutTicks(config.effect_timeout_ticks));
     world.insert_resource(waker.clone());
     world.insert_resource(Messages::<EffectIngressMessage>::default());
+    world.add_observer(bind_builtin_policy_observer);
 
     let mut schedule = Schedule::new(RigSchedule);
     schedule.set_build_settings(ScheduleBuildSettings {
@@ -2677,42 +3687,73 @@ pub fn install_runtime_with_waker(
             .in_set(RigSet::Ingest),
     );
     schedule.add_systems(
-        (reconcile_discovery_operations, reconcile_stable_ids)
+        (
+            reconcile_agent_control,
+            reconcile_run_control,
+            reconcile_discovery_operations,
+            reconcile_stable_ids,
+        )
             .chain()
             .in_set(RigSet::Reconcile),
     );
     schedule.add_systems(
-        (prepare_store_operations, prepare_model_operations)
+        (
+            prepare_store_operations,
+            prepare_model_operations,
+            initialize_request_policy_evaluations,
+            initialize_invalid_tool_call_policy_evaluations,
+            initialize_tool_call_policy_evaluations,
+        )
             .chain()
             .in_set(RigSet::Prepare),
     );
-    schedule.add_systems(apply_builtin_policy.in_set(RigSet::Policy));
+    schedule.add_systems(
+        (
+            evaluate_request_policies,
+            evaluate_invalid_tool_call_policies,
+            evaluate_tool_call_policies,
+            evaluate_completion_response_policies,
+            evaluate_tool_result_policies,
+            evaluate_text_delta_policies,
+        )
+            .chain()
+            .in_set(RigSet::Policy),
+    );
     schedule.add_systems(
         (
             dispatch_model_operations,
             dispatch_tool_operations,
             dispatch_discovery_operations,
             dispatch_store_operations,
+            dispatch_policy_approval_operations,
         )
             .chain()
             .in_set(RigSet::Dispatch),
     );
     schedule.add_systems(
-        (apply_effect_ingress, expire_effects)
+        (
+            apply_effect_ingress,
+            apply_policy_approval_results,
+            expire_effects,
+        )
             .chain()
             .in_set(RigSet::Apply),
     );
     schedule.add_systems(
         (
+            initialize_completion_response_policy_evaluations,
+            initialize_tool_result_policy_evaluations,
             commit_store_operations,
             commit_model_operations,
             commit_tool_batches,
+            commit_child_results,
         )
             .chain()
             .in_set(RigSet::Commit),
     );
     schedule.add_systems(
         (
+            propagate_parent_cancellation,
             propagate_cancellation,
             cleanup_observed_runs,
             cleanup_retired_tools,
@@ -2832,7 +3873,10 @@ impl Runtime {
         if model_tenant != &tenant {
             return Err(SpawnError::TenantMismatch);
         }
-        let entity = self.world.spawn((id, tenant, agent, UsesModel(model))).id();
+        let entity = self
+            .world
+            .spawn((id, tenant, agent, AgentControl::default(), UsesModel(model)))
+            .id();
         Ok(AgentHandle {
             runtime_id: self.handle.runtime_id,
             entity,
@@ -3135,6 +4179,17 @@ fn mark_progress(progress: &mut Progress) {
     progress.epoch = progress.epoch.wrapping_add(1);
 }
 
+fn control_allows_internal_progress(control: Option<&RunControl>) -> bool {
+    matches!(
+        control,
+        None | Some(RunControl::Running | RunControl::PauseRequested(PauseMode::Drain))
+    )
+}
+
+fn world_allows_internal_progress(world: &World, run: Entity) -> bool {
+    control_allows_internal_progress(world.get::<RunControl>(run))
+}
+
 fn advance_runtime_clock(mut clock: ResMut<RuntimeClock>) {
     clock.tick = clock.tick.saturating_add(1);
 }
@@ -3146,8 +4201,13 @@ fn ingest_commands(
     mut commands: Commands,
     ingress: Res<CommandIngress>,
     runtime: Res<RuntimeIdentity>,
-    agents: Query<(&TenantId, &Agent)>,
-    mut runs: Query<(&StableId, &mut RunState, &mut RunRecord)>,
+    mut agents: Query<(&TenantId, &Agent, Option<&mut AgentControl>)>,
+    mut runs: Query<(
+        &StableId,
+        &mut RunState,
+        &mut RunRecord,
+        Option<&mut RunControl>,
+    )>,
     mut sources: Query<(&StableId, &TenantId, &mut DiscoverySource)>,
     mut discovery_operations: Query<&mut OperationState, With<DiscoveryEffectInput>>,
     mut progress: ResMut<Progress>,
@@ -3166,6 +4226,7 @@ fn ingest_commands(
                 max_model_calls,
                 conversation,
                 subscriber,
+                parent,
             }) => {
                 let transcript_entry = if prompt.plain_text {
                     TranscriptEntry::User(prompt.text.clone())
@@ -3194,13 +4255,30 @@ fn ingest_commands(
                     retrieved_documents: Vec::new(),
                     pending_output: None,
                 };
-                let run = match agents.get(agent) {
-                    Ok((tenant, _)) => commands
+                let run = match agents.get_mut(agent) {
+                    Ok((tenant, _, control))
+                        if control
+                            .as_deref()
+                            .is_none_or(|control| matches!(control, AgentControl::Running)) =>
+                    {
+                        commands
+                            .spawn((
+                                run_id,
+                                tenant.clone(),
+                                RunOf(agent),
+                                RunState::Queued,
+                                RunControl::Running,
+                                record,
+                            ))
+                            .id()
+                    }
+                    Ok((tenant, _, _)) => commands
                         .spawn((
                             run_id,
                             tenant.clone(),
                             RunOf(agent),
-                            RunState::Queued,
+                            RunState::Failed(CanonicalError::AgentAdmissionDenied),
+                            RunControl::Running,
                             record,
                         ))
                         .id(),
@@ -3208,6 +4286,7 @@ fn ingest_commands(
                         .spawn((
                             run_id,
                             RunState::Failed(CanonicalError::StaleEntity("agent".to_owned())),
+                            RunControl::Running,
                             record,
                         ))
                         .id(),
@@ -3219,13 +4298,60 @@ fn ingest_commands(
                         SubscriptionState::Active,
                     ));
                 }
+                if let Some((parent, ordinal)) = parent {
+                    if runs.get_mut(parent).is_ok() {
+                        commands
+                            .entity(run)
+                            .insert((ParentRun(parent), ChildOrdinal(ordinal)));
+                    } else {
+                        commands
+                            .entity(run)
+                            .insert(RunState::Failed(CanonicalError::StaleEntity(
+                                "parent run".to_owned(),
+                            )));
+                    }
+                }
                 mark_progress(&mut progress);
             }
             Ok(RuntimeCommand::Cancel { run }) => {
-                if let Ok((_, mut state, _)) = runs.get_mut(run)
+                if let Ok((_, mut state, _, _)) = runs.get_mut(run)
                     && !matches!(*state, RunState::Completed(_) | RunState::Failed(_))
                 {
                     *state = RunState::Cancelled;
+                    mark_progress(&mut progress);
+                }
+            }
+            Ok(RuntimeCommand::PauseRun { run, mode }) => {
+                if let Ok((_, state, _, control)) = runs.get_mut(run)
+                    && !matches!(
+                        *state,
+                        RunState::Completed(_) | RunState::Failed(_) | RunState::Cancelled
+                    )
+                    && let Some(mut control) = control
+                {
+                    *control = RunControl::PauseRequested(mode);
+                    mark_progress(&mut progress);
+                }
+            }
+            Ok(RuntimeCommand::ResumeRun { run }) => {
+                if let Ok((_, state, _, control)) = runs.get_mut(run)
+                    && !matches!(
+                        *state,
+                        RunState::Completed(_) | RunState::Failed(_) | RunState::Cancelled
+                    )
+                    && let Some(mut control) = control
+                    && !matches!(*control, RunControl::Running)
+                {
+                    *control = RunControl::Running;
+                    mark_progress(&mut progress);
+                }
+            }
+            Ok(RuntimeCommand::SetAgentControl { agent, control }) => {
+                if let Ok((_, _, existing)) = agents.get_mut(agent)
+                    && let Some(mut existing) = existing
+                    && *existing != control
+                {
+                    *existing = control;
                     mark_progress(&mut progress);
                 }
             }
@@ -3301,6 +4427,94 @@ fn ingest_completions(
     while let Ok(message) = receiver.try_recv() {
         writer.write(EffectIngressMessage(message));
         mark_progress(&mut progress);
+    }
+}
+
+fn reconcile_agent_control(
+    agents: Query<(&AgentControl, Option<&AgentRuns>), Changed<AgentControl>>,
+    mut runs: Query<(&RunState, &mut RunControl)>,
+    mut progress: ResMut<Progress>,
+) {
+    for (agent_control, agent_runs) in &agents {
+        let Some(agent_runs) = agent_runs else {
+            continue;
+        };
+        for run in agent_runs.iter() {
+            let Ok((state, mut run_control)) = runs.get_mut(run) else {
+                continue;
+            };
+            if matches!(
+                state,
+                RunState::Completed(_) | RunState::Failed(_) | RunState::Cancelled
+            ) {
+                continue;
+            }
+            let next = match agent_control {
+                AgentControl::Running => RunControl::Running,
+                AgentControl::RejectNewRuns => continue,
+                AgentControl::PauseExistingRuns(mode) => RunControl::PauseRequested(*mode),
+            };
+            if *run_control != next {
+                *run_control = next;
+                mark_progress(&mut progress);
+            }
+        }
+    }
+}
+
+fn reconcile_run_control(
+    mut commands: Commands,
+    mut runs: Query<(Entity, &mut RunControl, Option<&RunOperations>)>,
+    mut operations: Query<(&mut OperationState, Option<&EffectDeadline>)>,
+    cancellations: Res<CancellationOutbox>,
+    mut progress: ResMut<Progress>,
+) {
+    for (_run, mut control, run_operations) in &mut runs {
+        let RunControl::PauseRequested(mode) = *control else {
+            continue;
+        };
+        let operation_entities = run_operations
+            .map(|operations| operations.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        match mode {
+            PauseMode::FreezeAfterIngress => {
+                *control = RunControl::Paused(mode);
+                mark_progress(&mut progress);
+            }
+            PauseMode::Drain => {
+                let has_in_flight = operation_entities.iter().any(|entity| {
+                    operations
+                        .get(*entity)
+                        .is_ok_and(|(state, _)| matches!(state.phase, OperationPhase::InFlight))
+                });
+                if !has_in_flight {
+                    *control = RunControl::Paused(mode);
+                    mark_progress(&mut progress);
+                }
+            }
+            PauseMode::CancelAndSuspend => {
+                for operation_entity in operation_entities {
+                    let Ok((mut operation, deadline)) = operations.get_mut(operation_entity) else {
+                        continue;
+                    };
+                    if !matches!(operation.phase, OperationPhase::InFlight) {
+                        continue;
+                    }
+                    let generation = operation.generation;
+                    let _ = cancellations.0.try_send(EffectCancellation {
+                        operation: operation_entity,
+                        generation,
+                    });
+                    operation.generation = operation.generation.saturating_add(1);
+                    operation.phase = OperationPhase::Prepared;
+                    if deadline.is_some() {
+                        commands.entity(operation_entity).remove::<EffectDeadline>();
+                    }
+                }
+                *control = RunControl::Paused(mode);
+                mark_progress(&mut progress);
+            }
+        }
     }
 }
 
@@ -3490,10 +4704,16 @@ fn reconcile_stable_ids(world: &mut World) {
     validate_relation!(StoreGrantForStore, StoreCapability, "StoreGrantForStore");
     validate_relation!(DiscoveredFrom, DiscoverySource, "DiscoveredFrom");
     validate_relation!(RunOf, Agent, "RunOf");
+    validate_relation!(ParentRun, RunState, "ParentRun");
     validate_relation!(TurnOf, RunState, "TurnOf");
     validate_relation!(OperationOf, RunState, "OperationOf");
     validate_relation!(BatchOf, RunState, "BatchOf");
     validate_relation!(SubscriptionOf, RunState, "SubscriptionOf");
+    validate_relation!(
+        EvaluationOfOperation,
+        OperationState,
+        "EvaluationOfOperation"
+    );
 
     world.resource_mut::<StableIdIndex>().0 = rebuilt;
     world.resource_mut::<InvariantViolations>().0 = found;
@@ -3501,14 +4721,21 @@ fn reconcile_stable_ids(world: &mut World) {
 
 fn prepare_store_operations(
     mut commands: Commands,
-    mut runs: Query<(Entity, &TenantId, &RunOf, &mut RunRecord, &mut RunState)>,
+    mut runs: Query<(
+        Entity,
+        &TenantId,
+        &RunOf,
+        &RunControl,
+        &mut RunRecord,
+        &mut RunState,
+    )>,
     agents: Query<(Option<&AgentStoreGrants>, Option<&RetrievalRequirement>)>,
     grants: Query<(&StableId, &TenantId, &StoreGrant, &StoreGrantForStore)>,
     stores: Query<(&StableId, &TenantId, &StoreCapability)>,
     mut progress: ResMut<Progress>,
 ) {
-    for (run_entity, run_tenant, run_of, mut record, mut run_state) in &mut runs {
-        if !matches!(*run_state, RunState::Queued) {
+    for (run_entity, run_tenant, run_of, control, mut record, mut run_state) in &mut runs {
+        if !matches!(*control, RunControl::Running) || !matches!(*run_state, RunState::Queued) {
             continue;
         }
         let Ok((agent_grants, retrieval_requirement)) = agents.get(run_of.get()) else {
@@ -3615,7 +4842,14 @@ fn prepare_store_operations(
 #[allow(clippy::type_complexity)]
 fn prepare_model_operations(
     mut commands: Commands,
-    mut runs: Query<(Entity, &TenantId, &RunOf, &RunRecord, &mut RunState)>,
+    mut runs: Query<(
+        Entity,
+        &TenantId,
+        &RunOf,
+        &RunControl,
+        &RunRecord,
+        &mut RunState,
+    )>,
     agents: Query<(
         &TenantId,
         &Agent,
@@ -3628,8 +4862,9 @@ fn prepare_model_operations(
     tools: Query<(&StableId, &TenantId, &ToolCapability)>,
     mut progress: ResMut<Progress>,
 ) {
-    for (run_entity, run_tenant, run_of, record, mut run_state) in &mut runs {
-        if !matches!(*run_state, RunState::Queued)
+    for (run_entity, run_tenant, run_of, control, record, mut run_state) in &mut runs {
+        if !matches!(*control, RunControl::Running)
+            || !matches!(*run_state, RunState::Queued)
             || !record.memory_loaded
             || !record.retrieval_loaded
         {
@@ -3739,7 +4974,7 @@ fn prepare_model_operations(
                 OperationKind::Model,
                 ModelStreamState::default(),
                 decision,
-                ModelEffectInput {
+                PendingModelRequest(ModelEffectInput {
                     decision: ModelDecision {
                         model_entity: model_relation.get(),
                         model_id: model_id.clone(),
@@ -3763,9 +4998,7 @@ fn prepare_model_operations(
                     max_tokens: agent.max_tokens,
                     tool_choice: agent.tool_choice.clone(),
                     additional_params: agent.additional_params.clone(),
-                },
-                AcceptedPolicies::default(),
-                PolicyStatus::Pending,
+                }),
             ))
             .id();
         *run_state = RunState::WaitingModel { operation };
@@ -3773,71 +5006,1075 @@ fn prepare_model_operations(
     }
 }
 
-fn apply_builtin_policy(
+fn initialize_request_policy_evaluations(
+    mut commands: Commands,
     operations: Query<
-        (
-            &OperationOf,
-            &ModelEffectInput,
-            &mut OperationState,
-            &mut AcceptedPolicies,
-            &mut PolicyStatus,
-        ),
-        Without<Policy>,
+        (Entity, &OperationOf, &PendingModelRequest, &OperationState),
+        Without<RequestPolicyInitialized>,
     >,
-    runs: Query<&RunOf>,
+    runs: Query<(&RunOf, Option<&RunControl>)>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(&StableId, &Policy)>,
+    policies: Query<(Entity, &StableId, &Policy)>,
     mut progress: ResMut<Progress>,
 ) {
-    let mut operations = operations;
-    for (operation_of, input, mut state, mut accepted, mut status) in &mut operations {
-        if !matches!(state.phase, OperationPhase::Prepared)
-            || !matches!(*status, PolicyStatus::Pending)
-        {
+    for (operation, operation_of, pending, state) in &operations {
+        if !matches!(state.phase, OperationPhase::Prepared) {
             continue;
         }
-        let Ok(run_of) = runs.get(operation_of.get()) else {
+        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
             continue;
         };
-        let Ok(Some(agent_policies)) = agents.get(run_of.get()) else {
-            *status = PolicyStatus::Accepted;
-            mark_progress(&mut progress);
+        if !control_allows_internal_progress(control) {
             continue;
-        };
-        let mut ordered = agent_policies
-            .iter()
+        }
+        let mut ordered = agents
+            .get(run_of.get())
+            .ok()
+            .flatten()
+            .into_iter()
+            .flat_map(|agent_policies| agent_policies.iter())
             .filter_map(|entity| policies.get(entity).ok())
+            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::Request))
             .collect::<Vec<_>>();
-        ordered.sort_by(|(left_id, left), (right_id, right)| {
+        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
-        for (id, policy) in ordered {
-            accepted.0.push(AcceptedPolicy {
+        let snapshot = ordered
+            .into_iter()
+            .map(|(entity, id, policy)| AcceptedPolicy {
                 id: id.clone(),
+                entity,
                 revision: policy.revision,
-            });
-            if let PolicyRule::DenyPromptContains(needle) = &policy.rule
-                && serde_json::from_value::<CompletionMessage>(input.prompt.clone())
+            })
+            .collect::<Vec<_>>();
+        commands.entity(operation).insert(RequestPolicyInitialized);
+        if snapshot.is_empty() {
+            commands
+                .entity(operation)
+                .insert((pending.0.clone(), AcceptedPolicies::default()))
+                .remove::<PendingModelRequest>();
+        } else {
+            commands
+                .entity(operation)
+                .insert(AcceptedPolicies(snapshot.clone()));
+            commands.spawn((
+                EvaluationOfOperation(operation),
+                RequestPolicyEvaluation {
+                    run: operation_of.get(),
+                    policies: snapshot,
+                    cursor: 0,
+                    effective: pending.0.clone(),
+                    phase: RequestPolicyEvaluationPhase::Evaluating,
+                },
+            ));
+        }
+        mark_progress(&mut progress);
+    }
+}
+
+fn bind_builtin_policy_observer(
+    event: On<Add, Policy>,
+    policies: Query<&Policy>,
+    mut commands: Commands,
+) {
+    let Ok(policy) = policies.get(event.entity) else {
+        return;
+    };
+    if policy.rule.applies_to(PolicyPoint::Request) && !matches!(policy.rule, PolicyRule::Custom(_))
+    {
+        commands
+            .entity(event.entity)
+            .observe(apply_builtin_request_policy);
+    }
+    if policy.rule.applies_to(PolicyPoint::ToolCall)
+        && !matches!(policy.rule, PolicyRule::Custom(_))
+    {
+        commands
+            .entity(event.entity)
+            .observe(apply_builtin_tool_call_policy);
+    }
+    if policy.rule.applies_to(PolicyPoint::InvalidToolCall)
+        && !matches!(policy.rule, PolicyRule::Custom(_))
+    {
+        commands
+            .entity(event.entity)
+            .observe(apply_builtin_invalid_tool_call_policy);
+    }
+    if policy.rule.applies_to(PolicyPoint::ToolResult)
+        && !matches!(policy.rule, PolicyRule::Custom(_))
+    {
+        commands
+            .entity(event.entity)
+            .observe(apply_builtin_tool_result_policy);
+    }
+    if policy.rule.applies_to(PolicyPoint::CompletionResponse)
+        && !matches!(policy.rule, PolicyRule::Custom(_))
+    {
+        commands
+            .entity(event.entity)
+            .observe(apply_builtin_completion_response_policy);
+    }
+    if policy.rule.applies_to(PolicyPoint::TextDelta)
+        && !matches!(policy.rule, PolicyRule::Custom(_))
+    {
+        commands
+            .entity(event.entity)
+            .observe(apply_builtin_text_delta_policy);
+    }
+}
+
+fn apply_builtin_request_policy(
+    mut invocation: On<RequestPolicyInvocation>,
+    policies: Query<&Policy>,
+) {
+    let Ok(policy) = policies.get(invocation.policy) else {
+        return;
+    };
+    invocation.decision = Some(match &policy.rule {
+        PolicyRule::Allow => RequestPolicyDecision::Continue,
+        PolicyRule::PatchRequest(patch) => RequestPolicyDecision::Patch(patch.clone()),
+        PolicyRule::DenyPromptContains(needle) => {
+            let denied =
+                serde_json::from_value::<CompletionMessage>(invocation.request.prompt.clone())
                     .ok()
                     .and_then(|message| message.rag_text())
-                    .is_some_and(|text| text.contains(needle))
-            {
-                state.phase = OperationPhase::Settled(OperationOutcome::Failure(
-                    CanonicalError::PolicyDenied {
-                        policy: id.as_str().to_owned(),
-                    },
-                ));
-                *status = PolicyStatus::Accepted;
-                mark_progress(&mut progress);
-                break;
+                    .is_some_and(|text| text.contains(needle));
+            if denied {
+                RequestPolicyDecision::Stop(format!("prompt contains `{needle}`"))
+            } else {
+                RequestPolicyDecision::Continue
             }
         }
-        if matches!(state.phase, OperationPhase::Prepared) {
-            *status = PolicyStatus::Accepted;
-            mark_progress(&mut progress);
+        PolicyRule::RequireApproval { prompt, .. } => {
+            RequestPolicyDecision::AwaitApproval(prompt.clone())
         }
+        PolicyRule::RewriteToolArguments { .. }
+        | PolicyRule::SkipToolCall { .. }
+        | PolicyRule::RepairInvalidTool { .. }
+        | PolicyRule::RetryInvalidTool { .. }
+        | PolicyRule::SkipInvalidTool { .. }
+        | PolicyRule::RewriteToolResult { .. }
+        | PolicyRule::StopToolResult { .. }
+        | PolicyRule::RewriteCompletionText { .. }
+        | PolicyRule::StopCompletionContains { .. }
+        | PolicyRule::StopTextDeltaContains { .. }
+        | PolicyRule::Custom(_) => return,
+    });
+}
+
+fn apply_builtin_tool_call_policy(
+    mut invocation: On<ToolCallPolicyInvocation>,
+    policies: Query<&Policy>,
+) {
+    let Ok(policy) = policies.get(invocation.policy) else {
+        return;
+    };
+    invocation.decision = Some(match &policy.rule {
+        PolicyRule::RewriteToolArguments { tool, arguments }
+            if tool
+                .as_ref()
+                .is_none_or(|name| name == &invocation.call.decision.name) =>
+        {
+            ToolCallPolicyDecision::Rewrite(arguments.clone())
+        }
+        PolicyRule::SkipToolCall { tool, reason }
+            if tool
+                .as_ref()
+                .is_none_or(|name| name == &invocation.call.decision.name) =>
+        {
+            ToolCallPolicyDecision::Skip(reason.clone())
+        }
+        PolicyRule::RewriteToolArguments { .. } | PolicyRule::SkipToolCall { .. } => {
+            ToolCallPolicyDecision::Run
+        }
+        PolicyRule::RequireApproval { prompt, .. } => {
+            ToolCallPolicyDecision::AwaitApproval(prompt.clone())
+        }
+        PolicyRule::Allow
+        | PolicyRule::DenyPromptContains(_)
+        | PolicyRule::PatchRequest(_)
+        | PolicyRule::RepairInvalidTool { .. }
+        | PolicyRule::RetryInvalidTool { .. }
+        | PolicyRule::SkipInvalidTool { .. }
+        | PolicyRule::RewriteToolResult { .. }
+        | PolicyRule::StopToolResult { .. }
+        | PolicyRule::RewriteCompletionText { .. }
+        | PolicyRule::StopCompletionContains { .. }
+        | PolicyRule::StopTextDeltaContains { .. }
+        | PolicyRule::Custom(_) => return,
+    });
+}
+
+fn apply_builtin_invalid_tool_call_policy(
+    mut invocation: On<InvalidToolCallPolicyInvocation>,
+    policies: Query<&Policy>,
+) {
+    let Ok(policy) = policies.get(invocation.policy) else {
+        return;
+    };
+    let emitted = &invocation.invalid.call.name;
+    invocation.decision = Some(match &policy.rule {
+        PolicyRule::RepairInvalidTool { from, to }
+            if from.as_ref().is_none_or(|name| name == emitted) =>
+        {
+            InvalidToolCallPolicyDecision::Repair(to.clone())
+        }
+        PolicyRule::RetryInvalidTool { tool, feedback }
+            if tool.as_ref().is_none_or(|name| name == emitted) =>
+        {
+            InvalidToolCallPolicyDecision::Retry(feedback.clone())
+        }
+        PolicyRule::SkipInvalidTool { tool, reason }
+            if tool.as_ref().is_none_or(|name| name == emitted) =>
+        {
+            InvalidToolCallPolicyDecision::Skip(reason.clone())
+        }
+        PolicyRule::RepairInvalidTool { .. }
+        | PolicyRule::RetryInvalidTool { .. }
+        | PolicyRule::SkipInvalidTool { .. } => InvalidToolCallPolicyDecision::Continue,
+        PolicyRule::RequireApproval { prompt, .. } => {
+            InvalidToolCallPolicyDecision::AwaitApproval(prompt.clone())
+        }
+        PolicyRule::Allow
+        | PolicyRule::DenyPromptContains(_)
+        | PolicyRule::PatchRequest(_)
+        | PolicyRule::RewriteToolArguments { .. }
+        | PolicyRule::SkipToolCall { .. }
+        | PolicyRule::RewriteToolResult { .. }
+        | PolicyRule::StopToolResult { .. }
+        | PolicyRule::RewriteCompletionText { .. }
+        | PolicyRule::StopCompletionContains { .. }
+        | PolicyRule::StopTextDeltaContains { .. }
+        | PolicyRule::Custom(_) => return,
+    });
+}
+
+fn apply_builtin_tool_result_policy(
+    mut invocation: On<ToolResultPolicyInvocation>,
+    policies: Query<&Policy>,
+) {
+    let Ok(policy) = policies.get(invocation.policy) else {
+        return;
+    };
+    let tool_name = &invocation.input.decision.name;
+    invocation.decision = Some(match &policy.rule {
+        PolicyRule::RewriteToolResult { tool, presentation }
+            if tool.as_ref().is_none_or(|name| name == tool_name) =>
+        {
+            ToolResultPolicyDecision::Rewrite(presentation.clone())
+        }
+        PolicyRule::StopToolResult { tool, reason }
+            if tool.as_ref().is_none_or(|name| name == tool_name) =>
+        {
+            ToolResultPolicyDecision::Stop(reason.clone())
+        }
+        PolicyRule::RewriteToolResult { .. } | PolicyRule::StopToolResult { .. } => {
+            ToolResultPolicyDecision::Keep
+        }
+        PolicyRule::RequireApproval { prompt, .. } => {
+            ToolResultPolicyDecision::AwaitApproval(prompt.clone())
+        }
+        PolicyRule::Allow
+        | PolicyRule::DenyPromptContains(_)
+        | PolicyRule::PatchRequest(_)
+        | PolicyRule::RewriteToolArguments { .. }
+        | PolicyRule::SkipToolCall { .. }
+        | PolicyRule::RepairInvalidTool { .. }
+        | PolicyRule::RetryInvalidTool { .. }
+        | PolicyRule::SkipInvalidTool { .. }
+        | PolicyRule::RewriteCompletionText { .. }
+        | PolicyRule::StopCompletionContains { .. }
+        | PolicyRule::StopTextDeltaContains { .. }
+        | PolicyRule::Custom(_) => return,
+    });
+}
+
+fn apply_builtin_completion_response_policy(
+    mut invocation: On<CompletionResponsePolicyInvocation>,
+    policies: Query<&Policy>,
+) {
+    let Ok(policy) = policies.get(invocation.policy) else {
+        return;
+    };
+    invocation.decision = Some(match &policy.rule {
+        PolicyRule::RewriteCompletionText { text } => {
+            CompletionResponsePolicyDecision::RewriteText(text.clone())
+        }
+        PolicyRule::StopCompletionContains { needle, reason }
+            if invocation.response.text.contains(needle) =>
+        {
+            CompletionResponsePolicyDecision::Stop(reason.clone())
+        }
+        PolicyRule::StopCompletionContains { .. } => CompletionResponsePolicyDecision::Continue,
+        PolicyRule::RequireApproval { prompt, .. } => {
+            CompletionResponsePolicyDecision::AwaitApproval(prompt.clone())
+        }
+        PolicyRule::Allow
+        | PolicyRule::DenyPromptContains(_)
+        | PolicyRule::PatchRequest(_)
+        | PolicyRule::RewriteToolArguments { .. }
+        | PolicyRule::SkipToolCall { .. }
+        | PolicyRule::RepairInvalidTool { .. }
+        | PolicyRule::RetryInvalidTool { .. }
+        | PolicyRule::SkipInvalidTool { .. }
+        | PolicyRule::RewriteToolResult { .. }
+        | PolicyRule::StopToolResult { .. }
+        | PolicyRule::StopTextDeltaContains { .. }
+        | PolicyRule::Custom(_) => return,
+    });
+}
+
+fn apply_builtin_text_delta_policy(
+    mut invocation: On<TextDeltaPolicyInvocation>,
+    policies: Query<&Policy>,
+) {
+    let Ok(policy) = policies.get(invocation.policy) else {
+        return;
+    };
+    invocation.decision = Some(match &policy.rule {
+        PolicyRule::StopTextDeltaContains { needle, reason }
+            if invocation.delta.contains(needle) =>
+        {
+            TextDeltaPolicyDecision::Stop(reason.clone())
+        }
+        PolicyRule::StopTextDeltaContains { .. } => TextDeltaPolicyDecision::Continue,
+        PolicyRule::RequireApproval { prompt, .. } => {
+            TextDeltaPolicyDecision::AwaitApproval(prompt.clone())
+        }
+        PolicyRule::Allow
+        | PolicyRule::DenyPromptContains(_)
+        | PolicyRule::PatchRequest(_)
+        | PolicyRule::RewriteToolArguments { .. }
+        | PolicyRule::SkipToolCall { .. }
+        | PolicyRule::RepairInvalidTool { .. }
+        | PolicyRule::RetryInvalidTool { .. }
+        | PolicyRule::SkipInvalidTool { .. }
+        | PolicyRule::RewriteToolResult { .. }
+        | PolicyRule::StopToolResult { .. }
+        | PolicyRule::RewriteCompletionText { .. }
+        | PolicyRule::StopCompletionContains { .. }
+        | PolicyRule::Custom(_) => return,
+    });
+}
+
+fn merge_request_patch(input: &mut ModelEffectInput, patch: RequestPatch) {
+    if let Some(instructions) = patch.instructions {
+        input.instructions = instructions;
+    }
+    if let Some(temperature_bits) = patch.temperature_bits {
+        input.temperature_bits = Some(temperature_bits);
+    }
+    if let Some(max_tokens) = patch.max_tokens {
+        input.max_tokens = Some(max_tokens);
+    }
+    if let Some(tool_choice) = patch.tool_choice {
+        input.tool_choice = Some(tool_choice);
+    }
+    if let Some(active_tools) = patch.active_tools {
+        let active_tools = active_tools.into_iter().collect::<HashSet<_>>();
+        input.tools.retain(|tool| active_tools.contains(&tool.name));
+    }
+    if let Some(patch_params) = patch.additional_params {
+        input.additional_params = match (input.additional_params.take(), patch_params) {
+            (Some(serde_json::Value::Object(mut base)), serde_json::Value::Object(patch)) => {
+                base.extend(patch);
+                Some(serde_json::Value::Object(base))
+            }
+            (_, replacement) => Some(replacement),
+        };
+    }
+    input.documents.extend(patch.extra_context);
+    if let Some(history) = patch.history {
+        input.history = history;
+    }
+}
+
+fn begin_policy_approval(
+    world: &mut World,
+    evaluation: Entity,
+    run: Entity,
+    policy: &AcceptedPolicy,
+    point: PolicyPoint,
+    prompt: String,
+) -> Entity {
+    world
+        .spawn((
+            OperationOf(run),
+            ApprovalForEvaluation(evaluation),
+            OperationKind::PolicyApproval,
+            OperationState {
+                generation: 0,
+                phase: OperationPhase::Prepared,
+            },
+            PolicyApprovalEffectInput {
+                policy_id: policy.id.clone(),
+                revision: policy.revision,
+                point,
+                prompt,
+            },
+        ))
+        .id()
+}
+
+fn evaluate_request_policies(world: &mut World) {
+    let mut query = world.query::<(Entity, &EvaluationOfOperation, &RequestPolicyEvaluation)>();
+    let mut ready = query
+        .iter(world)
+        .filter(|(_, _, evaluation)| {
+            matches!(evaluation.phase, RequestPolicyEvaluationPhase::Evaluating)
+        })
+        .map(|(entity, operation, evaluation)| {
+            (entity, operation.get(), evaluation.run, evaluation.cursor)
+        })
+        .collect::<Vec<_>>();
+    ready.retain(|(_, _, run, _)| world_allows_internal_progress(world, *run));
+    ready.sort_by(|left, right| {
+        let left_id = world.get::<StableId>(left.2);
+        let right_id = world.get::<StableId>(right.2);
+        left_id
+            .cmp(&right_id)
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.0.to_bits().cmp(&right.0.to_bits()))
+    });
+
+    for (evaluation_entity, operation, run, cursor) in ready {
+        let Some(evaluation) = world.get::<RequestPolicyEvaluation>(evaluation_entity) else {
+            continue;
+        };
+        let Some(policy) = evaluation.policies.get(cursor).cloned() else {
+            let effective = evaluation.effective.clone();
+            world.entity_mut(operation).insert(effective);
+            world.entity_mut(operation).remove::<PendingModelRequest>();
+            if let Some(mut evaluation) =
+                world.get_mut::<RequestPolicyEvaluation>(evaluation_entity)
+            {
+                evaluation.phase = RequestPolicyEvaluationPhase::Accepted;
+            }
+            mark_progress(&mut world.resource_mut::<Progress>());
+            continue;
+        };
+        let mut invocation = RequestPolicyInvocation {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            run,
+            operation,
+            request: evaluation.effective.clone(),
+            decision: None,
+        };
+        world.trigger(RequestPolicyInvoked {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            policy_id: policy.id.clone(),
+            revision: policy.revision,
+            cursor,
+        });
+        world.trigger_ref(&mut invocation);
+        let decision = invocation.decision.clone();
+        world.trigger(RequestPolicyDecided {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            policy_id: policy.id.clone(),
+            revision: policy.revision,
+            decision: decision.clone(),
+        });
+        match decision {
+            Some(RequestPolicyDecision::Continue) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<RequestPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(RequestPolicyDecision::Patch(patch)) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<RequestPolicyEvaluation>(evaluation_entity)
+                {
+                    merge_request_patch(&mut evaluation.effective, patch);
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(RequestPolicyDecision::AwaitApproval(prompt)) => {
+                let operation = begin_policy_approval(
+                    world,
+                    evaluation_entity,
+                    run,
+                    &policy,
+                    PolicyPoint::Request,
+                    prompt,
+                );
+                if let Some(mut evaluation) =
+                    world.get_mut::<RequestPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = RequestPolicyEvaluationPhase::WaitingApproval {
+                        operation,
+                        policy: policy.id.clone(),
+                    };
+                }
+            }
+            decision @ (Some(RequestPolicyDecision::Stop(_)) | None) => {
+                let reason = match decision {
+                    Some(RequestPolicyDecision::Stop(reason)) => reason,
+                    _ => "policy did not provide a steering decision".to_owned(),
+                };
+                if let Some(mut evaluation) =
+                    world.get_mut::<RequestPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = RequestPolicyEvaluationPhase::Rejected {
+                        policy: policy.id.clone(),
+                        reason,
+                    };
+                }
+                if let Some(mut state) = world.get_mut::<OperationState>(operation) {
+                    state.phase = OperationPhase::Settled(OperationOutcome::Failure(
+                        CanonicalError::PolicyDenied {
+                            policy: policy.id.as_str().to_owned(),
+                        },
+                    ));
+                }
+                if let Some(mut state) = world.get_mut::<RunState>(run) {
+                    *state = RunState::Failed(CanonicalError::PolicyDenied {
+                        policy: policy.id.as_str().to_owned(),
+                    });
+                }
+            }
+        }
+        mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
+fn initialize_tool_call_policy_evaluations(
+    mut commands: Commands,
+    operations: Query<
+        (Entity, &OperationOf, &PendingToolCall, &OperationState),
+        Without<ToolCallPolicyInitialized>,
+    >,
+    runs: Query<(&RunOf, Option<&RunControl>)>,
+    agents: Query<Option<&AgentPolicies>>,
+    policies: Query<(Entity, &StableId, &Policy)>,
+    mut progress: ResMut<Progress>,
+) {
+    for (operation, operation_of, pending, state) in &operations {
+        if !matches!(state.phase, OperationPhase::Prepared) {
+            continue;
+        }
+        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+            continue;
+        };
+        if !control_allows_internal_progress(control) {
+            continue;
+        }
+        let mut ordered = agents
+            .get(run_of.get())
+            .ok()
+            .flatten()
+            .into_iter()
+            .flat_map(|agent_policies| agent_policies.iter())
+            .filter_map(|entity| policies.get(entity).ok())
+            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::ToolCall))
+            .collect::<Vec<_>>();
+        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+            left.order
+                .cmp(&right.order)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let snapshot = ordered
+            .into_iter()
+            .map(|(entity, id, policy)| AcceptedPolicy {
+                id: id.clone(),
+                entity,
+                revision: policy.revision,
+            })
+            .collect::<Vec<_>>();
+        commands.entity(operation).insert(ToolCallPolicyInitialized);
+        if snapshot.is_empty() {
+            commands
+                .entity(operation)
+                .insert((pending.0.clone(), AcceptedToolCallPolicies::default()))
+                .remove::<PendingToolCall>();
+        } else {
+            commands
+                .entity(operation)
+                .insert(AcceptedToolCallPolicies(snapshot.clone()));
+            commands.spawn((
+                EvaluationOfOperation(operation),
+                ToolCallPolicyEvaluation {
+                    run: operation_of.get(),
+                    policies: snapshot,
+                    cursor: 0,
+                    effective: pending.0.clone(),
+                    phase: ToolCallPolicyEvaluationPhase::Evaluating,
+                },
+            ));
+        }
+        mark_progress(&mut progress);
+    }
+}
+
+fn evaluate_tool_call_policies(world: &mut World) {
+    let mut query = world.query::<(Entity, &EvaluationOfOperation, &ToolCallPolicyEvaluation)>();
+    let mut ready = query
+        .iter(world)
+        .filter(|(_, _, evaluation)| {
+            matches!(evaluation.phase, ToolCallPolicyEvaluationPhase::Evaluating)
+        })
+        .map(|(entity, operation, evaluation)| {
+            (
+                entity,
+                operation.get(),
+                evaluation.run,
+                evaluation.cursor,
+                evaluation.effective.index,
+            )
+        })
+        .collect::<Vec<_>>();
+    ready.retain(|(_, _, run, _, _)| world_allows_internal_progress(world, *run));
+    ready.sort_by(|left, right| {
+        let left_id = world.get::<StableId>(left.2);
+        let right_id = world.get::<StableId>(right.2);
+        left_id
+            .cmp(&right_id)
+            .then_with(|| left.4.cmp(&right.4))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.0.to_bits().cmp(&right.0.to_bits()))
+    });
+
+    for (evaluation_entity, operation, run, cursor, _) in ready {
+        let Some(evaluation) = world.get::<ToolCallPolicyEvaluation>(evaluation_entity) else {
+            continue;
+        };
+        let Some(policy) = evaluation.policies.get(cursor).cloned() else {
+            let effective = evaluation.effective.clone();
+            world.entity_mut(operation).insert(effective);
+            world.entity_mut(operation).remove::<PendingToolCall>();
+            if let Some(mut evaluation) =
+                world.get_mut::<ToolCallPolicyEvaluation>(evaluation_entity)
+            {
+                evaluation.phase = ToolCallPolicyEvaluationPhase::Accepted;
+            }
+            mark_progress(&mut world.resource_mut::<Progress>());
+            continue;
+        };
+        let mut invocation = ToolCallPolicyInvocation {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            run,
+            operation,
+            call: evaluation.effective.clone(),
+            decision: None,
+        };
+        world.trigger_ref(&mut invocation);
+        match invocation.decision {
+            Some(ToolCallPolicyDecision::Run) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(ToolCallPolicyDecision::Rewrite(arguments)) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.effective.arguments = arguments;
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(ToolCallPolicyDecision::AwaitApproval(prompt)) => {
+                let approval = begin_policy_approval(
+                    world,
+                    evaluation_entity,
+                    run,
+                    &policy,
+                    PolicyPoint::ToolCall,
+                    prompt,
+                );
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = ToolCallPolicyEvaluationPhase::WaitingApproval {
+                        operation: approval,
+                        policy: policy.id.clone(),
+                    };
+                }
+            }
+            Some(ToolCallPolicyDecision::Skip(reason)) => {
+                let effective = invocation.call.clone();
+                world.entity_mut(operation).insert(effective.clone());
+                world.entity_mut(operation).remove::<PendingToolCall>();
+                if let Some(mut state) = world.get_mut::<OperationState>(operation) {
+                    state.phase = OperationPhase::Settled(OperationOutcome::Success(
+                        EffectOutput::Tool(ToolEffectOutput {
+                            call_id: effective.call_id,
+                            provider_result_id: effective.provider_result_id,
+                            provider_call_id: effective.provider_call_id,
+                            name: effective.decision.name,
+                            raw: serde_json::json!({"skipped": true, "reason": reason}),
+                            presentation: reason.clone(),
+                            failure: None,
+                        }),
+                    ));
+                }
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = ToolCallPolicyEvaluationPhase::Skipped(reason);
+                }
+            }
+            decision @ (Some(ToolCallPolicyDecision::Stop(_)) | None) => {
+                let reason = match decision {
+                    Some(ToolCallPolicyDecision::Stop(reason)) => reason,
+                    _ => "policy did not provide a steering decision".to_owned(),
+                };
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = ToolCallPolicyEvaluationPhase::Rejected {
+                        policy: policy.id.clone(),
+                        reason,
+                    };
+                }
+                if let Some(mut state) = world.get_mut::<OperationState>(operation) {
+                    state.phase = OperationPhase::Settled(OperationOutcome::Failure(
+                        CanonicalError::PolicyDenied {
+                            policy: policy.id.as_str().to_owned(),
+                        },
+                    ));
+                }
+                if let Some(mut state) = world.get_mut::<RunState>(run) {
+                    *state = RunState::Failed(CanonicalError::PolicyDenied {
+                        policy: policy.id.as_str().to_owned(),
+                    });
+                }
+            }
+        }
+        mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
+fn initialize_invalid_tool_call_policy_evaluations(
+    mut commands: Commands,
+    operations: Query<
+        (
+            Entity,
+            &OperationOf,
+            &PendingInvalidToolCall,
+            &OperationState,
+        ),
+        Without<InvalidToolCallPolicyInitialized>,
+    >,
+    runs: Query<(&RunOf, Option<&RunControl>)>,
+    agents: Query<Option<&AgentPolicies>>,
+    policies: Query<(Entity, &StableId, &Policy)>,
+    mut progress: ResMut<Progress>,
+) {
+    for (operation, operation_of, invalid, state) in &operations {
+        if !matches!(state.phase, OperationPhase::Prepared) {
+            continue;
+        }
+        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+            continue;
+        };
+        if !control_allows_internal_progress(control) {
+            continue;
+        }
+        let mut ordered = agents
+            .get(run_of.get())
+            .ok()
+            .flatten()
+            .into_iter()
+            .flat_map(|agent_policies| agent_policies.iter())
+            .filter_map(|entity| policies.get(entity).ok())
+            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::InvalidToolCall))
+            .collect::<Vec<_>>();
+        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+            left.order
+                .cmp(&right.order)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let snapshot = ordered
+            .into_iter()
+            .map(|(entity, id, policy)| AcceptedPolicy {
+                id: id.clone(),
+                entity,
+                revision: policy.revision,
+            })
+            .collect::<Vec<_>>();
+        commands.entity(operation).insert((
+            InvalidToolCallPolicyInitialized,
+            AcceptedInvalidToolCallPolicies(snapshot.clone()),
+        ));
+        commands.spawn((
+            EvaluationOfOperation(operation),
+            InvalidToolCallPolicyEvaluation {
+                run: operation_of.get(),
+                policies: snapshot,
+                cursor: 0,
+                invalid: invalid.clone(),
+                phase: InvalidToolCallPolicyEvaluationPhase::Evaluating,
+            },
+        ));
+        mark_progress(&mut progress);
+    }
+}
+
+fn synthetic_invalid_tool_input(
+    operation: Entity,
+    invalid: &PendingInvalidToolCall,
+) -> ToolEffectInput {
+    ToolEffectInput {
+        decision: ToolDecision {
+            tool_entity: operation,
+            tool_id: StableId::generated(format!("invalid-tool-call/{}", invalid.call.id)),
+            revision: 0,
+            name: invalid.call.name.clone(),
+            description: "synthetic invalid tool-call result".to_owned(),
+            parameters: serde_json::Value::Null,
+            order: invalid.index,
+        },
+        call_id: invalid.call.id.clone(),
+        provider_result_id: invalid.call.provider_result_id.clone(),
+        provider_call_id: invalid.call.provider_call_id.clone(),
+        arguments: invalid.call.arguments.clone(),
+        index: invalid.index,
+    }
+}
+
+fn settle_invalid_tool_as_feedback(
+    world: &mut World,
+    operation: Entity,
+    invalid: &PendingInvalidToolCall,
+    kind: &str,
+    feedback: String,
+) {
+    let input = synthetic_invalid_tool_input(operation, invalid);
+    world.entity_mut(operation).insert(input.clone());
+    world
+        .entity_mut(operation)
+        .remove::<PendingInvalidToolCall>();
+    if let Some(mut state) = world.get_mut::<OperationState>(operation) {
+        state.phase = OperationPhase::Settled(OperationOutcome::Success(EffectOutput::Tool(
+            ToolEffectOutput {
+                call_id: input.call_id,
+                provider_result_id: input.provider_result_id,
+                provider_call_id: input.provider_call_id,
+                name: input.decision.name,
+                raw: serde_json::json!({"invalid_tool_call": kind, "feedback": feedback}),
+                presentation: feedback,
+                failure: None,
+            },
+        )));
+    }
+}
+
+fn fail_invalid_tool_call(
+    world: &mut World,
+    evaluation_entity: Entity,
+    operation: Entity,
+    run: Entity,
+    error: CanonicalError,
+) {
+    if let Some(mut evaluation) =
+        world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+    {
+        evaluation.phase = InvalidToolCallPolicyEvaluationPhase::Failed;
+    }
+    if let Some(mut state) = world.get_mut::<OperationState>(operation) {
+        state.phase = OperationPhase::Settled(OperationOutcome::Failure(error.clone()));
+    }
+    if let Some(mut state) = world.get_mut::<RunState>(run) {
+        *state = RunState::Failed(error);
+    }
+}
+
+fn evaluate_invalid_tool_call_policies(world: &mut World) {
+    let mut query = world.query::<(
+        Entity,
+        &EvaluationOfOperation,
+        &InvalidToolCallPolicyEvaluation,
+    )>();
+    let mut ready = query
+        .iter(world)
+        .filter(|(_, _, evaluation)| {
+            matches!(
+                evaluation.phase,
+                InvalidToolCallPolicyEvaluationPhase::Evaluating
+            )
+        })
+        .map(|(entity, operation, evaluation)| {
+            (
+                entity,
+                operation.get(),
+                evaluation.run,
+                evaluation.cursor,
+                evaluation.invalid.index,
+            )
+        })
+        .collect::<Vec<_>>();
+    ready.retain(|(_, _, run, _, _)| world_allows_internal_progress(world, *run));
+    ready.sort_by(|left, right| {
+        let left_id = world.get::<StableId>(left.2);
+        let right_id = world.get::<StableId>(right.2);
+        left_id
+            .cmp(&right_id)
+            .then_with(|| left.4.cmp(&right.4))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.0.to_bits().cmp(&right.0.to_bits()))
+    });
+
+    for (evaluation_entity, operation, run, cursor, _) in ready {
+        let Some(evaluation) = world
+            .get::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(policy) = evaluation.policies.get(cursor).cloned() else {
+            fail_invalid_tool_call(
+                world,
+                evaluation_entity,
+                operation,
+                run,
+                CanonicalError::UnknownTool(evaluation.invalid.call.name),
+            );
+            mark_progress(&mut world.resource_mut::<Progress>());
+            continue;
+        };
+        let mut invocation = InvalidToolCallPolicyInvocation {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            run,
+            operation,
+            invalid: evaluation.invalid.clone(),
+            decision: None,
+        };
+        world.trigger_ref(&mut invocation);
+        match invocation.decision {
+            Some(InvalidToolCallPolicyDecision::Continue) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(InvalidToolCallPolicyDecision::AwaitApproval(prompt)) => {
+                let approval = begin_policy_approval(
+                    world,
+                    evaluation_entity,
+                    run,
+                    &policy,
+                    PolicyPoint::InvalidToolCall,
+                    prompt,
+                );
+                if let Some(mut evaluation) =
+                    world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = InvalidToolCallPolicyEvaluationPhase::WaitingApproval {
+                        operation: approval,
+                        policy: policy.id.clone(),
+                    };
+                }
+            }
+            Some(InvalidToolCallPolicyDecision::Repair(tool_name)) => {
+                let Some(decision) = evaluation
+                    .invalid
+                    .available_tools
+                    .iter()
+                    .find(|tool| tool.name == tool_name)
+                    .cloned()
+                else {
+                    fail_invalid_tool_call(
+                        world,
+                        evaluation_entity,
+                        operation,
+                        run,
+                        CanonicalError::UnknownTool(tool_name),
+                    );
+                    mark_progress(&mut world.resource_mut::<Progress>());
+                    continue;
+                };
+                world
+                    .entity_mut(operation)
+                    .insert(PendingToolCall(ToolEffectInput {
+                        decision,
+                        call_id: evaluation.invalid.call.id.clone(),
+                        provider_result_id: evaluation.invalid.call.provider_result_id.clone(),
+                        provider_call_id: evaluation.invalid.call.provider_call_id.clone(),
+                        arguments: evaluation.invalid.call.arguments.clone(),
+                        index: evaluation.invalid.index,
+                    }));
+                world
+                    .entity_mut(operation)
+                    .remove::<PendingInvalidToolCall>();
+                if let Some(mut state) =
+                    world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    state.phase = InvalidToolCallPolicyEvaluationPhase::Resolved;
+                }
+            }
+            Some(InvalidToolCallPolicyDecision::Retry(feedback)) => {
+                settle_invalid_tool_as_feedback(
+                    world,
+                    operation,
+                    &evaluation.invalid,
+                    "retry",
+                    feedback,
+                );
+                if let Some(mut state) =
+                    world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    state.phase = InvalidToolCallPolicyEvaluationPhase::Resolved;
+                }
+            }
+            Some(InvalidToolCallPolicyDecision::Skip(reason)) => {
+                settle_invalid_tool_as_feedback(
+                    world,
+                    operation,
+                    &evaluation.invalid,
+                    "skip",
+                    reason,
+                );
+                if let Some(mut state) =
+                    world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    state.phase = InvalidToolCallPolicyEvaluationPhase::Resolved;
+                }
+            }
+            Some(InvalidToolCallPolicyDecision::Fail) => {
+                fail_invalid_tool_call(
+                    world,
+                    evaluation_entity,
+                    operation,
+                    run,
+                    CanonicalError::UnknownTool(evaluation.invalid.call.name),
+                );
+            }
+            decision @ (Some(InvalidToolCallPolicyDecision::Stop(_)) | None) => {
+                let reason = match decision {
+                    Some(InvalidToolCallPolicyDecision::Stop(reason)) => reason,
+                    _ => "policy did not provide a steering decision".to_owned(),
+                };
+                if let Some(mut state) =
+                    world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+                {
+                    state.phase = InvalidToolCallPolicyEvaluationPhase::Rejected {
+                        policy: policy.id.clone(),
+                        reason,
+                    };
+                }
+                let error = CanonicalError::PolicyDenied {
+                    policy: policy.id.as_str().to_owned(),
+                };
+                if let Some(mut state) = world.get_mut::<OperationState>(operation) {
+                    state.phase = OperationPhase::Settled(OperationOutcome::Failure(error.clone()));
+                }
+                if let Some(mut state) = world.get_mut::<RunState>(run) {
+                    *state = RunState::Failed(error);
+                }
+            }
+        }
+        mark_progress(&mut world.resource_mut::<Progress>());
     }
 }
 
@@ -3869,14 +6106,16 @@ fn dispatch_model_operations(world: &mut World) {
         Entity,
         &OperationOf,
         &ModelEffectInput,
-        &PolicyStatus,
         &OperationState,
     ), (With<ModelEffectInput>, Without<ToolEffectInput>)>();
     let mut prepared = query
         .iter(world)
-        .filter_map(|(entity, run, input, policy_status, state)| {
+        .filter_map(|(entity, run, input, state)| {
             if !matches!(state.phase, OperationPhase::Prepared)
-                || !matches!(*policy_status, PolicyStatus::Accepted)
+                || !matches!(
+                    world.get::<RunControl>(run.get()),
+                    Some(RunControl::Running)
+                )
                 || !matches!(
                     world.get::<RunState>(run.get()),
                     Some(RunState::WaitingModel { .. })
@@ -3936,6 +6175,7 @@ fn dispatch_tool_operations(world: &mut World) {
         .filter_map(|(entity, batch, input, state)| {
             let run = batch_query.get(world, batch.get()).ok()?.get();
             if !matches!(state.phase, OperationPhase::Prepared)
+                || !matches!(world.get::<RunControl>(run), Some(RunControl::Running))
                 || !matches!(
                     world.get::<RunState>(run),
                     Some(RunState::WaitingTools { .. })
@@ -4047,6 +6287,10 @@ fn dispatch_store_operations(world: &mut World) {
         .filter_map(|(entity, run, input, state)| {
             if !matches!(state.phase, OperationPhase::Prepared)
                 || !matches!(
+                    world.get::<RunControl>(run.get()),
+                    Some(RunControl::Running)
+                )
+                || !matches!(
                     world.get::<RunState>(run.get()),
                     Some(RunState::WaitingStore { .. })
                 )
@@ -4072,6 +6316,62 @@ fn dispatch_store_operations(world: &mut World) {
             input: EffectInput::Store(input),
         };
         let phase = match outbox.try_send(request) {
+            Ok(()) => {
+                made_progress = true;
+                Some(OperationPhase::InFlight)
+            }
+            Err(TrySendError::Full(_)) => None,
+            Err(TrySendError::Disconnected(_)) => {
+                made_progress = true;
+                Some(OperationPhase::Settled(OperationOutcome::Failure(
+                    CanonicalError::ExecutorDisconnected,
+                )))
+            }
+        };
+        if let Some(phase) = phase {
+            apply_dispatch_phase(world, entity, generation, phase);
+        }
+    }
+    if made_progress {
+        mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
+fn dispatch_policy_approval_operations(world: &mut World) {
+    let outbox = world.resource::<EffectOutbox>().0.clone();
+    let mut query = world.query::<(
+        Entity,
+        &OperationOf,
+        &PolicyApprovalEffectInput,
+        &OperationState,
+    )>();
+    let mut prepared = query
+        .iter(world)
+        .filter_map(|(entity, run, input, state)| {
+            if !matches!(state.phase, OperationPhase::Prepared)
+                || !matches!(
+                    world.get::<RunControl>(run.get()),
+                    Some(RunControl::Running)
+                )
+            {
+                return None;
+            }
+            let run_id = world.get::<StableId>(run.get())?;
+            Some((run_id.clone(), entity, state.generation, input.clone()))
+        })
+        .collect::<Vec<_>>();
+    prepared.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.to_bits().cmp(&right.1.to_bits()))
+    });
+    let mut made_progress = false;
+    for (_, entity, generation, input) in prepared {
+        let phase = match outbox.try_send(EffectRequest {
+            operation: entity,
+            generation,
+            input: EffectInput::PolicyApproval(input),
+        }) {
             Ok(()) => {
                 made_progress = true;
                 Some(OperationPhase::InFlight)
@@ -4140,6 +6440,9 @@ fn apply_effect_ingress(
     )>,
     clock: Res<RuntimeClock>,
     timeout: Res<EffectTimeoutTicks>,
+    runs: Query<(&RunOf, &RunRecord)>,
+    agents: Query<Option<&AgentPolicies>>,
+    policies: Query<(Entity, &StableId, &Policy)>,
     run_subscriptions: Query<&RunSubscriptions>,
     mut subscriptions: Query<(&StreamSink, &mut SubscriptionState)>,
     mut progress: ResMut<Progress>,
@@ -4164,6 +6467,10 @@ fn apply_effect_ingress(
                                 | (OperationKind::Tool, EffectOutput::Tool(_))
                                 | (OperationKind::Discovery, EffectOutput::Discovery(_))
                                 | (OperationKind::Store, EffectOutput::Store(_))
+                                | (
+                                    OperationKind::PolicyApproval,
+                                    EffectOutput::PolicyApproval(_)
+                                )
                         ) =>
                     {
                         OperationOutcome::Success(output.clone())
@@ -4195,8 +6502,59 @@ fn apply_effect_ingress(
                     continue;
                 }
                 stream_state.next_sequence = stream_state.next_sequence.saturating_add(1);
+                stream_state.aggregated_text.push_str(&delta.text);
+                let aggregated = stream_state.aggregated_text.clone();
                 if let Some(mut deadline) = deadline {
                     deadline.expires_at = clock.tick.saturating_add(timeout.0);
+                }
+                let run = operation_of.get();
+                let (turn, mut stream_policies) = runs
+                    .get(run)
+                    .ok()
+                    .map(|(run_of, record)| {
+                        let mut ordered = agents
+                            .get(run_of.get())
+                            .ok()
+                            .flatten()
+                            .into_iter()
+                            .flat_map(|agent_policies| agent_policies.iter())
+                            .filter_map(|entity| policies.get(entity).ok())
+                            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::TextDelta))
+                            .collect::<Vec<_>>();
+                        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+                            left.order
+                                .cmp(&right.order)
+                                .then_with(|| left_id.cmp(right_id))
+                        });
+                        (record.next_turn, ordered)
+                    })
+                    .unwrap_or_default();
+                let snapshot = stream_policies
+                    .drain(..)
+                    .map(|(entity, id, policy)| AcceptedPolicy {
+                        id: id.clone(),
+                        entity,
+                        revision: policy.revision,
+                    })
+                    .collect::<Vec<_>>();
+                if !snapshot.is_empty() {
+                    commands.spawn((
+                        EvaluationOfOperation(delta.operation),
+                        AcceptedTextDeltaPolicies(snapshot.clone()),
+                        TextDeltaPolicyEvaluation {
+                            run,
+                            operation: delta.operation,
+                            policies: snapshot,
+                            cursor: 0,
+                            turn,
+                            sequence: delta.sequence,
+                            delta: delta.text.clone(),
+                            aggregated,
+                            phase: TextDeltaPolicyEvaluationPhase::Evaluating,
+                        },
+                    ));
+                    mark_progress(&mut progress);
+                    continue;
                 }
                 if let Ok(run_subscriptions) = run_subscriptions.get(operation_of.get()) {
                     for subscription in run_subscriptions.iter() {
@@ -4280,6 +6638,81 @@ fn publish_terminal_streams(
             };
             mark_progress(&mut progress);
         }
+    }
+}
+
+fn commit_child_results(
+    mut commands: Commands,
+    mut parents: Query<(Entity, &ChildRuns, &mut RunRecord)>,
+    children: Query<(
+        &StableId,
+        &ChildOrdinal,
+        &RunState,
+        Option<&ChildResultCommitted>,
+    )>,
+    mut progress: ResMut<Progress>,
+) {
+    for (parent, child_runs, mut parent_record) in &mut parents {
+        let mut ordered = child_runs
+            .iter()
+            .filter_map(|child| {
+                let (id, ordinal, state, committed) = children.get(child).ok()?;
+                Some((ordinal.0, child, id.clone(), state, committed.is_some()))
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(ordinal, child, _, _, _)| (*ordinal, child.to_bits()));
+        for (ordinal, child, child_id, state, committed) in ordered {
+            if committed {
+                continue;
+            }
+            let result = match state {
+                RunState::Completed(output) => Ok(output.text.clone()),
+                RunState::Failed(error) => Err(error.to_string()),
+                RunState::Cancelled => Err("cancelled".to_owned()),
+                RunState::Queued
+                | RunState::WaitingModel { .. }
+                | RunState::WaitingTools { .. }
+                | RunState::WaitingStore { .. } => break,
+            };
+            parent_record.transcript.push(TranscriptEntry::ChildResult {
+                ordinal,
+                run_id: child_id.clone(),
+                result: result.clone(),
+            });
+            commands.entity(child).insert(ChildResultCommitted);
+            commands.trigger(ChildRunFinished {
+                parent,
+                child,
+                child_id,
+                ordinal,
+                result,
+            });
+            mark_progress(&mut progress);
+        }
+    }
+}
+
+fn propagate_parent_cancellation(world: &mut World) {
+    let mut query = world.query::<(&RunState, &ChildRuns)>();
+    let children = query
+        .iter(world)
+        .filter(|(state, _)| matches!(state, RunState::Cancelled))
+        .flat_map(|(_, children)| children.iter())
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for child in children {
+        if let Some(mut state) = world.get_mut::<RunState>(child)
+            && !matches!(
+                *state,
+                RunState::Completed(_) | RunState::Failed(_) | RunState::Cancelled
+            )
+        {
+            *state = RunState::Cancelled;
+            changed = true;
+        }
+    }
+    if changed {
+        mark_progress(&mut world.resource_mut::<Progress>());
     }
 }
 
@@ -4421,21 +6854,725 @@ fn update_runtime_metrics(
     *metrics = next;
 }
 
+fn initialize_completion_response_policy_evaluations(
+    mut commands: Commands,
+    operations: Query<
+        (Entity, &OperationOf, &ModelEffectInput, &OperationState),
+        Without<CompletionResponsePolicyInitialized>,
+    >,
+    runs: Query<(&RunOf, Option<&RunControl>)>,
+    agents: Query<Option<&AgentPolicies>>,
+    policies: Query<(Entity, &StableId, &Policy)>,
+    mut progress: ResMut<Progress>,
+) {
+    for (operation, operation_of, request, state) in &operations {
+        let OperationPhase::Settled(OperationOutcome::Success(EffectOutput::Model(output))) =
+            &state.phase
+        else {
+            continue;
+        };
+        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+            continue;
+        };
+        if !control_allows_internal_progress(control) {
+            continue;
+        }
+        let mut ordered = agents
+            .get(run_of.get())
+            .ok()
+            .flatten()
+            .into_iter()
+            .flat_map(|agent_policies| agent_policies.iter())
+            .filter_map(|entity| policies.get(entity).ok())
+            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::CompletionResponse))
+            .collect::<Vec<_>>();
+        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+            left.order
+                .cmp(&right.order)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let snapshot = ordered
+            .into_iter()
+            .map(|(entity, id, policy)| AcceptedPolicy {
+                id: id.clone(),
+                entity,
+                revision: policy.revision,
+            })
+            .collect::<Vec<_>>();
+        commands
+            .entity(operation)
+            .insert(CompletionResponsePolicyInitialized);
+        if snapshot.is_empty() {
+            commands.entity(operation).insert((
+                AcceptedCompletionResponsePolicies::default(),
+                EffectiveModelOutput(output.clone()),
+                CompletionResponsePolicyDone,
+            ));
+        } else {
+            commands
+                .entity(operation)
+                .insert(AcceptedCompletionResponsePolicies(snapshot.clone()));
+            commands.spawn((
+                EvaluationOfOperation(operation),
+                CompletionResponsePolicyEvaluation {
+                    run: operation_of.get(),
+                    policies: snapshot,
+                    cursor: 0,
+                    request: request.clone(),
+                    effective: output.clone(),
+                    phase: CompletionResponsePolicyEvaluationPhase::Evaluating,
+                },
+            ));
+        }
+        mark_progress(&mut progress);
+    }
+}
+
+fn evaluate_completion_response_policies(world: &mut World) {
+    let mut query = world.query::<(
+        Entity,
+        &EvaluationOfOperation,
+        &CompletionResponsePolicyEvaluation,
+    )>();
+    let mut ready = query
+        .iter(world)
+        .filter(|(_, _, evaluation)| {
+            matches!(
+                evaluation.phase,
+                CompletionResponsePolicyEvaluationPhase::Evaluating
+            )
+        })
+        .map(|(entity, operation, evaluation)| {
+            (entity, operation.get(), evaluation.run, evaluation.cursor)
+        })
+        .collect::<Vec<_>>();
+    ready.retain(|(_, _, run, _)| world_allows_internal_progress(world, *run));
+    ready.sort_by(|left, right| {
+        let left_id = world.get::<StableId>(left.2);
+        let right_id = world.get::<StableId>(right.2);
+        left_id
+            .cmp(&right_id)
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.0.to_bits().cmp(&right.0.to_bits()))
+    });
+
+    for (evaluation_entity, operation, run, cursor) in ready {
+        let Some(evaluation) = world
+            .get::<CompletionResponsePolicyEvaluation>(evaluation_entity)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(policy) = evaluation.policies.get(cursor).cloned() else {
+            world.entity_mut(operation).insert((
+                EffectiveModelOutput(evaluation.effective),
+                CompletionResponsePolicyDone,
+            ));
+            if let Some(mut evaluation) =
+                world.get_mut::<CompletionResponsePolicyEvaluation>(evaluation_entity)
+            {
+                evaluation.phase = CompletionResponsePolicyEvaluationPhase::Accepted;
+            }
+            mark_progress(&mut world.resource_mut::<Progress>());
+            continue;
+        };
+        let mut invocation = CompletionResponsePolicyInvocation {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            run,
+            operation,
+            request: evaluation.request,
+            response: evaluation.effective,
+            decision: None,
+        };
+        world.trigger_ref(&mut invocation);
+        match invocation.decision {
+            Some(CompletionResponsePolicyDecision::Continue) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<CompletionResponsePolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(CompletionResponsePolicyDecision::RewriteText(text)) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<CompletionResponsePolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.effective.text = text;
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(CompletionResponsePolicyDecision::AwaitApproval(prompt)) => {
+                let approval = begin_policy_approval(
+                    world,
+                    evaluation_entity,
+                    run,
+                    &policy,
+                    PolicyPoint::CompletionResponse,
+                    prompt,
+                );
+                if let Some(mut evaluation) =
+                    world.get_mut::<CompletionResponsePolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = CompletionResponsePolicyEvaluationPhase::WaitingApproval {
+                        operation: approval,
+                        policy: policy.id.clone(),
+                    };
+                }
+            }
+            decision @ (Some(CompletionResponsePolicyDecision::Stop(_)) | None) => {
+                let reason = match decision {
+                    Some(CompletionResponsePolicyDecision::Stop(reason)) => reason,
+                    _ => "policy did not provide a steering decision".to_owned(),
+                };
+                if let Some(mut evaluation) =
+                    world.get_mut::<CompletionResponsePolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = CompletionResponsePolicyEvaluationPhase::Rejected {
+                        policy: policy.id.clone(),
+                        reason,
+                    };
+                }
+                if let Some(mut state) = world.get_mut::<RunState>(run) {
+                    *state = RunState::Failed(CanonicalError::PolicyDenied {
+                        policy: policy.id.as_str().to_owned(),
+                    });
+                }
+            }
+        }
+        mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
+fn publish_evaluated_text_delta(world: &mut World, run: Entity, sequence: u64, text: &str) {
+    let subscriptions = world
+        .get::<RunSubscriptions>(run)
+        .map(|subscriptions| subscriptions.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for subscription in subscriptions {
+        if !matches!(
+            world.get::<SubscriptionState>(subscription),
+            Some(SubscriptionState::Active)
+        ) {
+            continue;
+        }
+        let sender = world
+            .get::<StreamSink>(subscription)
+            .map(|sink| sink.0.clone());
+        let Some(sender) = sender else {
+            continue;
+        };
+        if sender
+            .try_send(StreamItem::Delta {
+                sequence,
+                text: text.to_owned(),
+            })
+            .is_err()
+        {
+            if let Some(mut state) = world.get_mut::<SubscriptionState>(subscription) {
+                *state = SubscriptionState::DroppedSlowConsumer;
+            }
+            world.entity_mut(subscription).remove::<StreamSink>();
+        }
+    }
+}
+
+fn evaluate_text_delta_policies(world: &mut World) {
+    let mut query = world.query::<(Entity, &TextDeltaPolicyEvaluation)>();
+    let mut ready = query
+        .iter(world)
+        .filter(|(_, evaluation)| {
+            matches!(evaluation.phase, TextDeltaPolicyEvaluationPhase::Evaluating)
+        })
+        .map(|(entity, evaluation)| {
+            (
+                entity,
+                evaluation.run,
+                evaluation.operation,
+                evaluation.sequence,
+                evaluation.cursor,
+            )
+        })
+        .collect::<Vec<_>>();
+    ready.retain(|(_, run, _, _, _)| world_allows_internal_progress(world, *run));
+    ready.sort_by(|left, right| {
+        let left_id = world.get::<StableId>(left.1);
+        let right_id = world.get::<StableId>(right.1);
+        left_id
+            .cmp(&right_id)
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.cmp(&right.4))
+            .then_with(|| left.0.to_bits().cmp(&right.0.to_bits()))
+    });
+    let mut operations = HashSet::new();
+    ready.retain(|(_, _, operation, _, _)| operations.insert(*operation));
+
+    for (evaluation_entity, run, _, _, cursor) in ready {
+        let Some(evaluation) = world
+            .get::<TextDeltaPolicyEvaluation>(evaluation_entity)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(policy) = evaluation.policies.get(cursor).cloned() else {
+            publish_evaluated_text_delta(world, run, evaluation.sequence, &evaluation.delta);
+            if let Some(mut state) = world.get_mut::<TextDeltaPolicyEvaluation>(evaluation_entity) {
+                state.phase = TextDeltaPolicyEvaluationPhase::Published;
+            }
+            mark_progress(&mut world.resource_mut::<Progress>());
+            continue;
+        };
+        let mut invocation = TextDeltaPolicyInvocation {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            run,
+            operation: evaluation.operation,
+            turn: evaluation.turn,
+            sequence: evaluation.sequence,
+            delta: evaluation.delta,
+            aggregated: evaluation.aggregated,
+            decision: None,
+        };
+        world.trigger_ref(&mut invocation);
+        match invocation.decision {
+            Some(TextDeltaPolicyDecision::Continue) => {
+                if let Some(mut state) =
+                    world.get_mut::<TextDeltaPolicyEvaluation>(evaluation_entity)
+                {
+                    state.cursor += 1;
+                }
+            }
+            Some(TextDeltaPolicyDecision::AwaitApproval(prompt)) => {
+                let approval = begin_policy_approval(
+                    world,
+                    evaluation_entity,
+                    run,
+                    &policy,
+                    PolicyPoint::TextDelta,
+                    prompt,
+                );
+                if let Some(mut state) =
+                    world.get_mut::<TextDeltaPolicyEvaluation>(evaluation_entity)
+                {
+                    state.phase = TextDeltaPolicyEvaluationPhase::WaitingApproval {
+                        operation: approval,
+                        policy: policy.id.clone(),
+                    };
+                }
+            }
+            decision @ (Some(TextDeltaPolicyDecision::Stop(_)) | None) => {
+                let reason = match decision {
+                    Some(TextDeltaPolicyDecision::Stop(reason)) => reason,
+                    _ => "policy did not provide a steering decision".to_owned(),
+                };
+                if let Some(mut state) =
+                    world.get_mut::<TextDeltaPolicyEvaluation>(evaluation_entity)
+                {
+                    state.phase = TextDeltaPolicyEvaluationPhase::Rejected {
+                        policy: policy.id.clone(),
+                        reason,
+                    };
+                }
+                if let Some(mut state) = world.get_mut::<RunState>(run) {
+                    *state = RunState::Failed(CanonicalError::PolicyDenied {
+                        policy: policy.id.as_str().to_owned(),
+                    });
+                }
+            }
+        }
+        mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
+fn initialize_tool_result_policy_evaluations(
+    mut commands: Commands,
+    operations: Query<
+        (Entity, &OperationOf, &ToolEffectInput, &OperationState),
+        Without<ToolResultPolicyInitialized>,
+    >,
+    runs: Query<(&RunOf, Option<&RunControl>)>,
+    agents: Query<Option<&AgentPolicies>>,
+    policies: Query<(Entity, &StableId, &Policy)>,
+    mut progress: ResMut<Progress>,
+) {
+    for (operation, operation_of, input, state) in &operations {
+        let OperationPhase::Settled(OperationOutcome::Success(EffectOutput::Tool(output))) =
+            &state.phase
+        else {
+            continue;
+        };
+        let Ok((run_of, control)) = runs.get(operation_of.get()) else {
+            continue;
+        };
+        if !control_allows_internal_progress(control) {
+            continue;
+        }
+        let mut ordered = agents
+            .get(run_of.get())
+            .ok()
+            .flatten()
+            .into_iter()
+            .flat_map(|agent_policies| agent_policies.iter())
+            .filter_map(|entity| policies.get(entity).ok())
+            .filter(|(_, _, policy)| policy.rule.applies_to(PolicyPoint::ToolResult))
+            .collect::<Vec<_>>();
+        ordered.sort_by(|(_, left_id, left), (_, right_id, right)| {
+            left.order
+                .cmp(&right.order)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let snapshot = ordered
+            .into_iter()
+            .map(|(entity, id, policy)| AcceptedPolicy {
+                id: id.clone(),
+                entity,
+                revision: policy.revision,
+            })
+            .collect::<Vec<_>>();
+        commands
+            .entity(operation)
+            .insert(ToolResultPolicyInitialized);
+        if snapshot.is_empty() {
+            commands.entity(operation).insert((
+                AcceptedToolResultPolicies::default(),
+                EffectiveToolOutput(output.clone()),
+                ToolResultPolicyDone,
+            ));
+        } else {
+            commands
+                .entity(operation)
+                .insert(AcceptedToolResultPolicies(snapshot.clone()));
+            commands.spawn((
+                EvaluationOfOperation(operation),
+                ToolResultPolicyEvaluation {
+                    run: operation_of.get(),
+                    policies: snapshot,
+                    cursor: 0,
+                    input: input.clone(),
+                    effective: output.clone(),
+                    phase: ToolResultPolicyEvaluationPhase::Evaluating,
+                },
+            ));
+        }
+        mark_progress(&mut progress);
+    }
+}
+
+fn evaluate_tool_result_policies(world: &mut World) {
+    let mut query = world.query::<(Entity, &EvaluationOfOperation, &ToolResultPolicyEvaluation)>();
+    let mut ready = query
+        .iter(world)
+        .filter(|(_, _, evaluation)| {
+            matches!(
+                evaluation.phase,
+                ToolResultPolicyEvaluationPhase::Evaluating
+            )
+        })
+        .map(|(entity, operation, evaluation)| {
+            (
+                entity,
+                operation.get(),
+                evaluation.run,
+                evaluation.cursor,
+                evaluation.input.index,
+            )
+        })
+        .collect::<Vec<_>>();
+    ready.retain(|(_, _, run, _, _)| world_allows_internal_progress(world, *run));
+    ready.sort_by(|left, right| {
+        let left_id = world.get::<StableId>(left.2);
+        let right_id = world.get::<StableId>(right.2);
+        left_id
+            .cmp(&right_id)
+            .then_with(|| left.4.cmp(&right.4))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.0.to_bits().cmp(&right.0.to_bits()))
+    });
+
+    for (evaluation_entity, operation, run, cursor, _) in ready {
+        let Some(evaluation) = world
+            .get::<ToolResultPolicyEvaluation>(evaluation_entity)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(policy) = evaluation.policies.get(cursor).cloned() else {
+            world.entity_mut(operation).insert((
+                EffectiveToolOutput(evaluation.effective),
+                ToolResultPolicyDone,
+            ));
+            if let Some(mut evaluation) =
+                world.get_mut::<ToolResultPolicyEvaluation>(evaluation_entity)
+            {
+                evaluation.phase = ToolResultPolicyEvaluationPhase::Accepted;
+            }
+            mark_progress(&mut world.resource_mut::<Progress>());
+            continue;
+        };
+        let mut invocation = ToolResultPolicyInvocation {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            run,
+            operation,
+            input: evaluation.input,
+            result: evaluation.effective,
+            decision: None,
+        };
+        world.trigger_ref(&mut invocation);
+        match invocation.decision {
+            Some(ToolResultPolicyDecision::Keep) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolResultPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(ToolResultPolicyDecision::Rewrite(presentation)) => {
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolResultPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.effective.presentation = presentation;
+                    evaluation.cursor += 1;
+                }
+            }
+            Some(ToolResultPolicyDecision::AwaitApproval(prompt)) => {
+                let approval = begin_policy_approval(
+                    world,
+                    evaluation_entity,
+                    run,
+                    &policy,
+                    PolicyPoint::ToolResult,
+                    prompt,
+                );
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolResultPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = ToolResultPolicyEvaluationPhase::WaitingApproval {
+                        operation: approval,
+                        policy: policy.id.clone(),
+                    };
+                }
+            }
+            decision @ (Some(ToolResultPolicyDecision::Stop(_)) | None) => {
+                let reason = match decision {
+                    Some(ToolResultPolicyDecision::Stop(reason)) => reason,
+                    _ => "policy did not provide a steering decision".to_owned(),
+                };
+                if let Some(mut evaluation) =
+                    world.get_mut::<ToolResultPolicyEvaluation>(evaluation_entity)
+                {
+                    evaluation.phase = ToolResultPolicyEvaluationPhase::Rejected {
+                        policy: policy.id.clone(),
+                        reason,
+                    };
+                }
+                if let Some(mut state) = world.get_mut::<RunState>(run) {
+                    *state = RunState::Failed(CanonicalError::PolicyDenied {
+                        policy: policy.id.as_str().to_owned(),
+                    });
+                }
+            }
+        }
+        mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
+fn apply_policy_approval_results(world: &mut World) {
+    let mut query = world.query_filtered::<(
+        Entity,
+        &ApprovalForEvaluation,
+        &OperationOf,
+        &PolicyApprovalEffectInput,
+        &OperationState,
+    ), Without<PolicyApprovalApplied>>();
+    let settled = query
+        .iter(world)
+        .filter_map(|(operation, evaluation, run, input, state)| {
+            let OperationPhase::Settled(outcome) = &state.phase else {
+                return None;
+            };
+            Some((
+                operation,
+                evaluation.get(),
+                run.get(),
+                input.clone(),
+                outcome.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    for (operation, evaluation_entity, run, input, outcome) in settled {
+        let approved = matches!(
+            &outcome,
+            OperationOutcome::Success(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                approved: true,
+                ..
+            }))
+        );
+        let rejection_reason = match &outcome {
+            OperationOutcome::Success(EffectOutput::PolicyApproval(output)) => output
+                .reason
+                .clone()
+                .unwrap_or_else(|| "approval denied".to_owned()),
+            OperationOutcome::Failure(error) => error.to_string(),
+            OperationOutcome::Success(_) => "approval effect kind mismatch".to_owned(),
+        };
+        let mut matched = false;
+
+        if let Some(mut evaluation) = world.get_mut::<RequestPolicyEvaluation>(evaluation_entity)
+            && matches!(
+                evaluation.phase,
+                RequestPolicyEvaluationPhase::WaitingApproval {
+                    operation: waiting,
+                    ..
+                } if waiting == operation
+            )
+        {
+            matched = true;
+            if approved {
+                evaluation.cursor += 1;
+                evaluation.phase = RequestPolicyEvaluationPhase::Evaluating;
+            } else {
+                evaluation.phase = RequestPolicyEvaluationPhase::Rejected {
+                    policy: input.policy_id.clone(),
+                    reason: rejection_reason.clone(),
+                };
+            }
+        }
+        if let Some(mut evaluation) = world.get_mut::<ToolCallPolicyEvaluation>(evaluation_entity)
+            && matches!(
+                evaluation.phase,
+                ToolCallPolicyEvaluationPhase::WaitingApproval {
+                    operation: waiting,
+                    ..
+                } if waiting == operation
+            )
+        {
+            matched = true;
+            if approved {
+                evaluation.cursor += 1;
+                evaluation.phase = ToolCallPolicyEvaluationPhase::Evaluating;
+            } else {
+                evaluation.phase = ToolCallPolicyEvaluationPhase::Rejected {
+                    policy: input.policy_id.clone(),
+                    reason: rejection_reason.clone(),
+                };
+            }
+        }
+        if let Some(mut evaluation) =
+            world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
+            && matches!(
+                evaluation.phase,
+                InvalidToolCallPolicyEvaluationPhase::WaitingApproval {
+                    operation: waiting,
+                    ..
+                } if waiting == operation
+            )
+        {
+            matched = true;
+            if approved {
+                evaluation.cursor += 1;
+                evaluation.phase = InvalidToolCallPolicyEvaluationPhase::Evaluating;
+            } else {
+                evaluation.phase = InvalidToolCallPolicyEvaluationPhase::Rejected {
+                    policy: input.policy_id.clone(),
+                    reason: rejection_reason.clone(),
+                };
+            }
+        }
+        if let Some(mut evaluation) = world.get_mut::<ToolResultPolicyEvaluation>(evaluation_entity)
+            && matches!(
+                evaluation.phase,
+                ToolResultPolicyEvaluationPhase::WaitingApproval {
+                    operation: waiting,
+                    ..
+                } if waiting == operation
+            )
+        {
+            matched = true;
+            if approved {
+                evaluation.cursor += 1;
+                evaluation.phase = ToolResultPolicyEvaluationPhase::Evaluating;
+            } else {
+                evaluation.phase = ToolResultPolicyEvaluationPhase::Rejected {
+                    policy: input.policy_id.clone(),
+                    reason: rejection_reason.clone(),
+                };
+            }
+        }
+        if let Some(mut evaluation) =
+            world.get_mut::<CompletionResponsePolicyEvaluation>(evaluation_entity)
+            && matches!(
+                evaluation.phase,
+                CompletionResponsePolicyEvaluationPhase::WaitingApproval {
+                    operation: waiting,
+                    ..
+                } if waiting == operation
+            )
+        {
+            matched = true;
+            if approved {
+                evaluation.cursor += 1;
+                evaluation.phase = CompletionResponsePolicyEvaluationPhase::Evaluating;
+            } else {
+                evaluation.phase = CompletionResponsePolicyEvaluationPhase::Rejected {
+                    policy: input.policy_id.clone(),
+                    reason: rejection_reason.clone(),
+                };
+            }
+        }
+        if let Some(mut evaluation) = world.get_mut::<TextDeltaPolicyEvaluation>(evaluation_entity)
+            && matches!(
+                evaluation.phase,
+                TextDeltaPolicyEvaluationPhase::WaitingApproval {
+                    operation: waiting,
+                    ..
+                } if waiting == operation
+            )
+        {
+            matched = true;
+            if approved {
+                evaluation.cursor += 1;
+                evaluation.phase = TextDeltaPolicyEvaluationPhase::Evaluating;
+            } else {
+                evaluation.phase = TextDeltaPolicyEvaluationPhase::Rejected {
+                    policy: input.policy_id.clone(),
+                    reason: rejection_reason,
+                };
+            }
+        }
+
+        if matched
+            && !approved
+            && let Some(mut state) = world.get_mut::<RunState>(run)
+        {
+            *state = RunState::Failed(CanonicalError::PolicyDenied {
+                policy: input.policy_id.as_str().to_owned(),
+            });
+        }
+        world.entity_mut(operation).insert(PolicyApprovalApplied);
+        mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
 fn commit_store_operations(
     operations: Query<
         (Entity, &OperationOf, &StoreEffectInput, &OperationState),
         With<StoreEffectInput>,
     >,
-    mut runs: Query<(&mut RunState, &mut RunRecord)>,
+    mut runs: Query<(&mut RunState, &mut RunRecord, Option<&RunControl>)>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation_entity, operation_of, input, operation) in &operations {
         let OperationPhase::Settled(outcome) = &operation.phase else {
             continue;
         };
-        let Ok((mut run_state, mut record)) = runs.get_mut(operation_of.get()) else {
+        let Ok((mut run_state, mut record, control)) = runs.get_mut(operation_of.get()) else {
             continue;
         };
+        if !control_allows_internal_progress(control) {
+            continue;
+        }
         if !matches!(
             *run_state,
             RunState::WaitingStore { operation } if operation == operation_entity
@@ -4497,22 +7634,45 @@ fn commit_store_operations(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn commit_model_operations(
     mut commands: Commands,
     operations: Query<
-        (Entity, &OperationOf, &OperationState, &ModelEffectInput),
+        (
+            Entity,
+            &OperationOf,
+            &OperationState,
+            &ModelEffectInput,
+            Option<&EffectiveModelOutput>,
+            Option<&CompletionResponsePolicyDone>,
+            Option<&AcceptedPolicies>,
+            Option<&AcceptedCompletionResponsePolicies>,
+        ),
         With<ModelEffectInput>,
     >,
-    mut runs: Query<(&mut RunState, &mut RunRecord)>,
+    mut runs: Query<(&mut RunState, &mut RunRecord, Option<&RunControl>)>,
     mut progress: ResMut<Progress>,
 ) {
-    for (operation_entity, operation_of, operation, input) in &operations {
+    for (
+        operation_entity,
+        operation_of,
+        operation,
+        input,
+        effective_output,
+        response_policy_done,
+        request_policies,
+        response_policies,
+    ) in &operations
+    {
         let OperationPhase::Settled(outcome) = &operation.phase else {
             continue;
         };
-        let Ok((mut run_state, mut record)) = runs.get_mut(operation_of.get()) else {
+        let Ok((mut run_state, mut record, control)) = runs.get_mut(operation_of.get()) else {
             continue;
         };
+        if !control_allows_internal_progress(control) {
+            continue;
+        }
         let RunState::WaitingModel {
             operation: waiting_operation,
         } = *run_state
@@ -4524,6 +7684,10 @@ fn commit_model_operations(
         }
         match outcome {
             OperationOutcome::Success(EffectOutput::Model(output)) => {
+                if response_policy_done.is_none() {
+                    continue;
+                }
+                let output = effective_output.map_or(output, |effective| &effective.0);
                 let mut call_ids = HashSet::with_capacity(output.tool_calls.len());
                 if let Some(duplicate) = output
                     .tool_calls
@@ -4561,13 +7725,24 @@ fn commit_model_operations(
                             }
                         }));
                 }
+                let committed_turn = record.next_turn;
                 commands.spawn((
                     TurnOf(operation_of.get()),
                     CommittedTurn {
-                        index: record.next_turn,
+                        index: committed_turn,
                         output: output.clone(),
                     },
                 ));
+                commands.trigger(ModelTurnFinished {
+                    run: operation_of.get(),
+                    operation: operation_entity,
+                    turn: committed_turn,
+                    output: output.clone(),
+                    request_policies: request_policies
+                        .map_or_else(Vec::new, |policies| policies.0.clone()),
+                    response_policies: response_policies
+                        .map_or_else(Vec::new, |policies| policies.0.clone()),
+                });
                 record.next_turn = record.next_turn.saturating_add(1);
                 let terminal_text = if output.tool_calls.is_empty() {
                     Some((
@@ -4634,54 +7809,67 @@ fn commit_model_operations(
                     }
                 } else {
                     let mut prepared = Vec::with_capacity(output.tool_calls.len());
-                    let mut failure = None;
                     for (index, call) in output.tool_calls.iter().enumerate() {
-                        let Some(decision) = input.tools.iter().find(|tool| tool.name == call.name)
-                        else {
-                            failure = Some(CanonicalError::UnknownTool(call.name.clone()));
-                            break;
-                        };
-                        prepared.push(ToolEffectInput {
-                            decision: decision.clone(),
-                            call_id: call.id.clone(),
-                            provider_result_id: call.provider_result_id.clone(),
-                            provider_call_id: call.provider_call_id.clone(),
-                            arguments: call.arguments.clone(),
-                            index: u32::try_from(index).unwrap_or(u32::MAX),
-                        });
+                        let index = u32::try_from(index).unwrap_or(u32::MAX);
+                        prepared.push(
+                            if let Some(decision) =
+                                input.tools.iter().find(|tool| tool.name == call.name)
+                            {
+                                PreparedToolOperation::Valid(ToolEffectInput {
+                                    decision: decision.clone(),
+                                    call_id: call.id.clone(),
+                                    provider_result_id: call.provider_result_id.clone(),
+                                    provider_call_id: call.provider_call_id.clone(),
+                                    arguments: call.arguments.clone(),
+                                    index,
+                                })
+                            } else {
+                                PreparedToolOperation::Invalid(PendingInvalidToolCall {
+                                    call: call.clone(),
+                                    available_tools: input.tools.clone(),
+                                    index,
+                                })
+                            },
+                        );
                     }
-                    if let Some(error) = failure {
-                        *run_state = RunState::Failed(error);
-                    } else {
-                        let expected = u32::try_from(prepared.len()).unwrap_or(u32::MAX);
-                        let batch = commands
-                            .spawn((
-                                BatchOf(operation_of.get()),
-                                ToolBatchState {
-                                    source_model_operation: operation_entity,
-                                    expected,
-                                    committed: false,
-                                },
-                            ))
-                            .id();
-                        for tool_input in prepared {
-                            commands.spawn((
-                                OperationOf(operation_of.get()),
-                                OperationOfBatch(batch),
-                                OperationKind::Tool,
-                                OperationState {
-                                    generation: 0,
-                                    phase: OperationPhase::Prepared,
-                                },
-                                tool_input,
-                            ));
+                    let expected = u32::try_from(prepared.len()).unwrap_or(u32::MAX);
+                    let batch = commands
+                        .spawn((
+                            BatchOf(operation_of.get()),
+                            ToolBatchState {
+                                source_model_operation: operation_entity,
+                                expected,
+                                committed: false,
+                            },
+                        ))
+                        .id();
+                    for tool_input in prepared {
+                        let mut operation = commands.spawn((
+                            OperationOf(operation_of.get()),
+                            OperationOfBatch(batch),
+                            OperationKind::Tool,
+                            OperationState {
+                                generation: 0,
+                                phase: OperationPhase::Prepared,
+                            },
+                        ));
+                        match tool_input {
+                            PreparedToolOperation::Valid(input) => {
+                                operation.insert(PendingToolCall(input));
+                            }
+                            PreparedToolOperation::Invalid(invalid) => {
+                                operation.insert(invalid);
+                            }
                         }
-                        *run_state = RunState::WaitingTools { batch };
                     }
+                    *run_state = RunState::WaitingTools { batch };
                 }
             }
             OperationOutcome::Success(
-                EffectOutput::Tool(_) | EffectOutput::Discovery(_) | EffectOutput::Store(_),
+                EffectOutput::Tool(_)
+                | EffectOutput::Discovery(_)
+                | EffectOutput::Store(_)
+                | EffectOutput::PolicyApproval(_),
             ) => {
                 *run_state = RunState::Failed(CanonicalError::EffectKindMismatch);
             }
@@ -4723,9 +7911,14 @@ fn validate_structured_output(
 fn commit_tool_batches(
     mut commands: Commands,
     mut batches: Query<(Entity, &BatchOf, &BatchOperations, &mut ToolBatchState)>,
-    operations: Query<(&ToolEffectInput, &OperationState)>,
-    source_models: Query<(&ModelEffectInput, &AcceptedPolicies)>,
-    mut runs: Query<(&mut RunState, &mut RunRecord)>,
+    operations: Query<(
+        &ToolEffectInput,
+        &OperationState,
+        Option<&EffectiveToolOutput>,
+        Option<&ToolResultPolicyDone>,
+    )>,
+    source_models: Query<&ModelEffectInput>,
+    mut runs: Query<(&mut RunState, &mut RunRecord, Option<&RunControl>)>,
     mut progress: ResMut<Progress>,
 ) {
     'batches: for (batch_entity, batch_of, batch_operations, mut batch) in &mut batches {
@@ -4737,7 +7930,8 @@ fn commit_tool_batches(
         let mut settled = Vec::with_capacity(batch_operations.iter().count());
         let mut all_settled = true;
         for operation_entity in batch_operations.iter() {
-            let Ok((input, state)) = operations.get(operation_entity) else {
+            let Ok((input, state, effective, policy_done)) = operations.get(operation_entity)
+            else {
                 all_settled = false;
                 break;
             };
@@ -4745,21 +7939,30 @@ fn commit_tool_batches(
                 all_settled = false;
                 break;
             };
-            settled.push((input.index, input, outcome));
+            if matches!(outcome, OperationOutcome::Success(EffectOutput::Tool(_)))
+                && policy_done.is_none()
+            {
+                all_settled = false;
+                break;
+            }
+            settled.push((input.index, input, outcome, effective));
         }
         if !all_settled {
             continue;
         }
-        settled.sort_by_key(|(index, _, _)| *index);
-        let Ok((mut run_state, mut record)) = runs.get_mut(batch_of.get()) else {
+        settled.sort_by_key(|(index, _, _, _)| *index);
+        let Ok((mut run_state, mut record, control)) = runs.get_mut(batch_of.get()) else {
             continue;
         };
+        if !control_allows_internal_progress(control) {
+            continue;
+        }
         if !matches!(*run_state, RunState::WaitingTools { batch } if batch == batch_entity) {
             continue;
         }
-        if let Some((_, _, OperationOutcome::Failure(error))) = settled
+        if let Some((_, _, OperationOutcome::Failure(error), _)) = settled
             .iter()
-            .find(|(_, _, outcome)| matches!(outcome, OperationOutcome::Failure(_)))
+            .find(|(_, _, outcome, _)| matches!(outcome, OperationOutcome::Failure(_)))
         {
             *run_state = RunState::Failed(error.clone());
             batch.committed = true;
@@ -4767,7 +7970,7 @@ fn commit_tool_batches(
             continue;
         }
         let mut results = Vec::with_capacity(settled.len());
-        for (_, input, outcome) in settled {
+        for (_, input, outcome, effective) in settled {
             let OperationOutcome::Success(EffectOutput::Tool(output)) = outcome else {
                 *run_state = RunState::Failed(CanonicalError::EffectKindMismatch);
                 batch.committed = true;
@@ -4784,7 +7987,7 @@ fn commit_tool_batches(
                 mark_progress(&mut progress);
                 continue 'batches;
             }
-            results.push(output.clone());
+            results.push(effective.map_or_else(|| output.clone(), |effective| effective.0.clone()));
         }
         for result in &results {
             record.transcript.push(TranscriptEntry::ToolResult {
@@ -4796,8 +7999,7 @@ fn commit_tool_batches(
                 content: result.presentation.clone(),
             });
         }
-        let Ok((source_input, accepted_policies)) = source_models.get(batch.source_model_operation)
-        else {
+        let Ok(source_input) = source_models.get(batch.source_model_operation) else {
             *run_state = RunState::Failed(CanonicalError::StaleEntity(
                 "source model operation".to_owned(),
             ));
@@ -4818,9 +8020,7 @@ fn commit_tool_batches(
                     phase: OperationPhase::Prepared,
                 },
                 next_input.decision.clone(),
-                next_input,
-                accepted_policies.clone(),
-                PolicyStatus::Accepted,
+                PendingModelRequest(next_input),
             ))
             .id();
         *run_state = RunState::WaitingModel {
@@ -4834,6 +8034,79 @@ fn commit_tool_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Component)]
+    struct InspectRequestPolicy {
+        expected_instructions: String,
+        replacement_instructions: String,
+    }
+
+    #[derive(Component)]
+    struct InspectToolPolicy {
+        expected_arguments: serde_json::Value,
+        replacement_arguments: serde_json::Value,
+    }
+
+    #[derive(Component)]
+    struct InspectToolResultPolicy {
+        expected_presentation: String,
+        replacement_presentation: String,
+    }
+
+    #[derive(Resource, Default)]
+    struct FinishedTurns(Vec<ModelTurnFinished>);
+
+    fn inspect_request_policy(
+        mut event: On<RequestPolicyInvocation>,
+        policies: Query<&InspectRequestPolicy>,
+    ) {
+        let Ok(policy) = policies.get(event.policy) else {
+            return;
+        };
+        event.decision = Some(
+            if event.request.instructions == policy.expected_instructions {
+                RequestPolicyDecision::Patch(
+                    RequestPatch::new().instructions(policy.replacement_instructions.clone()),
+                )
+            } else {
+                RequestPolicyDecision::Stop("earlier rewrite was not visible".to_owned())
+            },
+        );
+    }
+
+    fn inspect_tool_policy(
+        mut event: On<ToolCallPolicyInvocation>,
+        policies: Query<&InspectToolPolicy>,
+    ) {
+        let Ok(policy) = policies.get(event.policy) else {
+            return;
+        };
+        event.decision = Some(if event.call.arguments == policy.expected_arguments {
+            ToolCallPolicyDecision::Rewrite(policy.replacement_arguments.clone())
+        } else {
+            ToolCallPolicyDecision::Stop("earlier argument rewrite was not visible".to_owned())
+        });
+    }
+
+    fn inspect_tool_result_policy(
+        mut event: On<ToolResultPolicyInvocation>,
+        policies: Query<&InspectToolResultPolicy>,
+    ) {
+        let Ok(policy) = policies.get(event.policy) else {
+            return;
+        };
+        event.decision = Some(
+            if event.result.presentation == policy.expected_presentation {
+                ToolResultPolicyDecision::Rewrite(policy.replacement_presentation.clone())
+            } else {
+                ToolResultPolicyDecision::Stop("earlier result rewrite was not visible".to_owned())
+            },
+        );
+    }
+
+    fn record_finished_turn(event: On<ModelTurnFinished>, mut turns: ResMut<FinishedTurns>) {
+        turns.0.push(event.event().clone());
+    }
 
     fn id(value: &str) -> StableId {
         StableId::new(value).unwrap()
@@ -4891,6 +8164,38 @@ mod tests {
             )
             .unwrap();
         (runtime, agent)
+    }
+
+    fn advance_to_lookup_tool(
+        runtime: &mut Runtime,
+        agent: AgentHandle,
+    ) -> (PendingRunHandle, EffectRequest) {
+        let pending = runtime.handle().prompt(agent, "use lookup").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "lookup".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let tool = runtime.effects().try_recv().unwrap().unwrap();
+        (pending, tool)
     }
 
     #[test]
@@ -5442,6 +8747,71 @@ mod tests {
     }
 
     #[test]
+    fn text_delta_policy_preserves_sequence_and_stops_before_publication() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("stream-guard"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 2,
+                    rule: PolicyRule::StopTextDeltaContains {
+                        needle: "blocked".to_owned(),
+                        reason: "unsafe stream".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let (_, stream) = runtime.handle().prompt_stream(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        let deltas = runtime.effects().delta_sender();
+        for (sequence, text) in [(0, "safe"), (1, "blocked")] {
+            deltas
+                .try_send(EffectDelta {
+                    operation: request.operation,
+                    generation: request.generation,
+                    sequence,
+                    text: text.to_owned(),
+                })
+                .unwrap();
+        }
+
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::Delta {
+                sequence: 0,
+                text: "safe".to_owned(),
+            })
+        );
+        assert!(matches!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::Finished(StreamTerminal::Failed(
+                CanonicalError::PolicyDenied { policy }
+            ))) if policy == "stream-guard"
+        ));
+        assert_eq!(stream.try_recv().unwrap(), None);
+    }
+
+    #[test]
     fn slow_stream_consumer_is_disconnected_without_cancelling_the_run() {
         let mut runtime = Runtime::new(RuntimeConfig {
             subscriber_capacity: 1,
@@ -5756,7 +9126,7 @@ mod tests {
         let agent = runtime
             .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
             .unwrap();
-        runtime
+        let policy = runtime
             .spawn_policy(
                 id("deny-secret"),
                 tenant("a"),
@@ -5790,8 +9160,725 @@ mod tests {
             runtime.world().get::<AcceptedPolicies>(operation),
             Some(&AcceptedPolicies(vec![AcceptedPolicy {
                 id: id("deny-secret"),
+                entity: policy,
                 revision: 4,
             }]))
+        );
+    }
+
+    #[test]
+    fn request_patches_reduce_by_order_and_remain_operation_local() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(
+                id("agent"),
+                tenant("a"),
+                Agent {
+                    instructions: "baseline".to_owned(),
+                    additional_params: Some(serde_json::json!({"baseline": true, "winner": 0})),
+                    ..Agent::default()
+                },
+                model,
+            )
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("z-last"),
+                tenant("a"),
+                Policy {
+                    order: 10,
+                    revision: 2,
+                    rule: PolicyRule::PatchRequest(
+                        RequestPatch::new()
+                            .instructions("last")
+                            .additional_params(serde_json::json!({"winner": 2, "z": true})),
+                    ),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("a-first"),
+                tenant("a"),
+                Policy {
+                    order: 10,
+                    revision: 1,
+                    rule: PolicyRule::PatchRequest(
+                        RequestPatch::new()
+                            .instructions("first")
+                            .additional_params(serde_json::json!({"winner": 1, "a": true})),
+                    ),
+                },
+                agent,
+            )
+            .unwrap();
+
+        runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let effect = runtime.effects().try_recv().unwrap().unwrap();
+        let input = effect.model_input().unwrap();
+        assert_eq!(input.instructions, "last");
+        assert_eq!(
+            input.additional_params,
+            Some(serde_json::json!({
+                "a": true,
+                "baseline": true,
+                "winner": 2,
+                "z": true
+            }))
+        );
+        assert_eq!(
+            runtime
+                .world()
+                .get::<Agent>(agent.entity())
+                .unwrap()
+                .instructions,
+            "baseline"
+        );
+    }
+
+    #[test]
+    fn targeted_custom_policy_observes_earlier_effective_request() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("first"),
+                tenant("a"),
+                Policy {
+                    order: 1,
+                    revision: 1,
+                    rule: PolicyRule::PatchRequest(
+                        RequestPatch::new().instructions("rewritten once"),
+                    ),
+                },
+                agent,
+            )
+            .unwrap();
+        let custom = runtime
+            .spawn_policy(
+                id("second"),
+                tenant("a"),
+                Policy {
+                    order: 2,
+                    revision: 7,
+                    rule: PolicyRule::Custom(PolicyPoint::Request),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(custom)
+            .insert(InspectRequestPolicy {
+                expected_instructions: "rewritten once".to_owned(),
+                replacement_instructions: "rewritten twice".to_owned(),
+            })
+            .observe(inspect_request_policy);
+
+        runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let effect = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            effect.model_input().unwrap().instructions,
+            "rewritten twice"
+        );
+    }
+
+    #[test]
+    fn custom_policy_without_a_responder_fails_closed() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("unbound"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::Custom(PolicyPoint::Request),
+                },
+                agent,
+            )
+            .unwrap();
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Failed(CanonicalError::PolicyDenied {
+                policy: "unbound".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn request_approval_operation_suspends_and_resumes_policy_cursor() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("approval"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 9,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::Request,
+                        prompt: "approve model call".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let approval = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            approval.policy_approval_input(),
+            Some(&PolicyApprovalEffectInput {
+                policy_id: id("approval"),
+                revision: 9,
+                point: PolicyPoint::Request,
+                prompt: "approve model call".to_owned(),
+            })
+        );
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: true,
+                    reason: None,
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        assert!(
+            runtime
+                .effects()
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .model_input()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn denied_tool_approval_prevents_tool_dispatch() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("tool-approval"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::ToolCall,
+                        prompt: "approve tool".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let pending = runtime.handle().prompt(agent, "use lookup").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "lookup".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let approval = runtime.effects().try_recv().unwrap().unwrap();
+        assert!(approval.policy_approval_input().is_some());
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: false,
+                    reason: Some("operator denied".to_owned()),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Failed(CanonicalError::PolicyDenied {
+                policy: "tool-approval".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn completion_response_policy_runs_before_commit_and_emits_turn_event() {
+        let mut runtime = runtime();
+        runtime
+            .world_mut()
+            .insert_resource(FinishedTurns::default());
+        runtime.world_mut().add_observer(record_finished_turn);
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("rewrite-response"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 5,
+                    rule: PolicyRule::RewriteCompletionText {
+                        text: "rewritten".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "original".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert!(matches!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "rewritten"
+        ));
+        let turns = &runtime.world().resource::<FinishedTurns>().0;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].output.text, "rewritten");
+        assert_eq!(turns[0].response_policies[0].revision, 5);
+    }
+
+    #[test]
+    fn stopped_completion_response_never_commits_a_turn() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("stop-response"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::StopCompletionContains {
+                        needle: "secret".to_owned(),
+                        reason: "sensitive completion".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "a secret".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Failed(CanonicalError::PolicyDenied {
+                policy: "stop-response".to_owned(),
+            }))
+        );
+        assert!(runtime.run_committed_turns(run).is_empty());
+    }
+
+    #[test]
+    fn tool_argument_rewrites_chain_in_policy_order() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("first-rewrite"),
+                tenant("a"),
+                Policy {
+                    order: 1,
+                    revision: 1,
+                    rule: PolicyRule::RewriteToolArguments {
+                        tool: Some("lookup".to_owned()),
+                        arguments: serde_json::json!({"step": 1}),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let second = runtime
+            .spawn_policy(
+                id("second-rewrite"),
+                tenant("a"),
+                Policy {
+                    order: 2,
+                    revision: 1,
+                    rule: PolicyRule::Custom(PolicyPoint::ToolCall),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(second)
+            .insert(InspectToolPolicy {
+                expected_arguments: serde_json::json!({"step": 1}),
+                replacement_arguments: serde_json::json!({"step": 2}),
+            })
+            .observe(inspect_tool_policy);
+
+        runtime.handle().prompt(agent, "use lookup").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "lookup".to_owned(),
+                        arguments: serde_json::json!({"step": 0}),
+                    }],
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let tool = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            tool.tool_input().unwrap().arguments,
+            serde_json::json!({"step": 2})
+        );
+    }
+
+    #[test]
+    fn skipped_tool_call_never_dispatches_and_reenters_model_flow() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("skip"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::SkipToolCall {
+                        tool: Some("lookup".to_owned()),
+                        reason: "approval denied".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+
+        runtime.handle().prompt(agent, "use lookup").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "lookup".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let next_model = runtime.effects().try_recv().unwrap().unwrap();
+        let input = next_model.model_input().unwrap();
+        assert_eq!(input.tool_results.len(), 1);
+        assert_eq!(input.tool_results[0].presentation, "approval denied");
+        assert_eq!(
+            input.tool_results[0].raw,
+            serde_json::json!({"skipped": true, "reason": "approval denied"})
+        );
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+    }
+
+    #[test]
+    fn tool_result_rewrites_chain_without_mutating_raw_audit_data() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("first-result"),
+                tenant("a"),
+                Policy {
+                    order: 1,
+                    revision: 1,
+                    rule: PolicyRule::RewriteToolResult {
+                        tool: Some("lookup".to_owned()),
+                        presentation: "redacted once".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let second = runtime
+            .spawn_policy(
+                id("second-result"),
+                tenant("a"),
+                Policy {
+                    order: 2,
+                    revision: 1,
+                    rule: PolicyRule::Custom(PolicyPoint::ToolResult),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .world_mut()
+            .entity_mut(second)
+            .insert(InspectToolResultPolicy {
+                expected_presentation: "redacted once".to_owned(),
+                replacement_presentation: "redacted twice".to_owned(),
+            })
+            .observe(inspect_tool_result_policy);
+        let (pending, tool) = advance_to_lookup_tool(&mut runtime, agent);
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: tool.operation,
+                generation: tool.generation,
+                result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                    call_id: "call".to_owned(),
+                    provider_result_id: "call".to_owned(),
+                    provider_call_id: None,
+                    name: "lookup".to_owned(),
+                    raw: serde_json::json!({"secret": 42}),
+                    presentation: "unredacted".to_owned(),
+                    failure: None,
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let next_model = runtime.effects().try_recv().unwrap().unwrap();
+        let result = &next_model.model_input().unwrap().tool_results[0];
+        assert_eq!(result.raw, serde_json::json!({"secret": 42}));
+        assert_eq!(result.presentation, "redacted twice");
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert!(
+            runtime
+                .world()
+                .get::<RunRecord>(run.entity())
+                .unwrap()
+                .transcript
+                .iter()
+                .any(|entry| matches!(
+                    entry,
+                    TranscriptEntry::ToolResult { raw, content, .. }
+                        if raw == &serde_json::json!({"secret": 42}) && content == "redacted twice"
+                ))
+        );
+    }
+
+    #[test]
+    fn stopped_tool_result_is_not_committed_or_redispatched() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("stop-result"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::StopToolResult {
+                        tool: None,
+                        reason: "sensitive result".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let (pending, tool) = advance_to_lookup_tool(&mut runtime, agent);
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: tool.operation,
+                generation: tool.generation,
+                result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                    call_id: "call".to_owned(),
+                    provider_result_id: "call".to_owned(),
+                    provider_call_id: None,
+                    name: "lookup".to_owned(),
+                    raw: serde_json::json!({"secret": 42}),
+                    presentation: "secret".to_owned(),
+                    failure: None,
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Failed(CanonicalError::PolicyDenied {
+                policy: "stop-result".to_owned(),
+            }))
+        );
+        assert!(
+            !runtime
+                .world()
+                .get::<RunRecord>(run.entity())
+                .unwrap()
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::ToolResult { .. }))
         );
     }
 
@@ -6305,12 +10392,123 @@ mod tests {
             )))
         );
         assert_eq!(runtime.effects().try_recv().unwrap(), None);
-        assert!(
+        let batch = runtime
+            .world()
+            .get::<RunToolBatches>(run.entity())
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
+        assert_eq!(
             runtime
                 .world()
-                .get::<RunToolBatches>(run.entity())
-                .is_none()
+                .get::<ToolBatchState>(batch)
+                .unwrap()
+                .expected,
+            2
         );
+    }
+
+    #[test]
+    fn invalid_tool_repair_resolves_against_the_advertised_snapshot() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("repair"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 3,
+                    rule: PolicyRule::RepairInvalidTool {
+                        from: Some("lookpu".to_owned()),
+                        to: "lookup".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        runtime.handle().prompt(agent, "use lookup").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "lookpu".to_owned(),
+                        arguments: serde_json::json!({"query": "x"}),
+                    }],
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let tool = runtime.effects().try_recv().unwrap().unwrap();
+        let input = tool.tool_input().unwrap();
+        assert_eq!(input.decision.name, "lookup");
+        assert_eq!(input.arguments, serde_json::json!({"query": "x"}));
+    }
+
+    #[test]
+    fn invalid_tool_retry_returns_feedback_without_tool_dispatch() {
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .spawn_policy(
+                id("retry"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 1,
+                    rule: PolicyRule::RetryInvalidTool {
+                        tool: None,
+                        feedback: "choose an advertised tool".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        runtime.handle().prompt(agent, "use lookup").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let model = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: model.operation,
+                generation: model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "missing".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        let next_model = runtime.effects().try_recv().unwrap().unwrap();
+        let input = next_model.model_input().unwrap();
+        assert_eq!(input.tool_results.len(), 1);
+        assert_eq!(
+            input.tool_results[0].presentation,
+            "choose an advertised tool"
+        );
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
     }
 
     #[test]
@@ -6664,6 +10862,385 @@ mod tests {
         assert_eq!(
             runtime.world().get::<RunState>(cancelled.entity()),
             Some(&RunState::Cancelled)
+        );
+    }
+
+    #[test]
+    fn freeze_after_ingress_retains_completion_until_resume() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+        runtime
+            .handle()
+            .pause_with_mode(run, PauseMode::FreezeAfterIngress)
+            .unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "retained".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.world().get::<RunControl>(run.entity()),
+            Some(&RunControl::Paused(PauseMode::FreezeAfterIngress))
+        );
+        assert!(matches!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(RunState::WaitingModel { .. })
+        ));
+        assert!(runtime.run_committed_turns(run).is_empty());
+
+        runtime.handle().resume(run).unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(matches!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "retained"
+        ));
+    }
+
+    #[test]
+    fn cancel_and_suspend_rejects_late_completion_and_redispatches_new_generation() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        let run = runtime.resolve_run(&pending).unwrap();
+        runtime
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.effects().try_recv_cancellation().unwrap(),
+            Some(EffectCancellation {
+                operation: request.operation,
+                generation: request.generation,
+            })
+        );
+        assert_eq!(
+            runtime.world().get::<RunControl>(run.entity()),
+            Some(&RunControl::Paused(PauseMode::CancelAndSuspend))
+        );
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "late".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+
+        runtime.handle().resume(run).unwrap();
+        runtime.run_until_stalled().unwrap();
+        let retried = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(retried.operation, request.operation);
+        assert_eq!(retried.generation, request.generation + 1);
+    }
+
+    #[test]
+    fn drain_paused_run_does_not_block_sibling_progress() {
+        let (mut runtime, agent) = runtime_with_tool();
+        let first_pending = runtime.handle().prompt(agent, "first").unwrap();
+        let second_pending = runtime.handle().prompt(agent, "second").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let first_request = runtime.effects().try_recv().unwrap().unwrap();
+        let second_request = runtime.effects().try_recv().unwrap().unwrap();
+        let first = runtime.resolve_run(&first_pending).unwrap();
+        let second = runtime.resolve_run(&second_pending).unwrap();
+        runtime.handle().pause(first).unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: first_request.operation,
+                generation: first_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: String::new(),
+                    usage: Usage::default(),
+                    tool_calls: vec![ModelToolCall {
+                        id: "call".to_owned(),
+                        provider_result_id: "call".to_owned(),
+                        provider_call_id: None,
+                        name: "lookup".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                })),
+            })
+            .unwrap();
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: second_request.operation,
+                generation: second_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "sibling completed".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.world().get::<RunControl>(first.entity()),
+            Some(&RunControl::Paused(PauseMode::Drain))
+        );
+        assert!(matches!(
+            runtime.world().get::<RunState>(first.entity()),
+            Some(RunState::WaitingTools { .. })
+        ));
+        assert!(matches!(
+            runtime.world().get::<RunState>(second.entity()),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "sibling completed"
+        ));
+        assert_eq!(runtime.effects().try_recv().unwrap(), None);
+
+        runtime.handle().resume(first).unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(
+            runtime
+                .effects()
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .tool_input()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn child_results_commit_in_creation_order_not_completion_order() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let parent_pending = runtime.handle().prompt(agent, "parent").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let _parent_request = runtime.effects().try_recv().unwrap().unwrap();
+        let parent = runtime.resolve_run(&parent_pending).unwrap();
+        let first_pending = runtime
+            .handle()
+            .spawn_child_run(parent, agent, "first child")
+            .unwrap();
+        let second_pending = runtime
+            .handle()
+            .spawn_child_run(parent, agent, "second child")
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let first_request = runtime.effects().try_recv().unwrap().unwrap();
+        let second_request = runtime.effects().try_recv().unwrap().unwrap();
+        let first = runtime.resolve_run(&first_pending).unwrap();
+        let second = runtime.resolve_run(&second_pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<ParentRun>(first.entity()),
+            Some(&ParentRun(parent.entity()))
+        );
+        assert_eq!(
+            runtime.world().get::<ParentRun>(second.entity()),
+            Some(&ParentRun(parent.entity()))
+        );
+
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: second_request.operation,
+                generation: second_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "second output".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(
+            !runtime
+                .world()
+                .get::<RunRecord>(parent.entity())
+                .unwrap()
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::ChildResult { .. }))
+        );
+
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: first_request.operation,
+                generation: first_request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "first output".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let results = runtime
+            .world()
+            .get::<RunRecord>(parent.entity())
+            .unwrap()
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::ChildResult { result, .. } => result.as_ref().ok().cloned(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, vec!["first output", "second output"]);
+    }
+
+    #[test]
+    fn cancelling_parent_cancels_active_children() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let parent_pending = runtime.handle().prompt(agent, "parent").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let _ = runtime.effects().try_recv().unwrap().unwrap();
+        let parent = runtime.resolve_run(&parent_pending).unwrap();
+        let child_pending = runtime
+            .handle()
+            .spawn_child_run(parent, agent, "child")
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        let _ = runtime.effects().try_recv().unwrap().unwrap();
+        let child = runtime.resolve_run(&child_pending).unwrap();
+
+        runtime.handle().cancel(parent).unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(child.entity()),
+            Some(&RunState::Cancelled)
+        );
+    }
+
+    #[test]
+    fn agent_control_rejects_admission_and_bulk_resumes_runs() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let active_pending = runtime.handle().prompt(agent, "active").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let _ = runtime.effects().try_recv().unwrap().unwrap();
+        let active = runtime.resolve_run(&active_pending).unwrap();
+
+        runtime
+            .handle()
+            .pause_agent(agent, PauseMode::FreezeAfterIngress)
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.world().get::<RunControl>(active.entity()),
+            Some(&RunControl::Paused(PauseMode::FreezeAfterIngress))
+        );
+        let rejected_pending = runtime.handle().prompt(agent, "rejected").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let rejected = runtime.resolve_run(&rejected_pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(rejected.entity()),
+            Some(&RunState::Failed(CanonicalError::AgentAdmissionDenied))
+        );
+
+        runtime.handle().resume_agent(agent).unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(
+            runtime.world().get::<RunControl>(active.entity()),
+            Some(&RunControl::Running)
         );
     }
 
@@ -7203,6 +11780,7 @@ mod tests {
                 id: id("agent"),
                 tenant: tenant("a"),
                 agent: Agent::default(),
+                control: AgentControl::default(),
                 model_id: id("missing"),
                 output_requirement: None,
                 retrieval_requirement: None,

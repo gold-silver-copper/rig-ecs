@@ -26,6 +26,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check merge-base example inventory
+        run: |
+          missing=0
+          while IFS= read -r manifest; do
+            if [[ ! -f "$manifest" ]]; then
+              echo "::error file=$manifest::Example present at the migration merge base was removed"
+              missing=1
+            fi
+          done < .github/example-inventory.txt
+          exit "$missing"
+
       - name: Install Rust stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:

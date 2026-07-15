@@ -2,10 +2,12 @@
 
 use std::{error::Error, sync::Arc};
 
+use serde::{Deserialize, Serialize};
+
 use crate::tool::ToolOutput;
 
 /// Normalized classification for a tool execution error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[non_exhaustive]
 pub enum ToolErrorKind {
     /// Arguments could not be decoded or validated.

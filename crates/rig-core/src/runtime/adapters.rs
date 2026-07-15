@@ -1267,7 +1267,9 @@ where
                             ))),
                         }
                     }
-                    EffectInput::Discovery(_) => Err(CanonicalError::EffectKindMismatch),
+                    EffectInput::Discovery(_) | EffectInput::PolicyApproval(_) => {
+                        Err(CanonicalError::EffectKindMismatch)
+                    }
                 };
                 self.submit_completion(
                     &completion_sender,
@@ -1647,7 +1649,7 @@ where
                                 ))),
                             }
                         }
-                        EffectInput::Discovery(_) => {
+                        EffectInput::Discovery(_) | EffectInput::PolicyApproval(_) => {
                             Err(CanonicalError::EffectKindMismatch)
                         }
                     };
@@ -2528,6 +2530,21 @@ pub(crate) fn transcript_messages(
                         }
                     })?,
                 });
+            }
+            TranscriptEntry::ChildResult {
+                ordinal,
+                run_id,
+                result,
+            } => {
+                let result = match result {
+                    Ok(output) => output.clone(),
+                    Err(error) => format!("child failed: {error}"),
+                };
+                messages.push(Message::user(format!(
+                    "Child run {} (ordinal {ordinal}) returned: {result}",
+                    run_id.as_str()
+                )));
+                index += 1;
             }
         }
     }
