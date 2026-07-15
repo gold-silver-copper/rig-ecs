@@ -1,4 +1,5 @@
 mod agent_run_support;
+mod hook_stress_support;
 mod support;
 mod tools_support;
 
@@ -37,6 +38,7 @@ mod cassette {
     mod tool_choice;
     mod tool_definitions;
     mod tool_hooks;
+    mod tool_server;
     mod transcription;
 }
 

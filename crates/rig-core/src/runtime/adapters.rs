@@ -15,13 +15,15 @@ use crate::{
         ActiveRunSnapshot, ActiveRunSnapshotError, Agent, AgentHandle, CanonicalError,
         DiscoveryEffectInput, DiscoveryEffectOutput, DriveError, EffectCompletion, EffectDelta,
         EffectDeltaSender, EffectInput, EffectIoError, EffectOutput, EffectRequest,
-        ExtensionInstallError, InstallError, ModelCapability, ModelDecision, ModelEffectInput,
-        ModelEffectOutput, ModelToolCall, ModelToolChoice, OutputRequirement, PauseMode,
-        RetrievalRequirement, RetrievedDocument, RigExtension, RunOf, RunOutput, RunState, Runtime,
-        RuntimeConfig, SpawnError, StableId, StoreCapability, StoreEffectInput, StoreEffectOutput,
-        StoreGrant, StoreOperation, StreamItem, StreamReceiveError, StreamTerminal, SubmitError,
-        TenantId, ToolCapability, ToolEffectInput, ToolEffectOutput, ToolGrant,
-        ToolRetrievalRequirement, TranscriptEntry, Usage,
+        ExtensionInstallError, GrantForAgent, GrantForTool, InstallError, InvalidToolCallBudget,
+        ModelCapability, ModelDecision, ModelEffectInput, ModelEffectOutput, ModelToolCall,
+        ModelToolChoice, OutputRequirement, PauseMode, RetiredCapability, RetrievalRequirement,
+        RetrievedDocument, RigExtension, RunOf, RunOutput, RunState, Runtime, RuntimeConfig,
+        SpawnError, StableId, StoreCapability, StoreEffectInput, StoreEffectOutput, StoreGrant,
+        StoreGrantForAgent, StoreGrantForStore, StoreOperation, StreamItem, StreamReceiveError,
+        StreamTerminal, StructuredOutputRetryBudget, SubmitError, TenantId, ToolCapability,
+        ToolEffectInput, ToolEffectOutput, ToolGrant, ToolRetrievalRequirement, TranscriptEntry,
+        Usage,
     },
     streaming::{StreamedAssistantContent, ToolCallDeltaContent},
     tool::IntoToolOutput,
@@ -36,7 +38,7 @@ use std::{
     future::Future,
     panic::AssertUnwindSafe,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 use thiserror::Error;
 
@@ -61,8 +63,19 @@ pub struct LocalModelAgent<M> {
     routed_effects: Arc<Mutex<HashMap<bevy_ecs::entity::Entity, VecDeque<EffectRequest>>>>,
     agent: AgentHandle,
     model: CompletionModelAdapter<M>,
-    tools: Arc<HashMap<(StableId, u64), Arc<dyn LocalToolExecutor>>>,
+    tools: SharedLocalToolExecutors,
     stores: Arc<HashMap<(StableId, u64), Arc<dyn LocalStoreExecutor>>>,
+}
+
+/// ECS-visible membership for hosted agents that share dynamic capability topology.
+#[derive(bevy_ecs::component::Component, Clone, Debug, Eq, PartialEq)]
+pub struct HostedAgentGroup(StableId);
+
+impl HostedAgentGroup {
+    /// Stable group identity used for topology reconciliation.
+    pub fn id(&self) -> &StableId {
+        &self.0
+    }
 }
 
 /// Incremental observation from a schedule-driven local agent.
@@ -307,6 +320,9 @@ trait LocalToolExecutor: Send + Sync {
         input: ToolEffectInput,
     ) -> BoxFuture<'_, Result<ToolEffectOutput, CanonicalError>>;
 }
+
+type LocalToolExecutors = HashMap<(StableId, u64), Arc<dyn LocalToolExecutor>>;
+type SharedLocalToolExecutors = Arc<RwLock<LocalToolExecutors>>;
 
 trait LocalStoreExecutor: Send + Sync {
     fn execute(
@@ -1136,6 +1152,10 @@ where
             },
             model_entity,
         )?;
+        runtime
+            .world_mut()
+            .entity_mut(agent.entity())
+            .insert(HostedAgentGroup(StableId::new("local-agent-group")?));
         if let Some(schema) = self.output_schema {
             runtime.set_output_requirement(agent, OutputRequirement { schema })?;
             runtime.set_structured_output_retry_budget(agent, self.structured_output_retries)?;
@@ -1204,7 +1224,7 @@ where
             routed_effects: Arc::new(Mutex::new(HashMap::new())),
             agent,
             model: CompletionModelAdapter::bound(self.model, model_binding),
-            tools: Arc::new(executors),
+            tools: Arc::new(RwLock::new(executors)),
             stores: Arc::new(store_executors),
         })
     }
@@ -1221,7 +1241,11 @@ where
     ) -> Vec<EffectCompletion> {
         futures::stream::iter(requests.into_iter().map(|(operation, generation, input)| {
             let key = (input.decision.tool_id.clone(), input.decision.revision);
-            let executor = self.tools.get(&key).cloned();
+            let executor = self
+                .tools
+                .read()
+                .ok()
+                .and_then(|tools| tools.get(&key).cloned());
             async move {
                 let result = match executor {
                     Some(executor) => {
@@ -1259,6 +1283,335 @@ where
     /// Returns the world-scoped agent entity handle.
     pub fn handle(&self) -> AgentHandle {
         self.agent
+    }
+
+    /// Spawns another agent definition in the same hosted ECS world.
+    ///
+    /// The new agent snapshots the current configuration and capability grants.
+    /// Later calls to [`Self::install_tool`] and [`Self::retire_tool`] reconcile
+    /// the shared hosted group through ECS entities and relationships.
+    pub fn fork_agent(&self, id: StableId) -> Result<Self, LocalAgentError>
+    where
+        M: Clone,
+    {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| LocalAgentError::RuntimePoisoned)?;
+        let source = self.agent.entity();
+        let tenant = runtime
+            .world()
+            .get::<TenantId>(source)
+            .cloned()
+            .ok_or(SpawnError::StaleEntity(source))?;
+        let configuration = runtime
+            .world()
+            .get::<Agent>(source)
+            .cloned()
+            .ok_or(SpawnError::StaleEntity(source))?;
+        let group = runtime
+            .world()
+            .get::<HostedAgentGroup>(source)
+            .cloned()
+            .ok_or(SpawnError::StaleEntity(source))?;
+        let model_entity = self
+            .model
+            .binding
+            .as_ref()
+            .map(|binding| binding.model_entity)
+            .ok_or_else(|| CanonicalError::StaleEntity("local model binding".to_owned()))?;
+
+        let tool_grants = {
+            let world = runtime.world_mut();
+            let mut query = world.query::<(
+                &StableId,
+                &TenantId,
+                &ToolGrant,
+                &GrantForAgent,
+                &GrantForTool,
+            )>();
+            query
+                .iter(world)
+                .filter(|(_, _, _, agent, _)| agent.get() == source)
+                .map(|(grant_id, grant_tenant, grant, _, tool)| {
+                    (
+                        grant_id.clone(),
+                        grant_tenant.clone(),
+                        grant.clone(),
+                        tool.get(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let store_grants = {
+            let world = runtime.world_mut();
+            let mut query = world.query::<(
+                &StableId,
+                &TenantId,
+                &StoreGrant,
+                &StoreGrantForAgent,
+                &StoreGrantForStore,
+            )>();
+            query
+                .iter(world)
+                .filter(|(_, _, _, agent, _)| agent.get() == source)
+                .map(|(grant_id, grant_tenant, grant, _, store)| {
+                    (
+                        grant_id.clone(),
+                        grant_tenant.clone(),
+                        grant.clone(),
+                        store.get(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let output_requirement = runtime.world().get::<OutputRequirement>(source).cloned();
+        let retrieval_requirement = runtime.world().get::<RetrievalRequirement>(source).cloned();
+        let tool_retrieval_requirement = runtime
+            .world()
+            .get::<ToolRetrievalRequirement>(source)
+            .cloned();
+        let invalid_tool_budget = runtime
+            .world()
+            .get::<InvalidToolCallBudget>(source)
+            .copied();
+        let structured_output_budget = runtime
+            .world()
+            .get::<StructuredOutputRetryBudget>(source)
+            .copied();
+
+        let fork = runtime.spawn_agent(id.clone(), tenant.clone(), configuration, model_entity)?;
+        runtime.world_mut().entity_mut(fork.entity()).insert(group);
+        if let Some(requirement) = output_requirement {
+            runtime.set_output_requirement(fork, requirement)?;
+        }
+        if let Some(requirement) = retrieval_requirement {
+            runtime.set_retrieval_requirement(fork, requirement)?;
+        }
+        if let Some(requirement) = tool_retrieval_requirement {
+            runtime.set_tool_retrieval_requirement(fork, requirement)?;
+        }
+        if let Some(budget) = invalid_tool_budget {
+            runtime.set_invalid_tool_call_budget(fork, budget.max_retries)?;
+        }
+        if let Some(budget) = structured_output_budget {
+            runtime.set_structured_output_retry_budget(fork, budget.max_retries)?;
+        }
+        for (index, (_, grant_tenant, grant, tool)) in tool_grants.into_iter().enumerate() {
+            runtime.grant_tool(
+                StableId::new(format!("hosted/{}/tool-grant/{index}", id.as_str()))?,
+                grant_tenant,
+                grant,
+                fork,
+                tool,
+            )?;
+        }
+        for (index, (_, grant_tenant, grant, store)) in store_grants.into_iter().enumerate() {
+            runtime.grant_store(
+                StableId::new(format!("hosted/{}/store-grant/{index}", id.as_str()))?,
+                grant_tenant,
+                grant,
+                fork,
+                store,
+            )?;
+        }
+        drop(runtime);
+
+        Ok(Self {
+            runtime: Arc::clone(&self.runtime),
+            routed_effects: Arc::clone(&self.routed_effects),
+            agent: fork,
+            model: self.model.clone(),
+            tools: Arc::clone(&self.tools),
+            stores: Arc::clone(&self.stores),
+        })
+    }
+
+    /// Installs or replaces one typed tool for every hosted agent in this ECS group.
+    ///
+    /// Existing same-named revisions are retired for future model operations;
+    /// already accepted operations retain their immutable revision and executor.
+    pub fn install_tool<T>(&self, tool: T) -> Result<(), LocalAgentError>
+    where
+        T: crate::tool::Tool + 'static,
+        T::Output: Send,
+    {
+        let name = T::NAME.to_owned();
+        let description = tool.description();
+        let parameters = tool.parameters();
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| LocalAgentError::RuntimePoisoned)?;
+        let group = runtime
+            .world()
+            .get::<HostedAgentGroup>(self.agent.entity())
+            .cloned()
+            .ok_or(SpawnError::StaleEntity(self.agent.entity()))?;
+        let agents = {
+            let world = runtime.world_mut();
+            let mut query = world.query::<(
+                bevy_ecs::entity::Entity,
+                &StableId,
+                &TenantId,
+                &HostedAgentGroup,
+            )>();
+            query
+                .iter(world)
+                .filter(|(_, _, _, candidate)| *candidate == &group)
+                .map(|(entity, id, tenant, _)| (entity, id.clone(), tenant.clone()))
+                .collect::<Vec<_>>()
+        };
+        let agent_entities = agents
+            .iter()
+            .map(|(entity, _, _)| *entity)
+            .collect::<HashSet<_>>();
+        let (existing_tools, next_order, revision) = {
+            let world = runtime.world_mut();
+            let mut grants = world.query::<(&GrantForAgent, &GrantForTool)>();
+            let accessible = grants
+                .iter(world)
+                .filter(|(agent, _)| agent_entities.contains(&agent.get()))
+                .map(|(_, tool)| tool.get())
+                .collect::<HashSet<_>>();
+            let mut tools = world.query::<(bevy_ecs::entity::Entity, &ToolCapability)>();
+            let rows = tools
+                .iter(world)
+                .filter(|(entity, _)| accessible.contains(entity))
+                .map(|(entity, capability)| (entity, capability.clone()))
+                .collect::<Vec<_>>();
+            let next_order = rows
+                .iter()
+                .find(|(_, capability)| capability.name == name)
+                .map(|(_, capability)| capability.order)
+                .unwrap_or_else(|| {
+                    rows.iter()
+                        .map(|(_, capability)| capability.order)
+                        .max()
+                        .map_or(0, |order| order.saturating_add(1))
+                });
+            let revision = rows
+                .iter()
+                .filter(|(_, capability)| capability.name == name)
+                .map(|(_, capability)| capability.revision)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let existing = rows
+                .into_iter()
+                .filter(|(_, capability)| capability.name == name && !capability.retired)
+                .map(|(entity, _)| entity)
+                .collect::<Vec<_>>();
+            (existing, next_order, revision)
+        };
+        for existing in existing_tools {
+            if let Ok(mut entity) = runtime.world_mut().get_entity_mut(existing) {
+                if let Some(mut capability) = entity.get_mut::<ToolCapability>() {
+                    capability.retired = true;
+                }
+                entity.insert(RetiredCapability {
+                    generation: revision,
+                });
+            }
+        }
+        let tool_id = StableId::new(format!(
+            "hosted/{}/tool/{name}/{revision}",
+            group.0.as_str()
+        ))?;
+        let tool_entity = runtime.spawn_tool(
+            tool_id.clone(),
+            agents
+                .first()
+                .map(|(_, _, tenant)| tenant.clone())
+                .ok_or(SpawnError::StaleEntity(self.agent.entity()))?,
+            ToolCapability {
+                name,
+                description,
+                parameters,
+                order: next_order,
+                revision,
+                retired: false,
+            },
+        )?;
+        for (index, (entity, agent_id, tenant)) in agents.into_iter().enumerate() {
+            runtime.grant_tool(
+                StableId::new(format!(
+                    "hosted/{}/tool-grant/{revision}/{index}",
+                    agent_id.as_str()
+                ))?,
+                tenant,
+                ToolGrant {
+                    order: next_order,
+                    enabled: true,
+                },
+                AgentHandle {
+                    runtime_id: self.agent.runtime_id,
+                    entity,
+                },
+                tool_entity,
+            )?;
+        }
+        drop(runtime);
+        self.tools
+            .write()
+            .map_err(|_| LocalAgentError::RuntimePoisoned)?
+            .insert(
+                (tool_id.clone(), revision),
+                Arc::new(TypedLocalTool {
+                    adapter: ToolAdapter::new(tool_id, revision, AuthoredTool(tool)),
+                }),
+            );
+        Ok(())
+    }
+
+    /// Retires every active same-named tool revision in this hosted ECS group.
+    pub fn retire_tool(&self, name: &str) -> Result<(), LocalAgentError> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| LocalAgentError::RuntimePoisoned)?;
+        let group = runtime
+            .world()
+            .get::<HostedAgentGroup>(self.agent.entity())
+            .cloned()
+            .ok_or(SpawnError::StaleEntity(self.agent.entity()))?;
+        let group_agents = {
+            let world = runtime.world_mut();
+            let mut query = world.query::<(bevy_ecs::entity::Entity, &HostedAgentGroup)>();
+            query
+                .iter(world)
+                .filter(|(_, candidate)| *candidate == &group)
+                .map(|(entity, _)| entity)
+                .collect::<HashSet<_>>()
+        };
+        let matching = {
+            let world = runtime.world_mut();
+            let mut grants = world.query::<(&GrantForAgent, &GrantForTool)>();
+            let accessible = grants
+                .iter(world)
+                .filter(|(agent, _)| group_agents.contains(&agent.get()))
+                .map(|(_, tool)| tool.get())
+                .collect::<HashSet<_>>();
+            let mut tools = world.query::<(bevy_ecs::entity::Entity, &ToolCapability)>();
+            tools
+                .iter(world)
+                .filter(|(entity, capability)| {
+                    accessible.contains(entity) && capability.name == name && !capability.retired
+                })
+                .map(|(entity, capability)| (entity, capability.revision))
+                .collect::<Vec<_>>()
+        };
+        for (entity, revision) in matching {
+            if let Ok(mut entity) = runtime.world_mut().get_entity_mut(entity) {
+                if let Some(mut capability) = entity.get_mut::<ToolCapability>() {
+                    capability.retired = true;
+                }
+                entity.insert(RetiredCapability {
+                    generation: revision,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Creates a one-model standalone runtime and spawns its model and agent

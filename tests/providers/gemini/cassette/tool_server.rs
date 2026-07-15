@@ -1,13 +1,11 @@
-//! Runtime mutation of a shared `ToolServerHandle`: tools added or removed
-//! between turns change the definitions advertised on the next request, and a
-//! single handle backs multiple agents. This is the surface `McpClientHandler`
-//! drives on tool-list-changed notifications, so its semantics must survive
-//! the rmcp migration unchanged.
+//! Runtime mutation of ECS tool capability and grant entities: tools added or
+//! retired between turns change the next immutable model request, and hosted
+//! agents in one world share explicit topology-group reconciliation.
 
 use rig::client::CompletionClient;
 use rig::completion::{Chat, Message};
 use rig::providers::gemini;
-use rig::tool::server::ToolServer;
+use rig::runtime::StableId;
 
 use super::super::agent_run_support::{history_has_assistant_tool_call, tool_result_texts};
 use super::super::support::with_gemini_cassette;
@@ -23,12 +21,11 @@ async fn add_tool_between_turns_appears_in_next_request() {
     with_gemini_cassette(
         "tool_server/add_tool_between_turns_appears_in_next_request",
         |client| async move {
-            let handle = ToolServer::new().tool(add).run();
             let agent = client
                 .agent(gemini::completion::GEMINI_2_5_FLASH)
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .temperature(0.0)
-                .tool_server_handle(handle.clone())
+                .tool(add)
                 .default_max_turns(3)
                 .build();
 
@@ -39,7 +36,9 @@ async fn add_tool_between_turns_appears_in_next_request() {
                 .expect("first prompt should succeed with only the add tool");
             assert_mentions_expected_number(&first, 42);
 
-            handle.add_tool(subtract).await;
+            agent
+                .install_tool(subtract)
+                .expect("subtract tool should install into ECS topology");
 
             let mut history = Vec::<Message>::new();
             let second = agent
@@ -70,12 +69,12 @@ async fn remove_tool_between_turns_drops_definition() {
     with_gemini_cassette(
         "tool_server/remove_tool_between_turns_drops_definition",
         |client| async move {
-            let handle = ToolServer::new().tool(add).tool(subtract).run();
             let agent = client
                 .agent(gemini::completion::GEMINI_2_5_FLASH)
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .temperature(0.0)
-                .tool_server_handle(handle.clone())
+                .tool(add)
+                .tool(subtract)
                 .default_max_turns(3)
                 .build();
 
@@ -87,7 +86,9 @@ async fn remove_tool_between_turns_drops_definition() {
             assert_mentions_expected_number(&first, 42);
             assert_eq!(add_counter.count(), 1, "add should execute on the first prompt");
 
-            handle.remove_tool("subtract").await;
+            agent
+                .retire_tool("subtract")
+                .expect("subtract tool should retire from ECS topology");
 
             let mut history = Vec::<Message>::new();
             let second = agent
@@ -112,7 +113,7 @@ async fn remove_tool_between_turns_drops_definition() {
 }
 
 #[tokio::test]
-async fn shared_tool_server_handle_updates_all_agents() {
+async fn shared_ecs_topology_updates_all_agents() {
     let add = CountingAdd::default();
     let subtract = CountingSubtract::default();
     let subtract_counter = subtract.counter.clone();
@@ -120,21 +121,19 @@ async fn shared_tool_server_handle_updates_all_agents() {
     with_gemini_cassette(
         "tool_server/shared_tool_server_handle_updates_all_agents",
         |client| async move {
-            let handle = ToolServer::new().tool(add).run();
             let first_agent = client
                 .agent(gemini::completion::GEMINI_2_5_FLASH)
                 .preamble(FORCE_TOOLS_PREAMBLE)
                 .temperature(0.0)
-                .tool_server_handle(handle.clone())
+                .tool(add)
                 .default_max_turns(3)
                 .build();
-            let second_agent = client
-                .agent(gemini::completion::GEMINI_2_5_FLASH)
-                .preamble(FORCE_TOOLS_PREAMBLE)
-                .temperature(0.0)
-                .tool_server_handle(handle.clone())
-                .default_max_turns(3)
-                .build();
+            let second_agent = first_agent
+                .fork_agent(
+                    StableId::new("local-second-agent")
+                        .expect("second agent stable id should build"),
+                )
+                .expect("second agent should spawn in the shared ECS world");
 
             let mut history = Vec::<Message>::new();
             let first = first_agent
@@ -143,7 +142,9 @@ async fn shared_tool_server_handle_updates_all_agents() {
                 .expect("the first agent should use the shared add tool");
             assert_mentions_expected_number(&first, 42);
 
-            handle.add_tool(subtract).await;
+            first_agent
+                .install_tool(subtract)
+                .expect("shared subtract tool should install into ECS topology");
 
             let mut history = Vec::<Message>::new();
             let second = second_agent
