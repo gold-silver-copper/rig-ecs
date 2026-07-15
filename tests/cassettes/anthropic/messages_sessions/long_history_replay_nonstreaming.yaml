@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json
-  body: '{"content":[{"text":"Sure! Let me look that up right away.","type":"text"},{"caller":{"type":"direct"},"id":"toolu_REDACTED_1","input":{},"name":"lookup_harbor_label","type":"tool_use"}],"id":"msg_REDACTED_1","model":"claude-sonnet-4-6","role":"assistant","stop_details":null,"stop_reason":"tool_use","stop_sequence":null,"type":"message","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":572,"output_tokens":49,"service_tier":"standard"}}'
+  body: '{"content":[{"text":"Sure! Let me look that up right now.","type":"text"},{"caller":{"type":"direct"},"id":"toolu_REDACTED_1","input":{},"name":"lookup_harbor_label","type":"tool_use"}],"id":"msg_REDACTED_1","model":"claude-sonnet-4-6","role":"assistant","stop_details":null,"stop_reason":"tool_use","stop_sequence":null,"type":"message","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":572,"output_tokens":49,"service_tier":"standard"}}'
 ---
 when:
   path: /v1/messages
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json
-  body: '{"content":[{"text":"Your favorite color is teal, and the harbor label is crimson-harbor.","type":"text"}],"id":"msg_REDACTED_2","model":"claude-sonnet-4-6","role":"assistant","stop_details":null,"stop_reason":"end_turn","stop_sequence":null,"type":"message","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":699,"output_tokens":20,"service_tier":"standard"}}'
+  body: '{"content":[{"text":"Your favorite color is teal, and the harbor label is **crimson-harbor**.","type":"text"}],"id":"msg_REDACTED_2","model":"claude-sonnet-4-6","role":"assistant","stop_details":null,"stop_reason":"end_turn","stop_sequence":null,"type":"message","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":699,"output_tokens":21,"service_tier":"standard"}}'

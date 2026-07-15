@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":2,"y":2},"name":"add"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":18,"promptTokenCount":91,"promptTokensDetails":[{"modality":"TEXT","tokenCount":91}],"serviceTier":"standard","thoughtsTokenCount":51,"totalTokenCount":160}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":2,"y":2},"name":"add"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":18,"promptTokenCount":91,"promptTokensDetails":[{"modality":"TEXT","tokenCount":91}],"serviceTier":"standard","thoughtsTokenCount":49,"totalTokenCount":158}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The exact tool result is `{\"add_response\": {\"result\": \"[SECRET]\"}}`."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":19,"promptTokenCount":123,"promptTokensDetails":[{"modality":"TEXT","tokenCount":123}],"serviceTier":"standard","totalTokenCount":142}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"The exact tool result is: `{\"add_response\": {\"result\": \"[SECRET]\"}}`"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":20,"promptTokenCount":123,"promptTokensDetails":[{"modality":"TEXT","tokenCount":123}],"serviceTier":"standard","totalTokenCount":143}}'

@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":12,"y":8},"name":"add"},"thoughtSignature":"signature_REDACTED_1"},{"functionCall":{"args":{"x":30,"y":7},"name":"subtract"}}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":38,"promptTokenCount":180,"promptTokensDetails":[{"modality":"TEXT","tokenCount":180}],"serviceTier":"standard","thoughtsTokenCount":62,"totalTokenCount":280}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":12,"y":8},"name":"add"},"thoughtSignature":"signature_REDACTED_1"},{"functionCall":{"args":{"x":30,"y":7},"name":"subtract"}}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":38,"promptTokenCount":180,"promptTokensDetails":[{"modality":"TEXT","tokenCount":180}],"serviceTier":"standard","thoughtsTokenCount":76,"totalTokenCount":294}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The sum of 12 and 8 is 20, and the difference of 30 and 7 is 23."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":29,"promptTokenCount":244,"promptTokensDetails":[{"modality":"TEXT","tokenCount":244}],"serviceTier":"standard","totalTokenCount":273}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"The sum of 12 + 8 is 20, and the difference of 30 - 7 is 23.","thoughtSignature":"signature_REDACTED_2"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":29,"promptTokenCount":244,"promptTokensDetails":[{"modality":"TEXT","tokenCount":244}],"serviceTier":"standard","thoughtsTokenCount":49,"totalTokenCount":322}}'

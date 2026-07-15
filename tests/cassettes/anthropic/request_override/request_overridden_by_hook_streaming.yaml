@@ -29,13 +29,13 @@ then:
     data: {"delta":{"partial_json":"","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"{\"locati","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"{\"loc","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"on\": \"Pari","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"ation\": \"P","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"s\"}","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"aris\"}","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":0,"type":"content_block_stop"}
@@ -78,13 +78,13 @@ then:
     data: {"delta":{"partial_json":"","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"{\"ti","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"{\"timezone\":","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"mezone\": \"Eu","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":" \"Europe/","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"rope/Paris\"}","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"Paris\"}","type":"input_json_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":0,"type":"content_block_stop"}
@@ -127,58 +127,61 @@ then:
     data: {"delta":{"text":"Great","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" news — here's a quick snapshot to help you prepare for your trip to **Paris**","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" news — here's a quick travel briefing for **Paris**","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" 🗼:\n\n---\n\n### 🌤️ Current Weather","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" to help you prepare! 🗼\n\n---\n\n### 🕛","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"\n- **Condition:** Clear skies\n- **Temperature:** 18°C (64°F)\n- **What to pack:** Light layers","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" Current Local Time\nIt's **12:00 PM (noon)** in Paris. Keep this","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" are ideal — a light jacket or sweater for the morning/evening, and comfortable","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" in mind for planning calls, bookings, or coordinating with locals!","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" clothes for daytime sightseeing.\n\n---\n\n### 🕛 Current Local","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"\n\n---\n\n### 🌤️ Current Weather\nThe weather in Paris is **clear skies** with a comfortable","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" Time\n- **Time in Paris:** 12:00 PM (noon)\n- **Timezone:** Central European Time (CET/Europe","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" **18°C (64°F)**. Here's what that means for packing:","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"/Paris)\n- Useful for planning calls home or scheduling activities!\n\n---\n\n### ","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"\n- 🧥 Bring a **light jacket or layer** — mornings and","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"✈️ Travel Tips for Paris\n1. **Language:** French is the official language — a","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" evenings may be cooler.\n- ☀️ **Sunglasses** are a good idea with clear","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" simple *\"Bonjour!\"* and *\"Merci!\"* go a long way.","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" skies.\n- 👟 Great weather for **walking tours** and","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"\n2. **Currency:** Euro (€)\n3. **Transport:** The Paris Métro is efficient","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" outdoor sightseeing!\n\n---\n\n### ✈️ Quick Travel Tips for Paris\n-","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" and affordable for getting around the city.\n4. **Must-sees:** Eiffel Tower, the Louvre, Notre","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" 🗣️ A few words of French go a long way — *\"Bonjour\"* and","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"-Dame Cathedral, Montmartre, and the Seine River.\n5. **Dining:** Lunch (12","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" *\"Merci\"* are always appreciated.\n- 🚇 Use the **Métro** for","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"–2 PM) is a great time to enjoy a sit-down meal — many","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" efficient city travel.\n- 🥐 Don't miss","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" restaurants offer affordable *formule* (set menus)","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" a café breakfast with a fresh croissant!\n- 🏛","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" at midday.\n\nWould you like help with anything else for your Paris trip, such as it","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"️ Top attractions: Eiffel Tower, the Louvre, Notre-Dame, and Montmartre.\n\n---\n\nWould you like help with","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"inerary suggestions or packing tips? 😊","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" anything else for your Paris trip, such as packing tips, itinerary ideas, or neighborhood recommendations","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+    event: content_block_delta
+    data: {"delta":{"text":"? 😊","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":0,"type":"content_block_stop"}
 
     event: message_delta
-    data: {"delta":{"stop_details":null,"stop_reason":"end_turn","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":812,"output_tokens":339}}
+    data: {"delta":{"stop_details":null,"stop_reason":"end_turn","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":812,"output_tokens":341}}
 
     event: message_stop
     data: {"type":"message_stop"}

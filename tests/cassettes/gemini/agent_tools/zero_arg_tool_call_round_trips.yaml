@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{},"name":"ping"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":8,"promptTokenCount":58,"promptTokensDetails":[{"modality":"TEXT","tokenCount":58}],"serviceTier":"standard","thoughtsTokenCount":32,"totalTokenCount":98}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{},"name":"ping"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":8,"promptTokenCount":58,"promptTokensDetails":[{"modality":"TEXT","tokenCount":58}],"serviceTier":"standard","thoughtsTokenCount":49,"totalTokenCount":115}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The ping tool returned the marker `pong-crimson-7423`."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":17,"promptTokenCount":87,"promptTokensDetails":[{"modality":"TEXT","tokenCount":87}],"serviceTier":"standard","totalTokenCount":104}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"The `ping` tool returned the marker `pong-crimson-7423`."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":19,"promptTokenCount":87,"promptTokensDetails":[{"modality":"TEXT","tokenCount":87}],"serviceTier":"standard","totalTokenCount":106}}'

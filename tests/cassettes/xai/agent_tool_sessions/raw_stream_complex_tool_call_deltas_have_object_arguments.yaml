@@ -201,17 +201,170 @@ then:
     data: {"item":{"id":"rs_REDACTED_1","status":"completed","summary":[{"text":"The task is: \"Call inspect_manifest exactly once for project rig-xai with critical=true, retries=2, steps [{name: plan, weight: 1}, {name: verify, weight: 2}], and note `streamed nested JSON`. Do not ...","type":"summary_text"}],"type":"reasoning"},"output_index":0,"sequence_number":61,"type":"response.output_item.done"}
 
     event: response.output_item.added
-    data: {"item":{"arguments":"","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"inspect_manifest","status":"in_progress","type":"function_call"},"output_index":1,"sequence_number":62,"type":"response.output_item.added"}
+    data: {"item":{"content":[],"id":"msg_REDACTED_1","role":"assistant","status":"in_progress","type":"message"},"output_index":1,"sequence_number":62,"type":"response.output_item.added"}
+
+    event: response.content_part.added
+    data: {"content_index":0,"item_id":"msg_REDACTED_1","output_index":1,"part":{"annotations":[],"logprobs":[],"text":"","type":"output_text"},"sequence_number":63,"type":"response.content_part.added"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"call","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":64,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" tool","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":65,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" inspect","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":66,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"_manifest","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":67,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" with","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":68,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" project","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":69,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" is","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":70,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" rig","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":71,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"-x","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":72,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"ai","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":73,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" flags","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":74,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" is","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":75,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" {\"","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":76,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"critical","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":77,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"\":","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":78,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"true","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":79,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":",\"","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":80,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"ret","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":81,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"ries","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":82,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"\":","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":83,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"2","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":84,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"}","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":85,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" steps","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":86,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" is","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":87,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" [{\"","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":88,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"name","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":89,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"\":\"","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":90,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"plan","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":91,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"\",\"","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":92,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"weight","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":93,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"\":","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":94,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"1","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":95,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"},{\"","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":96,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"name","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":97,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"\":\"","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":98,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"verify","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":99,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"\",\"","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":100,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"weight","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":101,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"\":","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":102,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"2","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":103,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"}]","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":104,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" note","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":105,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" is","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":106,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" streamed","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":107,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" nested","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":108,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" JSON","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":109,"type":"response.output_text.delta"}
+
+    event: response.output_item.added
+    data: {"item":{"arguments":"","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"inspect_manifest","status":"in_progress","type":"function_call"},"output_index":2,"sequence_number":110,"type":"response.output_item.added"}
 
     event: response.function_call_arguments.delta
-    data: {"delta":"{\"project\":\"rig-xai\",\"flags\":{\"critical\":true,\"retries\":2},\"steps\":[{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}],\"note\":\"streamed nested JSON\"}","item_id":"fc_REDACTED_1","output_index":1,"sequence_number":63,"type":"response.function_call_arguments.delta"}
+    data: {"delta":"{\"project\":\"rig-xai\",\"flags\":{\"critical\":true,\"retries\":2},\"steps\":[{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}],\"note\":\"streamed nested JSON\"}","item_id":"fc_REDACTED_1","output_index":2,"sequence_number":111,"type":"response.function_call_arguments.delta"}
 
-    event: response.function_call_arguments.done
-    data: {"arguments":"{\"project\":\"rig-xai\",\"flags\":{\"critical\":true,\"retries\":2},\"steps\":[{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}],\"note\":\"streamed nested JSON\"}","item_id":"fc_REDACTED_1","output_index":1,"sequence_number":64,"type":"response.function_call_arguments.done"}
+    event: response.output_text.done
+    data: {"content_index":0,"item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":112,"text":"call tool inspect_manifest with project is rig-xai flags is {\"critical\":true,\"retries\":2} steps is [{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}] note is streamed nested JSON","type":"response.output_text.done"}
+
+    event: response.content_part.done
+    data: {"content_index":0,"item_id":"msg_REDACTED_1","output_index":1,"part":{"annotations":[],"logprobs":[],"text":"call tool inspect_manifest with project is rig-xai flags is {\"critical\":true,\"retries\":2} steps is [{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}] note is streamed nested JSON","type":"output_text"},"sequence_number":113,"type":"response.content_part.done"}
 
     event: response.output_item.done
-    data: {"item":{"arguments":"{\"project\":\"rig-xai\",\"flags\":{\"critical\":true,\"retries\":2},\"steps\":[{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}],\"note\":\"streamed nested JSON\"}","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"inspect_manifest","status":"completed","type":"function_call"},"output_index":1,"sequence_number":65,"type":"response.output_item.done"}
+    data: {"item":{"content":[{"annotations":[],"logprobs":[],"text":"call tool inspect_manifest with project is rig-xai flags is {\"critical\":true,\"retries\":2} steps is [{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}] note is streamed nested JSON","type":"output_text"}],"id":"msg_REDACTED_1","role":"assistant","status":"completed","type":"message"},"output_index":1,"sequence_number":114,"type":"response.output_item.done"}
+
+    event: response.function_call_arguments.done
+    data: {"arguments":"{\"project\":\"rig-xai\",\"flags\":{\"critical\":true,\"retries\":2},\"steps\":[{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}],\"note\":\"streamed nested JSON\"}","item_id":"fc_REDACTED_1","output_index":2,"sequence_number":115,"type":"response.function_call_arguments.done"}
+
+    event: response.output_item.done
+    data: {"item":{"arguments":"{\"project\":\"rig-xai\",\"flags\":{\"critical\":true,\"retries\":2},\"steps\":[{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}],\"note\":\"streamed nested JSON\"}","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"inspect_manifest","status":"completed","type":"function_call"},"output_index":2,"sequence_number":116,"type":"response.output_item.done"}
 
     event: response.completed
-    data: {"response":{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_REDACTED_1","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_1","status":"completed","summary":[{"text":"The task is: \"Call inspect_manifest exactly once for project rig-xai with critical=true, retries=2, steps [{name: plan, weight: 1}, {name: verify, weight: 2}], and note `streamed nested JSON`. Do not ...","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"project\":\"rig-xai\",\"flags\":{\"critical\":true,\"retries\":2},\"steps\":[{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}],\"note\":\"streamed nested JSON\"}","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"inspect_manifest","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.699999988079071,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Validate a nested deployment manifest.","name":"inspect_manifest","parameters":{"properties":{"flags":{"properties":{"critical":{"type":"boolean"},"retries":{"type":"integer"}},"required":["critical","retries"],"type":"object"},"note":{"type":"string"},"project":{"type":"string"},"steps":{"items":{"properties":{"name":{"type":"string"},"weight":{"type":"integer"}},"required":["name","weight"],"type":"object"},"type":"array"}},"required":["project","flags","steps","note"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":0.949999988079071,"truncation":"disabled","usage":{"context_details":{"input_tokens":397,"output_tokens":632},"cost_in_usd_ticks":19418500,"input_tokens":397,"input_tokens_details":{"cached_tokens":128},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":632,"output_tokens_details":{"reasoning_tokens":566},"total_tokens":1029},"user":null},"sequence_number":66,"type":"response.completed"}
+    data: {"response":{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_REDACTED_1","incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_1","status":"completed","summary":[{"text":"The task is: \"Call inspect_manifest exactly once for project rig-xai with critical=true, retries=2, steps [{name: plan, weight: 1}, {name: verify, weight: 2}], and note `streamed nested JSON`. Do not ...","type":"summary_text"}],"type":"reasoning"},{"content":[{"annotations":[],"logprobs":[],"text":"call tool inspect_manifest with project is rig-xai flags is {\"critical\":true,\"retries\":2} steps is [{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}] note is streamed nested JSON","type":"output_text"}],"id":"msg_REDACTED_1","role":"assistant","status":"completed","type":"message"},{"arguments":"{\"project\":\"rig-xai\",\"flags\":{\"critical\":true,\"retries\":2},\"steps\":[{\"name\":\"plan\",\"weight\":1},{\"name\":\"verify\",\"weight\":2}],\"note\":\"streamed nested JSON\"}","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"inspect_manifest","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.699999988079071,"text":{"format":{"type":"text"}},"tool_choice":"required","tools":[{"description":"Validate a nested deployment manifest.","name":"inspect_manifest","parameters":{"properties":{"flags":{"properties":{"critical":{"type":"boolean"},"retries":{"type":"integer"}},"required":["critical","retries"],"type":"object"},"note":{"type":"string"},"project":{"type":"string"},"steps":{"items":{"properties":{"name":{"type":"string"},"weight":{"type":"integer"}},"required":["name","weight"],"type":"object"},"type":"array"}},"required":["project","flags","steps","note"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":0.949999988079071,"truncation":"disabled","usage":{"context_details":{"input_tokens":458,"output_tokens":657},"cost_in_usd_ticks":20806000,"input_tokens":458,"input_tokens_details":{"cached_tokens":128},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":657,"output_tokens_details":{"reasoning_tokens":545},"total_tokens":1115},"user":null},"sequence_number":117,"type":"response.completed"}
 

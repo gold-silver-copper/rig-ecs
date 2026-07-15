@@ -177,7 +177,7 @@ then:
     data: {"item":{"arguments":"{\"city\":\"Tokyo\"}","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"get_weather","status":"completed","type":"function_call"},"output_index":1,"sequence_number":53,"type":"response.output_item.done"}
 
     event: response.completed
-    data: {"response":{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_REDACTED_1","incomplete_details":null,"instructions":null,"max_output_tokens":4096,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_1","status":"completed","summary":[{"text":"The question is: \"I'm planning a trip. What is the current weather in Tokyo, Japan? Based on the weather conditions, should I pack an umbrella or sunscreen? Use the get_weather tool to check before an...","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"city\":\"Tokyo\"}","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"get_weather","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.699999988079071,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[{"description":"Get the current weather for a city. Must be called for weather questions.","name":"get_weather","parameters":{"properties":{"city":{"description":"City name to get weather for","type":"string"}},"required":["city"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":0.949999988079071,"truncation":"disabled","usage":{"context_details":{"input_tokens":329,"output_tokens":160},"cost_in_usd_ticks":4752500,"input_tokens":329,"input_tokens_details":{"cached_tokens":320},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":160,"output_tokens_details":{"reasoning_tokens":149},"total_tokens":489},"user":null},"sequence_number":54,"type":"response.completed"}
+    data: {"response":{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_REDACTED_1","incomplete_details":null,"instructions":null,"max_output_tokens":4096,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_1","status":"completed","summary":[{"text":"The question is: \"I'm planning a trip. What is the current weather in Tokyo, Japan? Based on the weather conditions, should I pack an umbrella or sunscreen? Use the get_weather tool to check before an...","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"city\":\"Tokyo\"}","call_id":"call_REDACTED_1","id":"fc_REDACTED_1","name":"get_weather","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.699999988079071,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[{"description":"Get the current weather for a city. Must be called for weather questions.","name":"get_weather","parameters":{"properties":{"city":{"description":"City name to get weather for","type":"string"}},"required":["city"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":0.949999988079071,"truncation":"disabled","usage":{"context_details":{"input_tokens":375,"output_tokens":198},"cost_in_usd_ticks":7621500,"input_tokens":375,"input_tokens_details":{"cached_tokens":192},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":198,"output_tokens_details":{"reasoning_tokens":187},"total_tokens":573},"user":null},"sequence_number":54,"type":"response.completed"}
 
 ---
 when:
@@ -218,7 +218,7 @@ then:
     data: {"delta":" result","item_id":"rs_REDACTED_2","output_index":0,"sequence_number":6,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
 
     event: response.reasoning_summary_text.delta
-    data: {"delta":" is","item_id":"rs_REDACTED_2","output_index":0,"sequence_number":7,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+    data: {"delta":" shows","item_id":"rs_REDACTED_2","output_index":0,"sequence_number":7,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
 
     event: response.reasoning_summary_text.delta
     data: {"delta":":","item_id":"rs_REDACTED_2","output_index":0,"sequence_number":8,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
@@ -302,13 +302,13 @@ then:
     data: {"delta":".\n","item_id":"rs_REDACTED_2","output_index":0,"sequence_number":34,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
 
     event: response.reasoning_summary_text.done
-    data: {"item_id":"rs_REDACTED_2","output_index":0,"sequence_number":35,"summary_index":0,"text":"The tool result is: Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW.\n","type":"response.reasoning_summary_text.done"}
+    data: {"item_id":"rs_REDACTED_2","output_index":0,"sequence_number":35,"summary_index":0,"text":"The tool result shows: Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW.\n","type":"response.reasoning_summary_text.done"}
 
     event: response.reasoning_summary_part.done
-    data: {"item_id":"rs_REDACTED_2","output_index":0,"part":{"text":"The tool result is: Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW.\n","type":"summary_text"},"sequence_number":36,"summary_index":0,"type":"response.reasoning_summary_part.done"}
+    data: {"item_id":"rs_REDACTED_2","output_index":0,"part":{"text":"The tool result shows: Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW.\n","type":"summary_text"},"sequence_number":36,"summary_index":0,"type":"response.reasoning_summary_part.done"}
 
     event: response.output_item.done
-    data: {"item":{"id":"rs_REDACTED_2","status":"completed","summary":[{"text":"The tool result is: Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW.\n","type":"summary_text"}],"type":"reasoning"},"output_index":0,"sequence_number":37,"type":"response.output_item.done"}
+    data: {"item":{"id":"rs_REDACTED_2","status":"completed","summary":[{"text":"The tool result shows: Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW.\n","type":"summary_text"}],"type":"reasoning"},"output_index":0,"sequence_number":37,"type":"response.output_item.done"}
 
     event: response.output_item.added
     data: {"item":{"content":[],"id":"msg_REDACTED_1","role":"assistant","status":"in_progress","type":"message"},"output_index":1,"sequence_number":38,"type":"response.output_item.added"}
@@ -383,19 +383,19 @@ then:
     data: {"content_index":0,"delta":",","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":61,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":" wind","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":62,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":" ","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":62,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":" ","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":63,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":"8","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":63,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":"8","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":64,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":" mph","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":64,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":" mph","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":65,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":" NW","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":65,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":" NW","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":66,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":" wind","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":66,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
     data: {"content_index":0,"delta":".","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":67,"type":"response.output_text.delta"}
@@ -410,26 +410,32 @@ then:
     data: {"content_index":0,"delta":" (","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":70,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":"not","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":71,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":"no","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":71,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":" an","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":72,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":" need","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":72,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":" umbrella","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":73,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":" for","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":73,"type":"response.output_text.delta"}
 
     event: response.output_text.delta
-    data: {"content_index":0,"delta":").","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":74,"type":"response.output_text.delta"}
+    data: {"content_index":0,"delta":" an","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":74,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" umbrella","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":75,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":").","item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":76,"type":"response.output_text.delta"}
 
     event: response.output_text.done
-    data: {"content_index":0,"item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":75,"text":"Current weather in Tokyo: 72°F (22°C), sunny with light clouds, 45% humidity, wind 8 mph NW. Pack sunscreen (not an umbrella).","type":"response.output_text.done"}
+    data: {"content_index":0,"item_id":"msg_REDACTED_1","logprobs":[],"output_index":1,"sequence_number":77,"text":"Current weather in Tokyo: 72°F (22°C), sunny with light clouds, 45% humidity, 8 mph NW wind. Pack sunscreen (no need for an umbrella).","type":"response.output_text.done"}
 
     event: response.content_part.done
-    data: {"content_index":0,"item_id":"msg_REDACTED_1","output_index":1,"part":{"annotations":[],"logprobs":[],"text":"Current weather in Tokyo: 72°F (22°C), sunny with light clouds, 45% humidity, wind 8 mph NW. Pack sunscreen (not an umbrella).","type":"output_text"},"sequence_number":76,"type":"response.content_part.done"}
+    data: {"content_index":0,"item_id":"msg_REDACTED_1","output_index":1,"part":{"annotations":[],"logprobs":[],"text":"Current weather in Tokyo: 72°F (22°C), sunny with light clouds, 45% humidity, 8 mph NW wind. Pack sunscreen (no need for an umbrella).","type":"output_text"},"sequence_number":78,"type":"response.content_part.done"}
 
     event: response.output_item.done
-    data: {"item":{"content":[{"annotations":[],"logprobs":[],"text":"Current weather in Tokyo: 72°F (22°C), sunny with light clouds, 45% humidity, wind 8 mph NW. Pack sunscreen (not an umbrella).","type":"output_text"}],"id":"msg_REDACTED_1","role":"assistant","status":"completed","type":"message"},"output_index":1,"sequence_number":77,"type":"response.output_item.done"}
+    data: {"item":{"content":[{"annotations":[],"logprobs":[],"text":"Current weather in Tokyo: 72°F (22°C), sunny with light clouds, 45% humidity, 8 mph NW wind. Pack sunscreen (no need for an umbrella).","type":"output_text"}],"id":"msg_REDACTED_1","role":"assistant","status":"completed","type":"message"},"output_index":1,"sequence_number":79,"type":"response.output_item.done"}
 
     event: response.completed
-    data: {"response":{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_REDACTED_2","incomplete_details":null,"instructions":null,"max_output_tokens":4096,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_2","status":"completed","summary":[{"text":"The tool result is: Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW.\n","type":"summary_text"}],"type":"reasoning"},{"content":[{"annotations":[],"logprobs":[],"text":"Current weather in Tokyo: 72°F (22°C), sunny with light clouds, 45% humidity, wind 8 mph NW. Pack sunscreen (not an umbrella).","type":"output_text"}],"id":"msg_REDACTED_1","role":"assistant","status":"completed","type":"message"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.699999988079071,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[{"description":"Get the current weather for a city. Must be called for weather questions.","name":"get_weather","parameters":{"properties":{"city":{"description":"City name to get weather for","type":"string"}},"required":["city"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":0.949999988079071,"truncation":"disabled","usage":{"context_details":{"input_tokens":521,"output_tokens":110},"cost_in_usd_ticks":5902500,"input_tokens":521,"input_tokens_details":{"cached_tokens":320},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":110,"output_tokens_details":{"reasoning_tokens":75},"total_tokens":631},"user":null},"sequence_number":78,"type":"response.completed"}
+    data: {"response":{"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_REDACTED_2","incomplete_details":null,"instructions":null,"max_output_tokens":4096,"max_tool_calls":null,"metadata":{"system_fingerprint":"fp_REDACTED_1"},"model":"grok-4.3","object":"response","output":[{"id":"rs_REDACTED_2","status":"completed","summary":[{"text":"The tool result shows: Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW.\n","type":"summary_text"}],"type":"reasoning"},{"content":[{"annotations":[],"logprobs":[],"text":"Current weather in Tokyo: 72°F (22°C), sunny with light clouds, 45% humidity, 8 mph NW wind. Pack sunscreen (no need for an umbrella).","type":"output_text"}],"id":"msg_REDACTED_1","role":"assistant","status":"completed","type":"message"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","status":"completed","store":true,"temperature":0.699999988079071,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[{"description":"Get the current weather for a city. Must be called for weather questions.","name":"get_weather","parameters":{"properties":{"city":{"description":"City name to get weather for","type":"string"}},"required":["city"],"type":"object"},"strict":null,"type":"function"}],"top_logprobs":0,"top_p":0.949999988079071,"truncation":"disabled","usage":{"context_details":{"input_tokens":415,"output_tokens":126},"cost_in_usd_ticks":4305500,"input_tokens":415,"input_tokens_details":{"cached_tokens":384},"num_server_side_tools_used":0,"num_sources_used":0,"output_tokens":126,"output_tokens_details":{"reasoning_tokens":89},"total_tokens":541},"user":null},"sequence_number":80,"type":"response.completed"}
 

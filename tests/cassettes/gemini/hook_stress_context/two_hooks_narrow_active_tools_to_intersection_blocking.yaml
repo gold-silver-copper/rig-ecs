@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":6,"y":2},"name":"add"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":18,"promptTokenCount":110,"promptTokensDetails":[{"modality":"TEXT","tokenCount":110}],"serviceTier":"standard","thoughtsTokenCount":79,"totalTokenCount":207}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":6,"y":2},"name":"add"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":18,"promptTokenCount":110,"promptTokensDetails":[{"modality":"TEXT","tokenCount":110}],"serviceTier":"standard","thoughtsTokenCount":76,"totalTokenCount":204}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"I can compute 6 + 2 = 8. I cannot compute 10 - 3 or 4 * 5, as I do not have the capability to subtract or multiply."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":40,"promptTokenCount":141,"promptTokensDetails":[{"modality":"TEXT","tokenCount":141}],"serviceTier":"standard","totalTokenCount":181}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"I can compute 6 + 2 = 8. I cannot compute 10 - 3 or 4 * 5, as I do not have the necessary tools for those operations."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":40,"promptTokenCount":141,"promptTokensDetails":[{"modality":"TEXT","tokenCount":141}],"serviceTier":"standard","totalTokenCount":181}}'

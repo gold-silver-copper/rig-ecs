@@ -18,6 +18,8 @@ then:
 
     : OPENROUTER PROCESSING
 
+    : OPENROUTER PROCESSING
+
     data: {"choices":[{"delta":{"content":"8","role":"assistant"},"finish_reason":null,"index":0,"native_finish_reason":null}],"created":0,"id":"chatcmpl-REDACTED_1","model":"google/gemini-2.5-flash","object":"chat.completion.chunk","provider":"Google"}
 
     data: {"choices":[{"delta":{"content":"c27","role":"assistant"},"finish_reason":null,"index":0,"native_finish_reason":null}],"created":0,"id":"chatcmpl-REDACTED_1","model":"google/gemini-2.5-flash","object":"chat.completion.chunk","provider":"Google"}

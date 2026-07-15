@@ -24,7 +24,7 @@ then:
 
     data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{}"},"index":1}]},"finish_reason":null,"index":0,"logprobs":null}],"created":0,"id":"chatcmpl-REDACTED_1","model":"deepseek-v4-flash","object":"chat.completion.chunk","system_fingerprint":"fp_REDACTED_1","usage":null}
 
-    data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls","index":0,"logprobs":null}],"created":0,"id":"chatcmpl-REDACTED_1","model":"deepseek-v4-flash","object":"chat.completion.chunk","system_fingerprint":"fp_REDACTED_1","usage":{"completion_tokens":48,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":404,"prompt_tokens":404,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":452}}
+    data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls","index":0,"logprobs":null}],"created":0,"id":"chatcmpl-REDACTED_1","model":"deepseek-v4-flash","object":"chat.completion.chunk","system_fingerprint":"fp_REDACTED_1","usage":{"completion_tokens":48,"prompt_cache_hit_tokens":384,"prompt_cache_miss_tokens":20,"prompt_tokens":404,"prompt_tokens_details":{"cached_tokens":384},"total_tokens":452}}
 
     data: [DONE]
 
