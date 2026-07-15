@@ -41,13 +41,13 @@ then:
     data: {"delta":{"partial_json":"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"{\"x\"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"{\"x\": 3","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":": 3","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":", \"y","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":", \"y\": 4}","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"\": 4}","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":1,"type":"content_block_stop"}
@@ -102,10 +102,7 @@ then:
     data: {"delta":{"partial_json":"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"{\"x\":","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
-
-    event: content_block_delta
-    data: {"delta":{"partial_json":" 7","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"{\"x\": 7","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
     data: {"delta":{"partial_json":", \"y\": 5}","type":"input_json_delta"},"index":1,"type":"content_block_delta"}

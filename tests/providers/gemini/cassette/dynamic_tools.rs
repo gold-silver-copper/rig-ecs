@@ -7,12 +7,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use rig::bevy_ecs::prelude::On;
+use rig::bevy_ecs::prelude::In;
 use rig::client::{CompletionClient, EmbeddingsClient};
 use rig::completion::{Chat, Message};
 use rig::embeddings::{EmbeddingsBuilder, ToolSchema};
 use rig::providers::gemini;
-use rig::runtime::{PolicyPoint, PolicyRule, RequestPolicyDecision, RequestPolicyInvocation};
+use rig::runtime::{
+    PolicyPoint, PolicyResponderId, PolicyRule, RequestPolicyDecision, RequestPolicyInvocation,
+};
 use rig::vector_store::in_memory_store::InMemoryVectorStore;
 
 use super::super::agent_run_support::{history_has_assistant_tool_call, tool_result_texts};
@@ -171,19 +173,23 @@ async fn sample_caps_retrieved_definitions() {
             let captured_for_policy = Arc::clone(&captured);
             agent
                 .with_runtime_mut(move |runtime| {
-                    runtime.world_mut().entity_mut(policy).observe(
-                        move |mut event: On<RequestPolicyInvocation>| {
-                            *captured_for_policy.lock().expect("captured tools") = event
-                                .request
-                                .tools
-                                .iter()
-                                .map(|tool| tool.name.clone())
-                                .collect();
-                            event.decision = Some(RequestPolicyDecision::Stop(
-                                "captured retrieved definitions".to_owned(),
-                            ));
-                        },
-                    );
+                    runtime
+                        .register_request_policy_responder(
+                            policy,
+                            PolicyResponderId::new("capture-retrieved-tools").unwrap(),
+                            move |In(event): In<RequestPolicyInvocation>| {
+                                *captured_for_policy.lock().expect("captured tools") = event
+                                    .request
+                                    .tools
+                                    .iter()
+                                    .map(|tool| tool.name.clone())
+                                    .collect();
+                                Some(RequestPolicyDecision::Stop(
+                                    "captured retrieved definitions".to_owned(),
+                                ))
+                            },
+                        )
+                        .expect("capture responder should register");
                 })
                 .expect("capture observer should install");
 

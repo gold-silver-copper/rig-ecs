@@ -1,12 +1,12 @@
 //! ECS policy dispatch on the tool execution path: skip-with-reason,
 //! stop-before-dispatch, and observation of every call/result pair.
 
-use rig::bevy_ecs::prelude::{On, Query};
+use rig::bevy_ecs::prelude::{In, On, Query};
 use rig::client::CompletionClient;
 use rig::providers::gemini;
 use rig::runtime::{
-    PolicyPoint, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation, ToolCallPrepared,
-    ToolEffectInput, ToolResultPresentationFinalized,
+    PolicyPoint, PolicyResponderId, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation,
+    ToolCallPrepared, ToolEffectInput, ToolResultPresentationFinalized,
 };
 use rig::tool::Tool;
 
@@ -18,12 +18,12 @@ use crate::support::{assert_nonempty_response, install_policy};
 const SKIP_REASON: &str = "the add tool is down for maintenance; report exactly that to the user";
 const TERMINATE_REASON: &str = "tool execution vetoed by policy hook";
 
-fn stop_add(mut event: On<ToolCallPolicyInvocation>) {
-    event.decision = Some(if event.call.decision.name == CountingAdd::NAME {
+fn stop_add(In(event): In<ToolCallPolicyInvocation>) -> Option<ToolCallPolicyDecision> {
+    Some(if event.call.decision.name == CountingAdd::NAME {
         ToolCallPolicyDecision::Stop(TERMINATE_REASON.to_owned())
     } else {
         ToolCallPolicyDecision::Run
-    });
+    })
 }
 
 #[tokio::test]
@@ -102,7 +102,13 @@ async fn on_tool_call_terminate_cancels_run() {
             .expect("stop policy should install");
             agent
                 .with_runtime_mut(|runtime| {
-                    runtime.world_mut().entity_mut(policy).observe(stop_add);
+                    runtime
+                        .register_tool_call_policy_responder(
+                            policy,
+                            PolicyResponderId::new("stop-add").unwrap(),
+                            stop_add,
+                        )
+                        .expect("tool-call responder should register");
                 })
                 .expect("policy observer should install");
 
@@ -212,8 +218,8 @@ async fn hooks_observe_every_tool_call_and_result() {
                 "result hook should see the same args"
             );
             assert_eq!(
-                result_output, "42",
-                "result hook should see the raw tool output"
+                result_output, "<typed tool output: 1 parts>",
+                "observe-only telemetry should summarize typed tool output"
             );
 
             assert!(

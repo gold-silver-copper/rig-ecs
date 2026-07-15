@@ -13,12 +13,13 @@ use anyhow::{Context, Result};
 use rig::bevy_ecs::{
     lifecycle::Add,
     observer::On,
-    prelude::{Commands, Component, Query},
+    prelude::{Commands, Component, In, Query},
 };
 use rig::runtime::{
     CanonicalError, EffectCompletion, EffectOutput, ModelEffectOutput, ModelToolCall, Policy,
-    PolicyPoint, PolicyRule, RunRecord, RunState, ToolCapability, ToolEffectFailure,
-    ToolEffectOutput, ToolGrant, ToolResultPolicyDecision, ToolResultPolicyInvocation, Usage,
+    PolicyPoint, PolicyResponderId, PolicyRule, RunRecord, RunState, ToolCapability,
+    ToolEffectFailure, ToolEffectOutput, ToolGrant, ToolResultPolicyDecision,
+    ToolResultPolicyInvocation, Usage,
 };
 use rig::tool::ToolErrorKind;
 
@@ -49,9 +50,9 @@ fn initialize_ledger(event: On<Add, RunRecord>, mut commands: Commands) {
 }
 
 fn record_failure(
-    mut event: On<ToolResultPolicyInvocation>,
+    In(event): In<ToolResultPolicyInvocation>,
     mut ledgers: Query<&mut FailureLedger>,
-) {
+) -> Option<ToolResultPolicyDecision> {
     if let Some(failure) = &event.result.failure
         && let Ok(mut ledger) = ledgers.get_mut(event.run)
     {
@@ -63,25 +64,30 @@ fn record_failure(
             message: failure.message.clone(),
         });
     }
-    event.decision = Some(ToolResultPolicyDecision::Keep);
+    Some(ToolResultPolicyDecision::Keep)
 }
 
-fn redact_model_presentation(mut event: On<ToolResultPolicyInvocation>) {
-    event.decision = Some(if event.result.failure.is_some() {
-        ToolResultPolicyDecision::Rewrite("system probe unavailable".to_owned())
+fn redact_model_presentation(
+    In(event): In<ToolResultPolicyInvocation>,
+) -> Option<ToolResultPolicyDecision> {
+    Some(if event.result.failure.is_some() {
+        ToolResultPolicyDecision::Rewrite("system probe unavailable".into())
     } else {
         ToolResultPolicyDecision::Keep
-    });
+    })
 }
 
-fn stop_fatal_failure(mut event: On<ToolResultPolicyInvocation>, ledgers: Query<&FailureLedger>) {
+fn stop_fatal_failure(
+    In(event): In<ToolResultPolicyInvocation>,
+    ledgers: Query<&FailureLedger>,
+) -> Option<ToolResultPolicyDecision> {
     let record = ledgers.get(event.run).ok().and_then(|ledger| {
         ledger
             .0
             .iter()
             .find(|record| record.call_id == event.result.call_id)
     });
-    event.decision = Some(match record {
+    Some(match record {
         Some(record) if record.kind == ToolErrorKind::Other => {
             ToolResultPolicyDecision::Stop(format!("fatal disk I/O failure ({})", record.message))
         }
@@ -93,7 +99,7 @@ fn stop_fatal_failure(mut event: On<ToolResultPolicyInvocation>, ledgers: Query<
             ToolResultPolicyDecision::Keep
         }
         None => ToolResultPolicyDecision::Keep,
-    });
+    })
 }
 
 fn parse_mode() -> Option<Mode> {
@@ -148,10 +154,11 @@ fn install_policies(
         },
         agent,
     )?;
-    runtime
-        .world_mut()
-        .entity_mut(recorder)
-        .observe(record_failure);
+    runtime.register_tool_result_policy_responder(
+        recorder,
+        PolicyResponderId::new("record-failure")?,
+        record_failure,
+    )?;
     let redaction = runtime.spawn_policy(
         ecs_demo::id("redact-failure")?,
         ecs_demo::tenant()?,
@@ -162,10 +169,11 @@ fn install_policies(
         },
         agent,
     )?;
-    runtime
-        .world_mut()
-        .entity_mut(redaction)
-        .observe(redact_model_presentation);
+    runtime.register_tool_result_policy_responder(
+        redaction,
+        PolicyResponderId::new("redact-failure")?,
+        redact_model_presentation,
+    )?;
     let fatal = runtime.spawn_policy(
         ecs_demo::id("stop-fatal-failure")?,
         ecs_demo::tenant()?,
@@ -176,10 +184,11 @@ fn install_policies(
         },
         agent,
     )?;
-    runtime
-        .world_mut()
-        .entity_mut(fatal)
-        .observe(stop_fatal_failure);
+    runtime.register_tool_result_policy_responder(
+        fatal,
+        PolicyResponderId::new("stop-fatal-failure")?,
+        stop_fatal_failure,
+    )?;
     Ok(())
 }
 
@@ -245,8 +254,8 @@ fn main() -> Result<()> {
                 provider_result_id: input.provider_result_id.clone(),
                 provider_call_id: input.provider_call_id.clone(),
                 name: input.decision.name.clone(),
-                raw: serde_json::json!({"error": failure.kind.as_str()}),
-                presentation: format!("probe failed: {}", failure.kind),
+                raw: serde_json::json!({"error": failure.kind.as_str()}).into(),
+                presentation: format!("probe failed: {}", failure.kind).into(),
                 failure: Some(failure),
             })),
         })?;
@@ -257,8 +266,8 @@ fn main() -> Result<()> {
 
     match mode {
         Mode::Fatal => match runtime.observe_run(run)? {
-            Some(RunState::Failed(CanonicalError::PolicyDenied { policy })) => {
-                println!("fatal result stopped by policy `{policy}`");
+            Some(RunState::Failed(CanonicalError::PolicyTerminated { termination })) => {
+                println!("fatal result stopped by {termination}");
             }
             state => anyhow::bail!("unexpected fatal outcome: {state:?}"),
         },

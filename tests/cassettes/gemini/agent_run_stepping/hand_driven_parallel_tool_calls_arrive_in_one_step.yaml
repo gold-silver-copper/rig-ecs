@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":3,"y":5},"name":"add"},"thoughtSignature":"signature_REDACTED_1"},{"functionCall":{"args":{"x":10,"y":4},"name":"subtract"}}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":37,"promptTokenCount":193,"promptTokensDetails":[{"modality":"TEXT","tokenCount":193}],"serviceTier":"standard","thoughtsTokenCount":70,"totalTokenCount":300}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":3,"y":5},"name":"add"},"thoughtSignature":"signature_REDACTED_1"},{"functionCall":{"args":{"x":10,"y":4},"name":"subtract"}}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":37,"promptTokenCount":193,"promptTokensDetails":[{"modality":"TEXT","tokenCount":193}],"serviceTier":"standard","thoughtsTokenCount":108,"totalTokenCount":338}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"3 + 5 = 8\n10 - 4 = 6","thoughtSignature":"signature_REDACTED_2"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":16,"promptTokenCount":254,"promptTokensDetails":[{"modality":"TEXT","tokenCount":254}],"serviceTier":"standard","thoughtsTokenCount":81,"totalTokenCount":351}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"8\n6","thoughtSignature":"signature_REDACTED_2"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":3,"promptTokenCount":254,"promptTokensDetails":[{"modality":"TEXT","tokenCount":254}],"serviceTier":"standard","thoughtsTokenCount":53,"totalTokenCount":310}}'

@@ -195,7 +195,7 @@ async fn streaming_result_redaction_reaches_final_response() {
                 1,
                 PolicyRule::RewriteToolResult {
                     tool: Some("add".to_owned()),
-                    presentation: "STREAM-REDACTED-Q3".to_owned(),
+                    presentation: "STREAM-REDACTED-Q3".into(),
                 },
             )
             .expect("redaction policy should install");

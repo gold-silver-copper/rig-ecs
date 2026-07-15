@@ -296,8 +296,8 @@ fn mcp_effect_output(
         provider_result_id,
         provider_call_id,
         name,
-        raw,
-        presentation,
+        raw: raw.into(),
+        presentation: presentation.into(),
         failure,
     })
 }

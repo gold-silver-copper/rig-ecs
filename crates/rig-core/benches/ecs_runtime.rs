@@ -408,8 +408,8 @@ fn parallel_tool_batch() -> Duration {
                     provider_result_id: input.provider_result_id.clone(),
                     provider_call_id: input.provider_call_id.clone(),
                     name: input.decision.name.clone(),
-                    raw: serde_json::json!(input.index),
-                    presentation: input.index.to_string(),
+                    raw: serde_json::json!(input.index).into(),
+                    presentation: input.index.to_string().into(),
                     failure: None,
                 })),
             })

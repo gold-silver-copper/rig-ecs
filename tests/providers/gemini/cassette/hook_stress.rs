@@ -174,7 +174,7 @@ async fn chained_arg_rewrite_then_result_redaction_blocking() {
                 1,
                 PolicyRule::RewriteToolResult {
                     tool: Some(CountingAdd::NAME.to_owned()),
-                    presentation: REDACTION_MARKER.to_owned(),
+                    presentation: REDACTION_MARKER.into(),
                 },
             )
             .expect("redaction policy should install");

@@ -581,7 +581,7 @@ impl AddAssign for Usage {
 /// either from a third party provider (e.g.: OpenAI) or a local model.
 pub trait CompletionModel: Clone + Send + Sync {
     /// The raw response type returned by the underlying completion model.
-    type Response: Send + Sync + Serialize + DeserializeOwned;
+    type Response: Send + Sync + Serialize + DeserializeOwned + 'static;
     /// The raw response type returned by the underlying completion model when streaming.
     type StreamingResponse: Clone
         + Unpin
@@ -589,7 +589,8 @@ pub trait CompletionModel: Clone + Send + Sync {
         + Sync
         + Serialize
         + DeserializeOwned
-        + GetTokenUsage;
+        + GetTokenUsage
+        + 'static;
 
     /// Provider client type used to construct this model.
     type Client;

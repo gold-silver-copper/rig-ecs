@@ -29,16 +29,16 @@ then:
     data: {"delta":{"text":"A solar eclipse occ","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"urs when the Moon passes between the Sun and Earth, blocking some or all of the Sun's light from reaching a portion of Earth's sur","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"urs when the Moon passes between the Sun and Earth, blocking all or part of the Sun's light from reaching a portion of","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"face. Depending on the alignment and the Moon's distance from Earth, the eclipse can be total","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" Earth's surface. Depending on the alignment and distances involved, the eclipse can be total (the Sun is complet","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" (the Sun is completely covered), partial (only part of the Sun is obscured), or annular (the Moon appears too","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"ely covered), partial (only part of the Sun is obscured), or annular (the Moon appears too small to f","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" small to fully cover the Sun, leaving a bright ring around it).","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"ully cover the Sun, leaving a bright ring of sunlight visible around it).","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":0,"type":"content_block_stop"}

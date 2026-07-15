@@ -53,7 +53,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":50,"y":8},"name":"subtract"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":19,"promptTokenCount":164,"promptTokensDetails":[{"modality":"TEXT","tokenCount":164}],"serviceTier":"standard","thoughtsTokenCount":45,"totalTokenCount":228}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":50,"y":8},"name":"subtract"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":19,"promptTokenCount":164,"promptTokensDetails":[{"modality":"TEXT","tokenCount":164}],"serviceTier":"standard","thoughtsTokenCount":47,"totalTokenCount":230}}'
 ---
 when:
   path: /v1beta/models/gemini-embedding-001:batchEmbedContents

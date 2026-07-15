@@ -29,7 +29,7 @@ then:
     data: {"delta":{"thinking":"The","type":"thinking_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"thinking":" user wants to know the current weather in Tokyo, Japan. I'll call the get_weather tool for Tokyo.","type":"thinking_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"thinking":" user wants to know the current weather in Tokyo, Japan. I'll call the get_weather tool with \"Tokyo\" as the city.","type":"thinking_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
     data: {"delta":{"signature":"signature_REDACTED_2","type":"signature_delta"},"index":0,"type":"content_block_delta"}
@@ -41,7 +41,10 @@ then:
     data: {"content_block":{"text":"","type":"text"},"index":1,"type":"content_block_start"}
 
     event: content_block_delta
-    data: {"delta":{"text":"Sure! Let me check the current weather in Tokyo right away!","type":"text_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"text":"Sure","type":"text_delta"},"index":1,"type":"content_block_delta"}
+
+    event: content_block_delta
+    data: {"delta":{"text":"! Let me check the current weather in Tokyo right away!","type":"text_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":1,"type":"content_block_stop"}
@@ -53,19 +56,16 @@ then:
     data: {"delta":{"partial_json":"","type":"input_json_delta"},"index":2,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"{\"city\":","type":"input_json_delta"},"index":2,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"{\"city\": \"To","type":"input_json_delta"},"index":2,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":" \"Tok","type":"input_json_delta"},"index":2,"type":"content_block_delta"}
-
-    event: content_block_delta
-    data: {"delta":{"partial_json":"yo\"}","type":"input_json_delta"},"index":2,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"kyo\"}","type":"input_json_delta"},"index":2,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":2,"type":"content_block_stop"}
 
     event: message_delta
-    data: {"delta":{"stop_details":null,"stop_reason":"tool_use","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":671,"output_tokens":106,"output_tokens_details":{"thinking_tokens":36}}}
+    data: {"delta":{"stop_details":null,"stop_reason":"tool_use","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":671,"output_tokens":111,"output_tokens_details":{"thinking_tokens":41}}}
 
     event: message_stop
     data: {"type":"message_stop"}
@@ -82,7 +82,7 @@ when:
     value: application/json
   - name: anthropic-version
     value: 2023-06-01
-  body: '{"max_tokens":16384,"messages":[{"content":[{"text":"I''m planning a trip. What is the current weather in Tokyo, Japan? Based on the weather conditions, should I pack an umbrella or sunscreen? Use the get_weather tool to check before answering.","type":"text"}],"role":"user"},{"content":[{"signature":"signature_REDACTED_2","thinking":"The user wants to know the current weather in Tokyo, Japan. I''ll call the get_weather tool for Tokyo.","type":"thinking"},{"text":"Sure! Let me check the current weather in Tokyo right away!","type":"text"},{"id":"toolu_REDACTED_1","input":{"city":"Tokyo"},"name":"get_weather","type":"tool_use"}],"role":"assistant"},{"content":[{"content":[{"text":"Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW","type":"text"}],"tool_use_id":"toolu_REDACTED_1","type":"tool_result"}],"role":"user"}],"model":"claude-sonnet-4-6","stream":true,"system":[{"text":"You are a weather assistant. You have access to a get_weather tool. You must call the get_weather tool for any weather question and never guess weather data. After receiving the tool result, provide a concise summary of the weather.","type":"text"}],"thinking":{"type":"adaptive"},"tool_choice":{"type":"auto"},"tools":[{"description":"Get the current weather for a city. Must be called for weather questions.","input_schema":{"properties":{"city":{"description":"City name to get weather for","type":"string"}},"required":["city"],"type":"object"},"name":"get_weather"}]}'
+  body: '{"max_tokens":16384,"messages":[{"content":[{"text":"I''m planning a trip. What is the current weather in Tokyo, Japan? Based on the weather conditions, should I pack an umbrella or sunscreen? Use the get_weather tool to check before answering.","type":"text"}],"role":"user"},{"content":[{"signature":"signature_REDACTED_2","thinking":"The user wants to know the current weather in Tokyo, Japan. I''ll call the get_weather tool with \"Tokyo\" as the city.","type":"thinking"},{"text":"Sure! Let me check the current weather in Tokyo right away!","type":"text"},{"id":"toolu_REDACTED_1","input":{"city":"Tokyo"},"name":"get_weather","type":"tool_use"}],"role":"assistant"},{"content":[{"content":[{"text":"Weather in Tokyo: 72F (22C), sunny with light clouds, humidity 45%, wind 8 mph NW","type":"text"}],"tool_use_id":"toolu_REDACTED_1","type":"tool_result"}],"role":"user"}],"model":"claude-sonnet-4-6","stream":true,"system":[{"text":"You are a weather assistant. You have access to a get_weather tool. You must call the get_weather tool for any weather question and never guess weather data. After receiving the tool result, provide a concise summary of the weather.","type":"text"}],"thinking":{"type":"adaptive"},"tool_choice":{"type":"auto"},"tools":[{"description":"Get the current weather for a city. Must be called for weather questions.","input_schema":{"properties":{"city":{"description":"City name to get weather for","type":"string"}},"required":["city"],"type":"object"},"name":"get_weather"}]}'
 then:
   status: 200
   header:
@@ -90,7 +90,7 @@ then:
     value: text/event-stream; charset=utf-8
   body: |+
     event: message_start
-    data: {"message":{"content":[],"id":"msg_REDACTED_2","model":"claude-sonnet-4-6","role":"assistant","stop_details":null,"stop_reason":null,"stop_sequence":null,"type":"message","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":816,"output_tokens":1,"service_tier":"standard"}},"type":"message_start"}
+    data: {"message":{"content":[],"id":"msg_REDACTED_2","model":"claude-sonnet-4-6","role":"assistant","stop_details":null,"stop_reason":null,"stop_sequence":null,"type":"message","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":821,"output_tokens":1,"service_tier":"standard"}},"type":"message_start"}
 
     event: content_block_start
     data: {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
@@ -102,52 +102,52 @@ then:
     data: {"delta":{"text":"Here","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"'s a summary of the current weather in **Tokyo, Japan** and my p","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"'s the current weather report for **Tokyo, Japan** 🇯🇵:\n\n| Condition | Details |\n|-----------|---------|","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"acking recommendation:\n\n---\n\n### 🌤️ Current Weather in Tokyo\n| Detail","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"\n| 🌡️ Temperature | 72°F (22°C) |\n| ☀️ Sky | Sunny with light clouds |\n| ","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" | Info |\n|---|---|\n| 🌡️ **Temperature** | 72°F (22°C) |\n| ☁️ **Conditions** |","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"💧 Humidity | 45% |\n| 💨 Wind | 8 mph, NW |\n\n---\n\n### 🧳","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" Sunny with light clouds |\n| 💧 **Humidity** | 45% |\n| 💨 **Wind** | 8 mph, Northwest |\n\n---\n\n### 🎒","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" Packing Recommendation: **Sunscreen!**\n\nBased on the current conditions, Tokyo","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" Packing Recommendation: **Sunscreen!** 🧴☀️\n\nThe weather in","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" is enjoying **sunny weather with light clouds** and a comfortable temperature of 72°F (22°C). Here's my","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" Tokyo is currently **sunny with light clouds**, a comfortable temperature, and low humidity — perfect sightseeing weather! Here's what I'd suggest","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" advice:\n\n- ✅ **Pack sunscreen** — With sunny skies and","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":":\n\n- ✅ **Pack sunscreen** — With sunny skies and light","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" only light cloud cover, UV exposure can still be significant","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" cloud cover, UV exposure is a real concern, especially if you're spending","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":", especially if you're out sightseeing all day.\n- ❌ **Skip","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" time outdoors exploring.\n- ❌ **Skip the umbrella** — There's no rain in sight","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" the umbrella** (for now) — There's no rain in the current","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" based on current conditions. However, if you're staying for multiple","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" conditions, so an umbrella isn't necessary at this moment.\n- 😊 **Bonus","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" days, it's always smart to keep a compact travel umbre","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" tip:** The 45% humidity and mild temperature make for very pleasant","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"lla handy since weather can change!\n- 👕 **Light layers** recommended","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" outdoor conditions — perfect for exploring Tokyo!\n\n> ⚠️ *Note: Weather","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" — 72°F is pleasant, but the NW wind might make it feel slightly","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" can change, so it's always a good idea to check a local forecast closer to your travel date for","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" cooler in the shade.\n\nHave a wonderful trip to Tokyo! 🗼","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" the most up-to-date information.*\n\nHave a wonderful trip to Tokyo! 🗼","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":0,"type":"content_block_stop"}
 
     event: message_delta
-    data: {"delta":{"stop_details":null,"stop_reason":"end_turn","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":816,"output_tokens":319,"output_tokens_details":{"thinking_tokens":0}}}
+    data: {"delta":{"stop_details":null,"stop_reason":"end_turn","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":821,"output_tokens":320,"output_tokens_details":{"thinking_tokens":0}}}
 
     event: message_stop
     data: {"type":"message_stop"}

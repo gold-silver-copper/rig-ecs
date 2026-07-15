@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use super::*;
 
-const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 4;
+const ACTIVE_RUN_SNAPSHOT_VERSION: u32 = 5;
 
 /// Serializable checkpoint for one run and all of its descendant runs.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -307,6 +307,8 @@ pub enum PersistedPolicyEvaluation {
     CompletionResponse(PersistedCompletionResponsePolicyEvaluation),
     /// Streaming text-delta evaluation.
     TextDelta(PersistedTextDeltaPolicyEvaluation),
+    /// Streaming tool-call-delta evaluation.
+    ToolCallDelta(PersistedToolCallDeltaPolicyEvaluation),
 }
 
 /// Request evaluation checkpoint.
@@ -389,6 +391,23 @@ pub struct PersistedTextDeltaPolicyEvaluation {
     pub phase: PersistedTextDeltaPolicyPhase,
 }
 
+/// Tool-call-delta evaluation checkpoint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersistedToolCallDeltaPolicyEvaluation {
+    pub id: String,
+    pub operation: String,
+    pub run_id: StableId,
+    pub policies: Vec<PersistedAcceptedPolicy>,
+    pub cursor: usize,
+    pub turn: u32,
+    pub sequence: u64,
+    pub provider_correlation: Option<String>,
+    pub call_id: String,
+    pub internal_call_id: String,
+    pub content: ToolCallDeltaContent,
+    pub phase: PersistedToolCallDeltaPolicyPhase,
+}
+
 macro_rules! policy_phase {
     ($name:ident { $($variant:ident $(($payload:ty))?),* $(,)? }) => {
         #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -423,6 +442,10 @@ policy_phase!(PersistedCompletionResponsePolicyPhase {
     Rejected((StableId, String)),
 });
 policy_phase!(PersistedTextDeltaPolicyPhase {
+    Published,
+    Rejected((StableId, String)),
+});
+policy_phase!(PersistedToolCallDeltaPolicyPhase {
     Published,
     Rejected((StableId, String)),
 });
@@ -559,10 +582,11 @@ pub fn snapshot_active_run(
         Option<&ToolResultPolicyEvaluation>,
         Option<&CompletionResponsePolicyEvaluation>,
         Option<&TextDeltaPolicyEvaluation>,
+        Option<&ToolCallDeltaPolicyEvaluation>,
     )>();
     let mut evaluation_entities = evaluation_query
         .iter(world)
-        .filter(|(_, operation, _, _, _, _, _, _)| operation_ids.contains_key(&operation.get()))
+        .filter(|(_, operation, _, _, _, _, _, _, _)| operation_ids.contains_key(&operation.get()))
         .map(|row| row.0)
         .collect::<Vec<_>>();
     evaluation_entities.sort();
@@ -948,6 +972,7 @@ fn persist_evaluation(
         Option<&ToolResultPolicyEvaluation>,
         Option<&CompletionResponsePolicyEvaluation>,
         Option<&TextDeltaPolicyEvaluation>,
+        Option<&ToolCallDeltaPolicyEvaluation>,
     ),
     run_ids: &HashMap<Entity, StableId>,
     operation_ids: &HashMap<Entity, String>,
@@ -971,6 +996,7 @@ fn persist_evaluation(
     count += usize::from(row.5.is_some());
     count += usize::from(row.6.is_some());
     count += usize::from(row.7.is_some());
+    count += usize::from(row.8.is_some());
     if count != 1 {
         return Err(ActiveRunSnapshotError::InvalidSnapshot(format!(
             "policy evaluation `{id}` has {count} evaluation kinds"
@@ -1145,13 +1171,45 @@ fn persist_evaluation(
             },
         ));
     }
-    let value = row.7.ok_or_else(|| {
+    if let Some(value) = row.7 {
+        return Ok(PersistedPolicyEvaluation::TextDelta(
+            PersistedTextDeltaPolicyEvaluation {
+                id: id.to_owned(),
+                operation: operation.to_owned(),
+                run_id: run_id(value.run)?,
+                policies: persist_policies(&value.policies),
+                cursor: value.cursor,
+                turn: value.turn,
+                sequence: value.sequence,
+                delta: value.delta.clone(),
+                aggregated: value.aggregated.clone(),
+                phase: match &value.phase {
+                    TextDeltaPolicyEvaluationPhase::Evaluating => {
+                        PersistedTextDeltaPolicyPhase::Evaluating
+                    }
+                    TextDeltaPolicyEvaluationPhase::WaitingApproval { operation, policy } => {
+                        PersistedTextDeltaPolicyPhase::WaitingApproval {
+                            operation: operation_id(*operation)?,
+                            policy: policy.clone(),
+                        }
+                    }
+                    TextDeltaPolicyEvaluationPhase::Published => {
+                        PersistedTextDeltaPolicyPhase::Published
+                    }
+                    TextDeltaPolicyEvaluationPhase::Rejected { policy, reason } => {
+                        PersistedTextDeltaPolicyPhase::Rejected((policy.clone(), reason.clone()))
+                    }
+                },
+            },
+        ));
+    }
+    let value = row.8.ok_or_else(|| {
         ActiveRunSnapshotError::InvalidSnapshot(format!(
             "policy evaluation `{id}` has no evaluation component"
         ))
     })?;
-    Ok(PersistedPolicyEvaluation::TextDelta(
-        PersistedTextDeltaPolicyEvaluation {
+    Ok(PersistedPolicyEvaluation::ToolCallDelta(
+        PersistedToolCallDeltaPolicyEvaluation {
             id: id.to_owned(),
             operation: operation.to_owned(),
             run_id: run_id(value.run)?,
@@ -1159,23 +1217,25 @@ fn persist_evaluation(
             cursor: value.cursor,
             turn: value.turn,
             sequence: value.sequence,
-            delta: value.delta.clone(),
-            aggregated: value.aggregated.clone(),
+            provider_correlation: value.provider_correlation.clone(),
+            call_id: value.id.clone(),
+            internal_call_id: value.internal_call_id.clone(),
+            content: value.content.clone(),
             phase: match &value.phase {
-                TextDeltaPolicyEvaluationPhase::Evaluating => {
-                    PersistedTextDeltaPolicyPhase::Evaluating
+                ToolCallDeltaPolicyEvaluationPhase::Evaluating => {
+                    PersistedToolCallDeltaPolicyPhase::Evaluating
                 }
-                TextDeltaPolicyEvaluationPhase::WaitingApproval { operation, policy } => {
-                    PersistedTextDeltaPolicyPhase::WaitingApproval {
+                ToolCallDeltaPolicyEvaluationPhase::WaitingApproval { operation, policy } => {
+                    PersistedToolCallDeltaPolicyPhase::WaitingApproval {
                         operation: operation_id(*operation)?,
                         policy: policy.clone(),
                     }
                 }
-                TextDeltaPolicyEvaluationPhase::Published => {
-                    PersistedTextDeltaPolicyPhase::Published
+                ToolCallDeltaPolicyEvaluationPhase::Published => {
+                    PersistedToolCallDeltaPolicyPhase::Published
                 }
-                TextDeltaPolicyEvaluationPhase::Rejected { policy, reason } => {
-                    PersistedTextDeltaPolicyPhase::Rejected((policy.clone(), reason.clone()))
+                ToolCallDeltaPolicyEvaluationPhase::Rejected { policy, reason } => {
+                    PersistedToolCallDeltaPolicyPhase::Rejected((policy.clone(), reason.clone()))
                 }
             },
         },
@@ -1190,6 +1250,7 @@ fn evaluation_id(evaluation: &PersistedPolicyEvaluation) -> &str {
         PersistedPolicyEvaluation::ToolResult(value) => &value.id,
         PersistedPolicyEvaluation::CompletionResponse(value) => &value.id,
         PersistedPolicyEvaluation::TextDelta(value) => &value.id,
+        PersistedPolicyEvaluation::ToolCallDelta(value) => &value.id,
     }
 }
 
@@ -1199,7 +1260,7 @@ struct DomainRef {
     tenant: TenantId,
     revision: Option<u64>,
     policy_order: Option<u32>,
-    policy_point: Option<PolicyPoint>,
+    policy_points: Option<Vec<PolicyPoint>>,
 }
 
 #[derive(Default)]
@@ -1287,7 +1348,7 @@ pub fn restore_active_run(
                 tenant: persisted.tenant.clone(),
                 revision: Some(persisted.policy.revision),
                 policy_order: Some(persisted.policy.order),
-                policy_point: Some(persisted.policy.rule.point()),
+                policy_points: Some(vec![persisted.policy.rule.point()]),
             },
         );
         restored_run_policies.push((persisted.id.clone(), entity));
@@ -1472,7 +1533,7 @@ fn validate_active_snapshot(
                 tenant: policy.tenant.clone(),
                 revision: Some(policy.policy.revision),
                 policy_order: Some(policy.policy.order),
-                policy_point: Some(policy.policy.rule.point()),
+                policy_points: Some(vec![policy.policy.rule.point()]),
             },
         );
         domain.existing_ids.insert(policy.id.clone());
@@ -1598,7 +1659,7 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     tenant: tenant.clone(),
                     revision: None,
                     policy_order: None,
-                    policy_point: None,
+                    policy_points: None,
                 },
             )
         })
@@ -1614,7 +1675,7 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     tenant: tenant.clone(),
                     revision: Some(value.revision),
                     policy_order: None,
-                    policy_point: None,
+                    policy_points: None,
                 },
             )
         })
@@ -1630,7 +1691,7 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     tenant: tenant.clone(),
                     revision: Some(value.revision),
                     policy_order: None,
-                    policy_point: None,
+                    policy_points: None,
                 },
             )
         })
@@ -1646,23 +1707,29 @@ fn collect_domain_refs(world: &mut World) -> DomainRefs {
                     tenant: tenant.clone(),
                     revision: Some(value.revision),
                     policy_order: None,
-                    policy_point: None,
+                    policy_points: None,
                 },
             )
         })
         .collect();
-    let mut policies = world.query::<(Entity, &StableId, &TenantId, &Policy)>();
+    let mut policies = world.query::<(
+        Entity,
+        &StableId,
+        &TenantId,
+        &PolicyMeta,
+        &PolicyCapabilities,
+    )>();
     refs.policies = policies
         .iter(world)
-        .map(|(entity, id, tenant, value)| {
+        .map(|(entity, id, tenant, meta, capabilities)| {
             (
                 id.clone(),
                 DomainRef {
                     entity,
                     tenant: tenant.clone(),
-                    revision: Some(value.revision),
-                    policy_order: Some(value.order),
-                    policy_point: Some(value.rule.point()),
+                    revision: Some(meta.revision),
+                    policy_order: Some(meta.order),
+                    policy_points: Some(capabilities.points().to_vec()),
                 },
             )
         })
@@ -1919,7 +1986,10 @@ fn remap_policies(
         .map(|policy| {
             let current = domain_ref(&domain.policies, &policy.id)?;
             if current.policy_order != Some(policy.order)
-                || current.policy_point != Some(policy.point)
+                || current
+                    .policy_points
+                    .as_ref()
+                    .is_none_or(|points| points.binary_search(&policy.point).is_err())
             {
                 return Err(ActiveRunSnapshotError::InvalidSnapshot(format!(
                     "accepted policy `{}` no longer has order {} and {:?} capability",
@@ -2217,6 +2287,7 @@ fn evaluation_operation(evaluation: &PersistedPolicyEvaluation) -> &str {
         PersistedPolicyEvaluation::ToolResult(value) => &value.operation,
         PersistedPolicyEvaluation::CompletionResponse(value) => &value.operation,
         PersistedPolicyEvaluation::TextDelta(value) => &value.operation,
+        PersistedPolicyEvaluation::ToolCallDelta(value) => &value.operation,
     }
 }
 
@@ -2228,6 +2299,7 @@ fn evaluation_run(evaluation: &PersistedPolicyEvaluation) -> &StableId {
         PersistedPolicyEvaluation::ToolResult(value) => &value.run_id,
         PersistedPolicyEvaluation::CompletionResponse(value) => &value.run_id,
         PersistedPolicyEvaluation::TextDelta(value) => &value.run_id,
+        PersistedPolicyEvaluation::ToolCallDelta(value) => &value.run_id,
     }
 }
 
@@ -2279,6 +2351,9 @@ fn validate_evaluation(
         PersistedPolicyEvaluation::TextDelta(value) => {
             remap_policies(&value.policies, PolicyPoint::TextDelta, domain, tenant)?;
         }
+        PersistedPolicyEvaluation::ToolCallDelta(value) => {
+            remap_policies(&value.policies, PolicyPoint::ToolCallDelta, domain, tenant)?;
+        }
     }
     validate_evaluation_approval_ref(evaluation, operations)
 }
@@ -2314,6 +2389,10 @@ fn validate_evaluation_approval_ref(
         },
         PersistedPolicyEvaluation::TextDelta(value) => match &value.phase {
             PersistedTextDeltaPolicyPhase::WaitingApproval { operation, .. } => Some(operation),
+            _ => None,
+        },
+        PersistedPolicyEvaluation::ToolCallDelta(value) => match &value.phase {
+            PersistedToolCallDeltaPolicyPhase::WaitingApproval { operation, .. } => Some(operation),
             _ => None,
         },
     };
@@ -2561,6 +2640,46 @@ fn restore_evaluation_components(
                         }
                         PersistedTextDeltaPolicyPhase::Rejected((policy, reason)) => {
                             TextDeltaPolicyEvaluationPhase::Rejected {
+                                policy: policy.clone(),
+                                reason: reason.clone(),
+                            }
+                        }
+                    },
+                },
+            ));
+        }
+        PersistedPolicyEvaluation::ToolCallDelta(value) => {
+            let policies =
+                remap_policies(&value.policies, PolicyPoint::ToolCallDelta, domain, &tenant)?;
+            world.entity_mut(entity).insert((
+                AcceptedToolCallDeltaPolicies(policies.clone()),
+                ToolCallDeltaPolicyEvaluation {
+                    run,
+                    operation: local_entity(operations, &value.operation)?,
+                    policies,
+                    cursor: value.cursor,
+                    turn: value.turn,
+                    sequence: value.sequence,
+                    provider_correlation: value.provider_correlation.clone(),
+                    id: value.call_id.clone(),
+                    internal_call_id: value.internal_call_id.clone(),
+                    content: value.content.clone(),
+                    phase: match &value.phase {
+                        PersistedToolCallDeltaPolicyPhase::Evaluating => {
+                            ToolCallDeltaPolicyEvaluationPhase::Evaluating
+                        }
+                        PersistedToolCallDeltaPolicyPhase::WaitingApproval {
+                            operation,
+                            policy,
+                        } => ToolCallDeltaPolicyEvaluationPhase::WaitingApproval {
+                            operation: local_entity(operations, operation)?,
+                            policy: policy.clone(),
+                        },
+                        PersistedToolCallDeltaPolicyPhase::Published => {
+                            ToolCallDeltaPolicyEvaluationPhase::Published
+                        }
+                        PersistedToolCallDeltaPolicyPhase::Rejected((policy, reason)) => {
+                            ToolCallDeltaPolicyEvaluationPhase::Rejected {
                                 policy: policy.clone(),
                                 reason: reason.clone(),
                             }

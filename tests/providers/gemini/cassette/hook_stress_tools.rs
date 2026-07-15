@@ -3,12 +3,12 @@
 //! stopping from a tool result (post-execution), and model-driven recovery
 //! from a tool error. Recorded against real Gemini.
 
-use rig::bevy_ecs::prelude::{On, Query};
+use rig::bevy_ecs::prelude::{In, On, Query};
 use rig::client::CompletionClient;
 use rig::providers::gemini;
 use rig::runtime::{
-    PolicyPoint, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation, ToolCallPrepared,
-    ToolEffectInput, ToolResultPolicyDecision, ToolResultPolicyInvocation,
+    PolicyPoint, PolicyResponderId, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation,
+    ToolCallPrepared, ToolEffectInput, ToolResultPolicyDecision, ToolResultPolicyInvocation,
     ToolResultPresentationFinalized,
 };
 use rig::tool::Tool;
@@ -35,20 +35,23 @@ pub(super) fn install_arg_patch(
     .expect("argument policy should install");
     agent
         .with_runtime_mut(move |runtime| {
-            runtime.world_mut().entity_mut(policy).observe(
-                move |mut event: On<ToolCallPolicyInvocation>| {
-                    if event.call.decision.name != CountingAdd::NAME {
-                        event.decision = Some(ToolCallPolicyDecision::Run);
-                        return;
-                    }
-                    let mut arguments = event.call.arguments.clone();
-                    arguments
-                        .as_object_mut()
-                        .expect("add arguments should be an object")
-                        .insert(key.to_owned(), value.clone());
-                    event.decision = Some(ToolCallPolicyDecision::Rewrite(arguments));
-                },
-            );
+            runtime
+                .register_tool_call_policy_responder(
+                    policy,
+                    PolicyResponderId::new(id).unwrap(),
+                    move |In(event): In<ToolCallPolicyInvocation>| {
+                        if event.call.decision.name != CountingAdd::NAME {
+                            return Some(ToolCallPolicyDecision::Run);
+                        }
+                        let mut arguments = event.call.arguments.clone();
+                        arguments
+                            .as_object_mut()
+                            .expect("add arguments should be an object")
+                            .insert(key.to_owned(), value.clone());
+                        Some(ToolCallPolicyDecision::Rewrite(arguments))
+                    },
+                )
+                .expect("argument responder should register");
         })
         .expect("argument observer should install");
 }
@@ -70,15 +73,21 @@ fn install_result_transform(
     .expect("result policy should install");
     agent
         .with_runtime_mut(move |runtime| {
-            runtime.world_mut().entity_mut(policy).observe(
-                move |mut event: On<ToolResultPolicyInvocation>| {
-                    event.decision = Some(if event.result.name == tool {
-                        ToolResultPolicyDecision::Rewrite(transform(&event.result.presentation))
-                    } else {
-                        ToolResultPolicyDecision::Keep
-                    });
-                },
-            );
+            runtime
+                .register_tool_result_policy_responder(
+                    policy,
+                    PolicyResponderId::new(id).unwrap(),
+                    move |In(event): In<ToolResultPolicyInvocation>| {
+                        Some(if event.result.name == tool {
+                            ToolResultPolicyDecision::Rewrite(
+                                transform(&event.result.presentation.render()).into(),
+                            )
+                        } else {
+                            ToolResultPolicyDecision::Keep
+                        })
+                    },
+                )
+                .expect("result responder should register");
         })
         .expect("result observer should install");
 }
@@ -213,9 +222,10 @@ async fn two_arg_rewrites_chain_blocking() {
                 "both chained rewrites must compose"
             );
             let results = recorder_probe.recorded_results();
-            assert_eq!(
-                results[0].2, "15",
-                "the tool executed against the composed args"
+            assert_eq!(results[0].2, "<typed tool output: 1 parts>");
+            assert!(
+                response.contains("15"),
+                "the composed result reached Gemini"
             );
         },
     )
@@ -251,7 +261,7 @@ async fn two_result_rewrites_chain_redact_then_wrap_blocking() {
                 1,
                 PolicyRule::RewriteToolResult {
                     tool: Some("add".to_owned()),
-                    presentation: "SECRET".to_owned(),
+                    presentation: "SECRET".into(),
                 },
             )
             .expect("redaction policy should install");

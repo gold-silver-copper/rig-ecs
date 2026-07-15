@@ -18,13 +18,14 @@ use crate::{
         ExtensionInstallError, GrantForAgent, GrantForTool, InstallError, InvalidToolCallBudget,
         ModelCapability, ModelDecision, ModelEffectInput, ModelEffectOutput, ModelToolCall,
         ModelToolChoice, OutputRequirement, PauseMode, PolicyApprovalEffectInput,
-        PolicyApprovalEffectOutput, ProviderDiagnosticsIngress, RetiredCapability,
-        RetrievalRequirement, RetrievedDocument, RigExtension, RunOf, RunOutput, RunPolicySpec,
-        RunState, Runtime, RuntimeConfig, SpawnError, StableId, StoreCapability, StoreEffectInput,
-        StoreEffectOutput, StoreGrant, StoreGrantForAgent, StoreGrantForStore, StoreOperation,
-        StreamItem, StreamReceiveError, StreamTerminal, StructuredOutputRetryBudget, SubmitError,
-        TenantId, ToolApprovalPolicyBundle, ToolCapability, ToolEffectInput, ToolEffectOutput,
-        ToolGrant, ToolRetrievalRequirement, TranscriptEntry, Usage,
+        PolicyApprovalEffectOutput, PolicyTermination, ProviderDiagnosticsIngress,
+        RetiredCapability, RetrievalRequirement, RetrievedDocument, RigExtension, RunOf, RunOutput,
+        RunPolicySpec, RunState, Runtime, RuntimeConfig, SpawnError, StableId, StoreCapability,
+        StoreEffectInput, StoreEffectOutput, StoreGrant, StoreGrantForAgent, StoreGrantForStore,
+        StoreOperation, StreamItem, StreamReceiveError, StreamTerminal,
+        StructuredOutputRetryBudget, SubmitError, TenantId, ToolApprovalPolicyBundle,
+        ToolCapability, ToolEffectInput, ToolEffectOutput, ToolGrant, ToolRetrievalRequirement,
+        TranscriptEntry, Usage,
     },
     streaming::{StreamedAssistantContent, ToolCallDeltaContent},
     tool::IntoToolOutput,
@@ -55,11 +56,13 @@ pub struct CompletionModelAdapter<M> {
 
 /// Canonical model output paired with serialized provider-specific diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelExecutionResult {
+pub struct ModelExecutionResult<R> {
     /// Provider-independent result consumed by core progression.
     pub output: ModelEffectOutput,
     /// Raw typed provider response serialized for ECS policy and telemetry queries.
     pub provider_diagnostics: serde_json::Value,
+    /// Concrete provider response retained for typed ECS extension queries.
+    pub provider_response: R,
 }
 
 /// Standalone typed facade that drives the authoritative ECS schedule.
@@ -1970,11 +1973,12 @@ where
                             Ok(execution) => {
                                 if let Err(error) = self.submit_provider_diagnostics(
                                     &completion_sender,
-                                    ProviderDiagnosticsIngress {
+                                    ProviderDiagnosticsIngress::serialized(
                                         operation,
                                         generation,
-                                        diagnostics: execution.provider_diagnostics,
-                                    },
+                                        execution.provider_diagnostics,
+                                    )
+                                    .with_typed(execution.provider_response),
                                 ) {
                                     Err(CanonicalError::Provider {
                                         message: format!(
@@ -2541,11 +2545,12 @@ where
                                 };
                                 if let Err(error) = agent.submit_provider_diagnostics(
                                     &completion_sender,
-                                    ProviderDiagnosticsIngress {
+                                    ProviderDiagnosticsIngress::serialized(
                                         operation,
                                         generation,
                                         diagnostics,
-                                    },
+                                    )
+                                    .with_typed(response.clone()),
                                 ) {
                                     break 'model Err(CanonicalError::Provider {
                                         message: format!(
@@ -2849,8 +2854,8 @@ fn local_run_failure(error: CanonicalError, transcript: Vec<TranscriptEntry>) ->
             tool_name,
             transcript,
         },
-        CanonicalError::PolicyDenied { policy } => {
-            LocalAgentError::PolicyDenied { policy, transcript }
+        CanonicalError::PolicyTerminated { termination } => {
+            LocalAgentError::PolicyTerminated { termination }
         }
         error => LocalAgentError::Canonical(error),
     }
@@ -2893,8 +2898,11 @@ pub(crate) fn local_prompt_error(error: LocalAgentError) -> PromptError {
                 prompt: Box::new(prompt),
             }
         }
-        LocalAgentError::PolicyDenied { transcript, .. }
-        | LocalAgentError::Cancelled { transcript } => PromptError::PromptCancelled {
+        LocalAgentError::PolicyTerminated { termination } => PromptError::PromptCancelled {
+            chat_history: response_messages(&termination.history).unwrap_or_default(),
+            reason: message,
+        },
+        LocalAgentError::Cancelled { transcript } => PromptError::PromptCancelled {
             chat_history: response_messages(&transcript).unwrap_or_default(),
             reason: message,
         },
@@ -2951,13 +2959,11 @@ pub enum LocalAgentError {
         /// Complete transcript at invalid-call detection.
         transcript: Vec<TranscriptEntry>,
     },
-    /// A steering policy stopped the run with its committed history retained.
-    #[error("policy `{policy}` denied the operation")]
-    PolicyDenied {
-        /// Stable policy identity.
-        policy: String,
-        /// Complete transcript at the stopping transition.
-        transcript: Vec<TranscriptEntry>,
+    /// A steering policy stopped the run with complete diagnostic context.
+    #[error("{termination}")]
+    PolicyTerminated {
+        /// Accepted policy identity/revision, lifecycle point, reason, and history.
+        termination: Box<PolicyTermination>,
     },
     /// The run was cancelled before completion.
     #[error("run was cancelled")]
@@ -3070,12 +3076,8 @@ where
                 );
             }
         };
-        let presentation = output.render();
-        let raw =
-            serde_json::to_value(output.as_content()).map_err(|error| CanonicalError::Tool {
-                message: format!("failed to serialize output: {error}"),
-                retryable: false,
-            })?;
+        let presentation = output.clone();
+        let raw = output;
         Ok(ToolEffectOutput {
             call_id,
             provider_result_id,
@@ -3095,13 +3097,8 @@ fn tool_failure_output(
     name: String,
     error: crate::tool::ToolExecutionError,
 ) -> Result<ToolEffectOutput, CanonicalError> {
-    let presentation = error.model_output().render();
-    let raw = serde_json::to_value(error.model_output().as_content()).map_err(|source| {
-        CanonicalError::Tool {
-            message: format!("failed to serialize model-visible tool failure: {source}"),
-            retryable: false,
-        }
-    })?;
+    let presentation = error.model_output().clone();
+    let raw = presentation.clone();
     Ok(ToolEffectOutput {
         call_id,
         provider_result_id,
@@ -3328,7 +3325,7 @@ where
     pub async fn execute_with_diagnostics(
         &self,
         input: ModelEffectInput,
-    ) -> Result<ModelExecutionResult, CanonicalError> {
+    ) -> Result<ModelExecutionResult<M::Response>, CanonicalError> {
         self.validate_decision(&input)?;
         let request = completion_request(&input)?;
         let response =
@@ -3355,6 +3352,7 @@ where
         Ok(ModelExecutionResult {
             output,
             provider_diagnostics,
+            provider_response: response.raw_response,
         })
     }
 
@@ -3443,11 +3441,10 @@ where
                     retryable: false,
                 })?;
             deltas
-                .try_send_provider_diagnostics(ProviderDiagnosticsIngress {
-                    operation,
-                    generation,
-                    diagnostics,
-                })
+                .try_send_provider_diagnostics(
+                    ProviderDiagnosticsIngress::serialized(operation, generation, diagnostics)
+                        .with_typed(response.clone()),
+                )
                 .map_err(|error| CanonicalError::Provider {
                     message: format!("stream diagnostics ingress failed: {error}"),
                     retryable: true,
@@ -3780,15 +3777,14 @@ fn response_messages(history: &[TranscriptEntry]) -> Result<Vec<Message>, Canoni
 }
 
 fn tool_result_content(
-    raw: &serde_json::Value,
-    presentation: &str,
+    raw: &crate::tool::ToolOutput,
+    presentation: &crate::tool::ToolOutput,
     presentation_overrides_raw: bool,
 ) -> OneOrMany<ToolResultContent> {
     if presentation_overrides_raw {
-        return OneOrMany::one(ToolResultContent::text(presentation.to_owned()));
+        return presentation.as_content().clone();
     }
-    serde_json::from_value(raw.clone())
-        .unwrap_or_else(|_| OneOrMany::one(ToolResultContent::text(presentation.to_owned())))
+    raw.as_content().clone()
 }
 
 #[cfg(test)]
@@ -3800,7 +3796,7 @@ mod tests {
         runtime::{
             EffectIngress, ModelDecision, Policy, PolicyFor, PolicyRule,
             ProviderResponseDiagnostics, RequestPatch, RequestPatchPolicyBundle, RuntimeWaker,
-            StableId, StoreDecision, TenantId, ToolDecision,
+            StableId, StoreDecision, TenantId, ToolDecision, TypedProviderResponseDiagnostics,
         },
         streaming::{StreamingCompletionResponse, StreamingResult},
         test_utils::{MockCompletionModel, MockResponse, MockStreamEvent, MockTurn},
@@ -3998,8 +3994,8 @@ mod tests {
                     provider_result_id: "call-1".to_owned(),
                     provider_call_id: None,
                     name: "lookup".to_owned(),
-                    raw: serde_json::Value::Null,
-                    content: "result".to_owned(),
+                    raw: serde_json::Value::Null.into(),
+                    content: "result".into(),
                     presentation_overrides_raw: false,
                 },
             ],
@@ -4184,11 +4180,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            output.raw,
-            serde_json::json!([{"type": "json", "value": 5}])
-        );
-        assert_eq!(output.presentation, "5");
+        assert_eq!(output.raw, serde_json::json!(5));
+        assert_eq!(output.presentation, serde_json::json!(5));
 
         decision.revision = 3;
         assert!(matches!(
@@ -4285,7 +4278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_facade_retains_serialized_provider_diagnostics_on_the_operation() {
+    async fn local_facade_retains_typed_and_serialized_provider_diagnostics() {
         let agent = LocalModelAgent::new(
             MockCompletionModel::text("diagnostic result"),
             "mock",
@@ -4308,6 +4301,16 @@ mod tests {
             })
             .unwrap();
         assert!(diagnostics.get("usage").is_some());
+        let typed_count = agent
+            .with_runtime_mut(|runtime| {
+                runtime
+                    .world_mut()
+                    .query::<&TypedProviderResponseDiagnostics<MockResponse>>()
+                    .iter(runtime.world())
+                    .count()
+            })
+            .unwrap();
+        assert_eq!(typed_count, 1);
     }
 
     #[test]

@@ -10,21 +10,24 @@
 mod ecs_demo;
 
 use anyhow::{Context, Result};
-use rig::bevy_ecs::{observer::On, prelude::Query};
+use rig::bevy_ecs::prelude::{In, Query};
 use rig::runtime::{
-    CanonicalError, ModelToolChoice, Policy, PolicyPoint, PolicyRule, RequestPatch,
-    RequestPolicyDecision, RequestPolicyInvocation, RunRecord, RunState,
+    CanonicalError, ModelToolChoice, Policy, PolicyPoint, PolicyResponderId, PolicyRule,
+    RequestPatch, RequestPolicyDecision, RequestPolicyInvocation, RunRecord, RunState,
 };
 
-fn force_first_turn(mut event: On<RequestPolicyInvocation>, runs: Query<&RunRecord>) {
+fn force_first_turn(
+    In(event): In<RequestPolicyInvocation>,
+    runs: Query<&RunRecord>,
+) -> Option<RequestPolicyDecision> {
     let first_turn = runs
         .get(event.run)
         .is_ok_and(|record| record.next_turn == 0);
-    event.decision = Some(if first_turn {
+    Some(if first_turn {
         RequestPolicyDecision::Patch(RequestPatch::new().tool_choice(ModelToolChoice::Required))
     } else {
         RequestPolicyDecision::Continue
-    });
+    })
 }
 
 fn complete_tool_turn(runtime: &mut rig::runtime::Runtime) -> Result<ModelToolChoice> {
@@ -92,10 +95,11 @@ fn demonstrate_fix() -> Result<()> {
         },
         agent,
     )?;
-    runtime
-        .world_mut()
-        .entity_mut(policy)
-        .observe(force_first_turn);
+    runtime.register_request_policy_responder(
+        policy,
+        PolicyResponderId::new("force-first-turn")?,
+        force_first_turn,
+    )?;
     let pending = runtime.handle().prompt(agent, "Look something up")?;
 
     println!("=== run-state-gated policy (the fix) ===");

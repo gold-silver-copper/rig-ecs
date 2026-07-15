@@ -15,4 +15,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"Güneş yavaşça batıyor, boş tarlaya uzun gölgeler düşürüyordu.","thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-3-flash-preview","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":22,"promptTokenCount":152,"promptTokensDetails":[{"modality":"TEXT","tokenCount":14},{"modality":"AUDIO","tokenCount":138}],"serviceTier":"standard","thoughtsTokenCount":754,"totalTokenCount":928}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"El sol se ponía lentamente, proyectando largas sombras sobre el campo vacío.","thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-3-flash-preview","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":16,"promptTokenCount":152,"promptTokensDetails":[{"modality":"TEXT","tokenCount":14},{"modality":"AUDIO","tokenCount":138}],"serviceTier":"standard","thoughtsTokenCount":745,"totalTokenCount":913}}'

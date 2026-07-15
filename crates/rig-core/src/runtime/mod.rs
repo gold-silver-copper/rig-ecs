@@ -30,8 +30,13 @@
 //! or operation, not in an erased scratchpad.
 
 pub mod adapters;
+mod debug;
 mod snapshot;
 
+pub use debug::{
+    AcceptedPolicyDebug, PendingOperationDebug, PolicyEvaluationDebug, RunDebugError,
+    RunExplanation, StalledReason,
+};
 pub use snapshot::{
     ActiveRunSnapshot, ActiveRunSnapshotError, RestoredRuns, restore_active_run,
     snapshot_active_run,
@@ -52,13 +57,14 @@ use bevy_ecs::{
     prelude::*,
     relationship::Relationship,
     schedule::{IntoScheduleConfigs, LogLevel, Schedule, ScheduleBuildSettings, ScheduleLabel},
-    system::SystemParam,
+    system::{SystemId, SystemParam},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    completion::Message as CompletionMessage, message::UserContent, streaming::ToolCallDeltaContent,
+    completion::Message as CompletionMessage, message::UserContent,
+    streaming::ToolCallDeltaContent, tool::ToolOutput,
 };
 
 static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
@@ -467,7 +473,21 @@ pub struct StoreGrant {
     pub enabled: bool,
 }
 
-/// Ordered ECS policy instance.
+/// Authoritative ordering and revision facts for an ECS policy entity.
+#[derive(Component, Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[component(immutable)]
+pub struct PolicyMeta {
+    /// Explicit composition order. Stable ID breaks ties.
+    pub order: u32,
+    /// Immutable policy revision recorded by accepted decisions.
+    pub revision: u64,
+}
+
+/// Ergonomic and serialized policy installation input.
+///
+/// The add lifecycle materializes [`PolicyMeta`], [`PolicyCapabilities`], and
+/// the matching typed policy component. Core selection and steering never read
+/// this component after installation.
 #[derive(Component, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[component(immutable)]
 pub struct Policy {
@@ -505,8 +525,46 @@ pub enum PolicyStatus {
     Retired,
 }
 
+/// Relationship from one explicit steering-responder binding to its policy.
 #[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
-struct BoundPolicyObserver(Entity);
+#[relationship(relationship_target = PolicyResponders)]
+pub struct PolicyResponderFor(pub Entity);
+
+/// Explicit steering-responder bindings owned by a policy entity.
+#[derive(Component, Debug)]
+#[relationship_target(relationship = PolicyResponderFor)]
+pub struct PolicyResponders(Vec<Entity>);
+
+/// Lifecycle point handled by a responder binding entity.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct ResponderPoint(pub PolicyPoint);
+
+/// Stable identity used to reconstruct an extension-owned responder binding.
+#[derive(Component, Clone, Debug, Eq, Hash, PartialEq)]
+#[component(immutable)]
+pub struct PolicyResponderId(String);
+
+impl PolicyResponderId {
+    /// Creates a stable responder-binding identity.
+    pub fn new(value: impl Into<String>) -> Result<Self, IdentityError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(IdentityError::Empty);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the serialized binding identity.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Opaque Bevy registered-system entity invoked for one policy point.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+#[component(immutable)]
+struct RegisteredPolicyResponder(Entity);
 
 fn accepts_new_policy_evaluations(status: Option<&PolicyStatus>) -> bool {
     !matches!(status, Some(PolicyStatus::Retired))
@@ -522,8 +580,11 @@ fn policy_entities<'a>(
         .chain(run.into_iter().flat_map(RunPolicies::iter))
 }
 
-/// Built-in policy data. Extensions can add components and systems at the
-/// relevant public policy boundary, such as [`RigSet::InvokeRequestPolicy`].
+/// Ergonomic and serialized policy input.
+///
+/// Installation materializes this value into typed ECS policy components and
+/// [`PolicyCapabilities`]. Runtime selection and steering query those typed
+/// facts rather than dispatching on this enum.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PolicyRule {
     /// Permit progression without modification.
@@ -572,7 +633,7 @@ pub enum PolicyRule {
         /// Optional tool name; `None` applies to every result.
         tool: Option<String>,
         /// Replacement model-visible presentation.
-        presentation: String,
+        presentation: ToolOutput,
     },
     /// Stop a run after a matching tool result settles but before commit.
     StopToolResult {
@@ -600,6 +661,13 @@ pub enum PolicyRule {
         /// Audit-only stop reason.
         reason: String,
     },
+    /// Stop a streaming run when a tool-call delta contains a substring.
+    StopToolCallDeltaContains {
+        /// Substring matched against a tool name or argument fragment.
+        needle: String,
+        /// Audit-only stop reason.
+        reason: String,
+    },
     /// Await an external approval operation at one lifecycle point.
     RequireApproval {
         /// Lifecycle point whose progression is suspended.
@@ -613,8 +681,168 @@ pub enum PolicyRule {
     Custom(PolicyPoint),
 }
 
+/// Lifecycle capabilities materialized on a policy entity.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
+pub struct PolicyCapabilities(Vec<PolicyPoint>);
+
+impl PolicyCapabilities {
+    /// Creates a deterministic, duplicate-free capability set.
+    pub fn new(points: impl IntoIterator<Item = PolicyPoint>) -> Self {
+        let mut points = points.into_iter().collect::<Vec<_>>();
+        points.sort();
+        points.dedup();
+        Self(points)
+    }
+
+    /// Returns whether this policy participates at `point`.
+    pub fn contains(&self, point: PolicyPoint) -> bool {
+        self.0.binary_search(&point).is_ok()
+    }
+
+    /// Borrows the deterministic lifecycle-point set.
+    pub fn points(&self) -> &[PolicyPoint] {
+        &self.0
+    }
+}
+
+/// Unconditional request progression.
+#[derive(Component, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
+pub struct AllowRequestPolicy;
+
+/// Request denial based on canonical prompt text.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct DenyPromptContainsPolicy(pub String);
+
+/// Operation-local request patch contribution.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct RequestPatchPolicy(pub RequestPatch);
+
+/// Typed tool-argument rewrite policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct RewriteToolArgumentsPolicy {
+    /// Optional tool name; `None` applies to every call.
+    pub tool: Option<String>,
+    /// Replacement arguments.
+    pub arguments: serde_json::Value,
+}
+
+/// Typed tool-call skip policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct SkipToolCallPolicy {
+    /// Optional tool name; `None` applies to every call.
+    pub tool: Option<String>,
+    /// Model-visible feedback.
+    pub reason: String,
+}
+
+/// Typed invalid-tool repair policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct RepairInvalidToolPolicy {
+    /// Optional emitted name; `None` applies to every invalid call.
+    pub from: Option<String>,
+    /// Replacement advertised tool name.
+    pub to: String,
+}
+
+/// Typed invalid-tool retry policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct RetryInvalidToolPolicy {
+    /// Optional emitted name; `None` applies to every invalid call.
+    pub tool: Option<String>,
+    /// Corrective model feedback.
+    pub feedback: String,
+}
+
+/// Typed invalid-tool skip policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct SkipInvalidToolPolicy {
+    /// Optional emitted name; `None` applies to every invalid call.
+    pub tool: Option<String>,
+    /// Model-visible feedback.
+    pub reason: String,
+}
+
+/// Typed tool-result presentation rewrite policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct RewriteToolResultPolicy {
+    /// Optional tool name; `None` applies to every result.
+    pub tool: Option<String>,
+    /// Replacement typed presentation.
+    pub presentation: ToolOutput,
+}
+
+/// Typed tool-result stop policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct StopToolResultPolicy {
+    /// Optional tool name; `None` applies to every result.
+    pub tool: Option<String>,
+    /// Audit reason.
+    pub reason: String,
+}
+
+/// Typed completion-text rewrite policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct RewriteCompletionTextPolicy(pub String);
+
+/// Typed completion-response stop policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct StopCompletionContainsPolicy {
+    /// Text matched against normalized completion output.
+    pub needle: String,
+    /// Audit reason.
+    pub reason: String,
+}
+
+/// Typed streaming text-delta stop policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct StopTextDeltaContainsPolicy {
+    /// Text matched against the new delta.
+    pub needle: String,
+    /// Audit reason.
+    pub reason: String,
+}
+
+/// Typed streaming tool-call-delta stop policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct StopToolCallDeltaContainsPolicy {
+    /// Text matched against a name or argument fragment.
+    pub needle: String,
+    /// Audit reason.
+    pub reason: String,
+}
+
+/// Typed asynchronous approval policy.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct RequireApprovalPolicy {
+    /// Lifecycle point awaiting approval.
+    pub point: PolicyPoint,
+    /// Approver-facing prompt.
+    pub prompt: String,
+}
+
+/// Marks a lifecycle point whose steering responder is extension-owned.
+#[derive(Component, Clone, Copy, Debug, Eq, PartialEq)]
+#[component(immutable)]
+pub struct CustomPolicy(pub PolicyPoint);
+
 /// Lifecycle point governed by a custom policy entity.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum PolicyPoint {
     /// Before a model request is dispatched.
     Request,
@@ -628,6 +856,22 @@ pub enum PolicyPoint {
     CompletionResponse,
     /// Before an accepted text delta is published to subscribers.
     TextDelta,
+    /// Before an accepted tool-call delta is published to subscribers.
+    ToolCallDelta,
+}
+
+impl PolicyPoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::ToolCall => "tool-call",
+            Self::InvalidToolCall => "invalid-tool-call",
+            Self::ToolResult => "tool-result",
+            Self::CompletionResponse => "completion-response",
+            Self::TextDelta => "text-delta",
+            Self::ToolCallDelta => "tool-call-delta",
+        }
+    }
 }
 
 impl PolicyRule {
@@ -645,12 +889,9 @@ impl PolicyRule {
                 PolicyPoint::CompletionResponse
             }
             Self::StopTextDeltaContains { .. } => PolicyPoint::TextDelta,
+            Self::StopToolCallDeltaContains { .. } => PolicyPoint::ToolCallDelta,
             Self::RequireApproval { point, .. } | Self::Custom(point) => *point,
         }
-    }
-
-    fn applies_to(&self, point: PolicyPoint) -> bool {
-        self.point() == point
     }
 }
 
@@ -934,7 +1175,7 @@ impl ToolResultRedactionPolicyBundle {
         order: u32,
         revision: u64,
         tool: Option<String>,
-        presentation: impl Into<String>,
+        presentation: impl Into<ToolOutput>,
     ) -> Self {
         Self {
             policy: PolicyEntityBundle::new(
@@ -946,6 +1187,70 @@ impl ToolResultRedactionPolicyBundle {
                 PolicyRule::RewriteToolResult {
                     tool,
                     presentation: presentation.into(),
+                },
+            ),
+        }
+    }
+}
+
+policy_bundle!(
+    TextDeltaStopPolicyBundle,
+    "A policy that stops streaming before publishing matching text deltas."
+);
+
+impl TextDeltaStopPolicyBundle {
+    /// Creates a text-delta guard for one agent.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        needle: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::StopTextDeltaContains {
+                    needle: needle.into(),
+                    reason: reason.into(),
+                },
+            ),
+        }
+    }
+}
+
+policy_bundle!(
+    ToolCallDeltaStopPolicyBundle,
+    "A policy that stops streaming before publishing matching tool-call deltas."
+);
+
+impl ToolCallDeltaStopPolicyBundle {
+    /// Creates a tool-call-delta guard for one agent.
+    pub fn new(
+        id: StableId,
+        tenant: TenantId,
+        agent: Entity,
+        order: u32,
+        revision: u64,
+        needle: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyEntityBundle::new(
+                id,
+                tenant,
+                agent,
+                order,
+                revision,
+                PolicyRule::StopToolCallDeltaContains {
+                    needle: needle.into(),
+                    reason: reason.into(),
                 },
             ),
         }
@@ -1081,12 +1386,11 @@ pub enum RequestPolicyDecision {
 
 /// Entity-targeted invocation of exactly one policy in deterministic order.
 ///
-/// Steering observers set [`Self::decision`]. Audit observers should instead
-/// consume the observation events published after reduction.
-#[derive(EntityEvent, Clone, Debug)]
+/// The runtime passes this value only to the responder explicitly bound to the
+/// selected policy. Audit observers consume the events published after reduction.
+#[derive(Clone, Debug)]
 pub struct RequestPolicyInvocation {
-    /// Policy entity targeted by this invocation.
-    #[event_target]
+    /// Policy entity selected for this invocation.
     pub policy: Entity,
     /// Durable evaluation entity owning the cursor and effective request.
     pub evaluation: Entity,
@@ -1096,8 +1400,6 @@ pub struct RequestPolicyInvocation {
     pub operation: Entity,
     /// Current effective request, including all earlier rewrites.
     pub request: ModelEffectInput,
-    /// Decision written by the policy's single steering observer.
-    pub decision: Option<RequestPolicyDecision>,
 }
 
 /// Observe-only notification emitted immediately before a request policy runs.
@@ -1233,11 +1535,10 @@ pub enum ToolCallPolicyDecision {
     AwaitApproval(String),
 }
 
-/// Entity-targeted invocation for one tool call and one policy.
-#[derive(EntityEvent, Clone, Debug)]
+/// Typed input for one tool call and its explicitly bound policy responder.
+#[derive(Clone, Debug)]
 pub struct ToolCallPolicyInvocation {
-    /// Policy entity targeted by the core evaluator.
-    #[event_target]
+    /// Policy entity selected by the core evaluator.
     pub policy: Entity,
     /// Durable evaluation identity.
     pub evaluation: Entity,
@@ -1247,8 +1548,6 @@ pub struct ToolCallPolicyInvocation {
     pub operation: Entity,
     /// Effective call including all earlier rewrites.
     pub call: ToolEffectInput,
-    /// Decision written by the policy's steering observer.
-    pub decision: Option<ToolCallPolicyDecision>,
 }
 
 /// Authoritative phase of a tool-call policy evaluation.
@@ -1331,11 +1630,10 @@ pub struct PendingInvalidToolCall {
     pub max_retries: u32,
 }
 
-/// Entity-targeted invocation for one invalid call and one policy.
-#[derive(EntityEvent, Clone, Debug)]
+/// Typed input for one invalid call and its explicitly bound policy responder.
+#[derive(Clone, Debug)]
 pub struct InvalidToolCallPolicyInvocation {
-    /// Policy entity targeted by the core evaluator.
-    #[event_target]
+    /// Policy entity selected by the core evaluator.
     pub policy: Entity,
     /// Durable evaluation identity.
     pub evaluation: Entity,
@@ -1345,8 +1643,6 @@ pub struct InvalidToolCallPolicyInvocation {
     pub operation: Entity,
     /// Immutable invalid-call context.
     pub invalid: PendingInvalidToolCall,
-    /// Decision written by the policy's steering observer.
-    pub decision: Option<InvalidToolCallPolicyDecision>,
 }
 
 /// Authoritative invalid-call evaluation phase.
@@ -1393,18 +1689,17 @@ pub enum ToolResultPolicyDecision {
     /// Preserve the current effective presentation.
     Keep,
     /// Replace only the model-visible presentation.
-    Rewrite(String),
+    Rewrite(ToolOutput),
     /// Stop the run without publishing raw result content.
     Stop(String),
     /// Suspend evaluation on an external approval operation.
     AwaitApproval(String),
 }
 
-/// Entity-targeted invocation for one settled tool result and one policy.
-#[derive(EntityEvent, Clone, Debug)]
+/// Typed input for one settled tool result and its explicitly bound responder.
+#[derive(Clone, Debug)]
 pub struct ToolResultPolicyInvocation {
-    /// Policy entity targeted by the core evaluator.
-    #[event_target]
+    /// Policy entity selected by the core evaluator.
     pub policy: Entity,
     /// Durable evaluation identity.
     pub evaluation: Entity,
@@ -1416,8 +1711,6 @@ pub struct ToolResultPolicyInvocation {
     pub input: ToolEffectInput,
     /// Immutable raw result and current effective presentation.
     pub result: ToolEffectOutput,
-    /// Decision written by the policy's steering observer.
-    pub decision: Option<ToolResultPolicyDecision>,
 }
 
 /// Authoritative tool-result evaluation phase.
@@ -1478,11 +1771,10 @@ pub enum CompletionResponsePolicyDecision {
     AwaitApproval(String),
 }
 
-/// Entity-targeted invocation for one settled model response and one policy.
-#[derive(EntityEvent, Clone, Debug)]
+/// Typed input for one settled model response and its explicitly bound responder.
+#[derive(Clone, Debug)]
 pub struct CompletionResponsePolicyInvocation {
-    /// Policy entity targeted by the core evaluator.
-    #[event_target]
+    /// Policy entity selected by the core evaluator.
     pub policy: Entity,
     /// Durable evaluation identity.
     pub evaluation: Entity,
@@ -1494,8 +1786,6 @@ pub struct CompletionResponsePolicyInvocation {
     pub request: ModelEffectInput,
     /// Current normalized response, including earlier rewrites.
     pub response: ModelEffectOutput,
-    /// Decision written by the policy's steering observer.
-    pub decision: Option<CompletionResponsePolicyDecision>,
 }
 
 /// Authoritative completion-response evaluation phase.
@@ -1855,11 +2145,10 @@ pub enum TextDeltaPolicyDecision {
     AwaitApproval(String),
 }
 
-/// Entity-targeted invocation for one accepted, not-yet-published text delta.
-#[derive(EntityEvent, Clone, Debug)]
+/// Typed input for one accepted, not-yet-published text delta.
+#[derive(Clone, Debug)]
 pub struct TextDeltaPolicyInvocation {
-    /// Policy entity targeted by the core evaluator.
-    #[event_target]
+    /// Policy entity selected by the core evaluator.
     pub policy: Entity,
     /// Durable delta evaluation identity.
     pub evaluation: Entity,
@@ -1875,8 +2164,6 @@ pub struct TextDeltaPolicyInvocation {
     pub delta: String,
     /// Authoritative aggregate including this delta.
     pub aggregated: String,
-    /// Decision written by the policy's steering observer.
-    pub decision: Option<TextDeltaPolicyDecision>,
 }
 
 /// Authoritative text-delta evaluation phase.
@@ -1919,6 +2206,87 @@ pub struct TextDeltaPolicyEvaluation {
 #[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
 #[component(immutable)]
 pub struct AcceptedTextDeltaPolicies(pub Vec<AcceptedPolicy>);
+
+/// Typed steering result for a streamed tool-call delta.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolCallDeltaPolicyDecision {
+    /// Publish the accepted delta.
+    Continue,
+    /// Stop the run before publishing this delta.
+    Stop(String),
+    /// Suspend evaluation on an external approval operation.
+    AwaitApproval(String),
+}
+
+/// Typed input for one accepted tool-call delta.
+#[derive(Clone, Debug)]
+pub struct ToolCallDeltaPolicyInvocation {
+    /// Policy entity selected by the evaluator.
+    pub policy: Entity,
+    /// Durable delta evaluation identity.
+    pub evaluation: Entity,
+    /// Run receiving the stream.
+    pub run: Entity,
+    /// Model operation producing the stream.
+    pub operation: Entity,
+    /// Committed model-call index at ingress time.
+    pub turn: u32,
+    /// Monotonic operation-local sequence.
+    pub sequence: u64,
+    /// Provider correlation retained for audit and policy.
+    pub provider_correlation: Option<String>,
+    /// Provider-facing tool-call identifier.
+    pub id: String,
+    /// Rig correlation identifier.
+    pub internal_call_id: String,
+    /// Tool name or argument fragment.
+    pub content: ToolCallDeltaContent,
+}
+
+/// Authoritative tool-call-delta evaluation phase.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolCallDeltaPolicyEvaluationPhase {
+    /// The policy at `cursor` is ready to run.
+    Evaluating,
+    /// Waiting for a correlated approval operation.
+    WaitingApproval { operation: Entity, policy: StableId },
+    /// The delta was published once.
+    Published,
+    /// A policy stopped the run.
+    Rejected { policy: StableId, reason: String },
+}
+
+/// Durable ordered tool-call-delta policy state.
+#[derive(Component, Clone, Debug, Eq, PartialEq)]
+pub struct ToolCallDeltaPolicyEvaluation {
+    /// Run receiving the delta.
+    pub run: Entity,
+    /// Producing model operation.
+    pub operation: Entity,
+    /// Deterministically sorted immutable policy snapshot.
+    pub policies: Vec<AcceptedPolicy>,
+    /// Index of the next policy to invoke.
+    pub cursor: usize,
+    /// Committed model-call index at ingress time.
+    pub turn: u32,
+    /// Operation-local sequence.
+    pub sequence: u64,
+    /// Provider correlation retained for audit and policy.
+    pub provider_correlation: Option<String>,
+    /// Provider-facing tool-call identifier.
+    pub id: String,
+    /// Rig correlation identifier.
+    pub internal_call_id: String,
+    /// Tool name or argument fragment.
+    pub content: ToolCallDeltaContent,
+    /// Authoritative evaluation phase.
+    pub phase: ToolCallDeltaPolicyEvaluationPhase,
+}
+
+/// Immutable tool-call-delta policy snapshot accepted for one delta.
+#[derive(Component, Clone, Debug, Default, Eq, PartialEq)]
+#[component(immutable)]
+pub struct AcceptedToolCallDeltaPolicies(pub Vec<AcceptedPolicy>);
 
 /// Authoritative run phase and outcome.
 #[derive(Component, Clone, Debug, Eq, PartialEq)]
@@ -2135,6 +2503,9 @@ impl RigOperationContext<'_, '_> {
 
 /// Canonical transcript entry.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// Transcript entries are retained and cloned far less often than their content
+// is inspected; boxing rich tool output would add allocations to every result.
+#[allow(clippy::large_enum_variant)]
 pub enum TranscriptEntry {
     /// Original user input.
     User(String),
@@ -2167,9 +2538,9 @@ pub enum TranscriptEntry {
         /// Provider-facing tool name.
         name: String,
         /// Canonical structured content retained for provider round trips.
-        raw: serde_json::Value,
+        raw: ToolOutput,
         /// Presentation returned to the next model call.
-        content: String,
+        content: ToolOutput,
         /// Whether policy requires the presentation to replace rich raw content.
         #[serde(default)]
         presentation_overrides_raw: bool,
@@ -2302,11 +2673,46 @@ pub enum OperationPhase {
 
 /// Canonical terminal operation outcome.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// Outcomes move between ECS phases once. Boxing the successful result would
+// add an allocation to every completed external effect.
+#[allow(clippy::large_enum_variant)]
 pub enum OperationOutcome {
     /// Successful typed effect output.
     Success(EffectOutput),
     /// Failed external operation.
     Failure(CanonicalError),
+}
+
+/// Complete diagnostic context for a policy-caused terminal outcome.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PolicyTermination {
+    /// Stable policy identity accepted by the operation.
+    pub policy_id: StableId,
+    /// Exact accepted policy revision.
+    pub revision: u64,
+    /// Lifecycle point where steering terminated progression.
+    pub point: PolicyPoint,
+    /// Policy-provided or fail-closed reason.
+    pub reason: String,
+    /// Stable run identity.
+    pub run_id: StableId,
+    /// Stable operation identity.
+    pub operation_id: StableId,
+    /// Complete transcript at the termination boundary.
+    pub history: Vec<TranscriptEntry>,
+}
+
+impl fmt::Display for PolicyTermination {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "policy `{}` revision {} terminated {:?}: {}",
+            self.policy_id.as_str(),
+            self.revision,
+            self.point,
+            self.reason
+        )
+    }
 }
 
 /// Canonical error safe for policy, telemetry, and persistence.
@@ -2382,11 +2788,11 @@ pub enum CanonicalError {
         /// Whether policy may retry the failure.
         retryable: bool,
     },
-    /// Ordered policy denied dispatch.
-    #[error("policy `{policy}` denied the operation")]
-    PolicyDenied {
-        /// Persistent policy identity.
-        policy: String,
+    /// Ordered policy stopped or failed progression.
+    #[error("{termination}")]
+    PolicyTerminated {
+        /// Complete durable diagnostic context.
+        termination: Box<PolicyTermination>,
     },
     /// Agent admission control rejected a newly submitted run.
     #[error("agent is not accepting new runs")]
@@ -2666,7 +3072,7 @@ pub enum EffectDeltaKind {
 }
 
 /// Raw serialized provider response correlated to one model operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ProviderDiagnosticsIngress {
     /// Model operation identity.
     pub operation: Entity,
@@ -2674,9 +3080,90 @@ pub struct ProviderDiagnosticsIngress {
     pub generation: u64,
     /// Provider-specific response serialized by the typed adapter.
     pub diagnostics: serde_json::Value,
+    typed: Option<Arc<dyn ProviderDiagnosticsPayload>>,
 }
 
+trait ProviderDiagnosticsPayload: Send + Sync {
+    fn insert(&self, commands: &mut Commands<'_, '_>, operation: Entity);
+}
+
+struct ConcreteProviderDiagnostics<T>(Mutex<Option<T>>);
+
+impl<T> ProviderDiagnosticsPayload for ConcreteProviderDiagnostics<T>
+where
+    T: Send + Sync + 'static,
+{
+    fn insert(&self, commands: &mut Commands<'_, '_>, operation: Entity) {
+        let Ok(mut value) = self.0.lock() else {
+            return;
+        };
+        if let Some(value) = value.take() {
+            commands
+                .entity(operation)
+                .insert(TypedProviderResponseDiagnostics(value));
+        }
+    }
+}
+
+impl fmt::Debug for ProviderDiagnosticsIngress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderDiagnosticsIngress")
+            .field("operation", &self.operation)
+            .field("generation", &self.generation)
+            .field("diagnostics", &self.diagnostics)
+            .field("has_typed_payload", &self.typed.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ProviderDiagnosticsIngress {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation == other.operation
+            && self.generation == other.generation
+            && self.diagnostics == other.diagnostics
+    }
+}
+
+impl Eq for ProviderDiagnosticsIngress {}
+
+impl ProviderDiagnosticsIngress {
+    /// Creates serialized diagnostics for generic telemetry and persistence.
+    pub fn serialized(operation: Entity, generation: u64, diagnostics: serde_json::Value) -> Self {
+        Self {
+            operation,
+            generation,
+            diagnostics,
+            typed: None,
+        }
+    }
+
+    /// Adds the concrete provider response retained by a typed adapter.
+    pub fn with_typed<T>(mut self, response: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        self.typed = Some(Arc::new(ConcreteProviderDiagnostics(Mutex::new(Some(
+            response,
+        )))));
+        self
+    }
+}
+
+/// Concrete provider response retained on a model operation.
+///
+/// Extensions query `TypedProviderResponseDiagnostics<M::Response>` when they
+/// need provider-native fields. [`ProviderResponseDiagnostics`] remains the
+/// serialized, provider-independent persistence and telemetry representation.
+#[derive(Component, Debug)]
+#[component(immutable)]
+pub struct TypedProviderResponseDiagnostics<T>(pub T)
+where
+    T: Send + Sync + 'static;
+
 #[derive(Clone, Debug)]
+// Ingress values are transferred once from a bounded channel into the world.
+#[allow(clippy::large_enum_variant)]
 enum EffectIngress {
     Completion(EffectCompletion),
     Delta(EffectDelta),
@@ -2685,6 +3172,9 @@ enum EffectIngress {
 
 /// Typed provider-independent effect result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// Tool output is intentionally rich; boxing it here would impose an allocation
+// on every effect consumer and complicate the public matching surface.
+#[allow(clippy::large_enum_variant)]
 pub enum EffectOutput {
     /// Model operation result.
     Model(ModelEffectOutput),
@@ -2747,9 +3237,9 @@ pub struct ToolEffectOutput {
     /// Provider-facing tool name.
     pub name: String,
     /// Raw canonical model-visible output retained independently of rendering.
-    pub raw: serde_json::Value,
+    pub raw: ToolOutput,
     /// Independently rewritable model-visible presentation.
-    pub presentation: String,
+    pub presentation: ToolOutput,
     /// Operator and retry metadata kept separate from model-visible content.
     pub failure: Option<ToolEffectFailure>,
 }
@@ -4874,8 +5364,9 @@ pub fn install_runtime_with_waker(
     world.insert_resource(EffectTimeoutTicks(config.effect_timeout_ticks));
     world.insert_resource(waker.clone());
     world.insert_resource(Messages::<EffectIngressMessage>::default());
-    world.add_observer(bind_builtin_policy_observer);
-    world.add_observer(unbind_builtin_policy_observer);
+    world.add_observer(bind_builtin_policy_responder);
+    world.add_observer(dematerialize_removed_policy);
+    world.add_observer(unbind_policy_responders);
     world.add_observer(count_prepared_request);
     world.add_observer(count_committed_model_turn);
     world.add_observer(count_committed_tool_batch);
@@ -4981,6 +5472,7 @@ pub fn install_runtime_with_waker(
             initialize_completion_response_policy_evaluations,
             evaluate_completion_response_policies,
             evaluate_text_delta_policies,
+            evaluate_tool_call_delta_policies,
             publish_applied_model_policy_observations,
         )
             .chain()
@@ -5189,6 +5681,49 @@ impl Runtime {
             .id())
     }
 
+    /// Spawns an extension-owned typed policy related to an agent.
+    ///
+    /// `components` may contain any extension-defined policy facts. The
+    /// declared capabilities determine which lifecycle snapshots include the
+    /// entity; bind one explicit responder for every participating point.
+    /// Extension-owned policy state is runtime-only unless the extension also
+    /// supplies a stable persistence codec.
+    pub fn spawn_typed_policy<B>(
+        &mut self,
+        id: StableId,
+        tenant: TenantId,
+        meta: PolicyMeta,
+        capabilities: PolicyCapabilities,
+        components: B,
+        agent: AgentHandle,
+    ) -> Result<Entity, SpawnError>
+    where
+        B: Bundle,
+    {
+        if agent.runtime_id != self.handle.runtime_id {
+            return Err(SpawnError::ForeignRuntime);
+        }
+        ensure_unique_id(&mut self.world, &id)?;
+        let Some(agent_tenant) = self.world.get::<TenantId>(agent.entity) else {
+            return Err(SpawnError::StaleEntity(agent.entity));
+        };
+        if agent_tenant != &tenant {
+            return Err(SpawnError::TenantMismatch);
+        }
+        Ok(self
+            .world
+            .spawn((
+                id,
+                tenant,
+                meta,
+                capabilities,
+                components,
+                PolicyStatus::Enabled,
+                PolicyFor(agent.entity),
+            ))
+            .id())
+    }
+
     /// Spawns a policy revision scoped to one live run.
     pub fn spawn_run_policy(
         &mut self,
@@ -5222,12 +5757,177 @@ impl Runtime {
             .id())
     }
 
+    fn register_typed_policy_responder<E, D, M>(
+        &mut self,
+        policy: Entity,
+        point: PolicyPoint,
+        id: PolicyResponderId,
+        system: impl IntoSystem<In<E>, Option<D>, M> + 'static,
+    ) -> Result<Entity, PolicyResponderRegistrationError>
+    where
+        E: Send + Sync + 'static,
+        D: 'static,
+        M: 'static,
+    {
+        let Some(tenant) = self.world.get::<TenantId>(policy).cloned() else {
+            return Err(PolicyResponderRegistrationError::StalePolicy(policy));
+        };
+        if self.world.get::<PolicyMeta>(policy).is_none() {
+            return Err(PolicyResponderRegistrationError::StalePolicy(policy));
+        }
+        let Some(capabilities) = self.world.get::<PolicyCapabilities>(policy) else {
+            return Err(PolicyResponderRegistrationError::StalePolicy(policy));
+        };
+        if !capabilities.contains(point) {
+            return Err(PolicyResponderRegistrationError::CapabilityMismatch(point));
+        }
+        if let Some(bindings) = self.world.get::<PolicyResponders>(policy) {
+            for binding in bindings.iter() {
+                if self
+                    .world
+                    .get::<ResponderPoint>(binding)
+                    .is_some_and(|candidate| candidate.0 == point)
+                {
+                    return Err(PolicyResponderRegistrationError::ConflictingResponder(
+                        point,
+                    ));
+                }
+                if self
+                    .world
+                    .get::<PolicyResponderId>(binding)
+                    .is_some_and(|candidate| candidate == &id)
+                {
+                    return Err(PolicyResponderRegistrationError::DuplicateResponderId(
+                        id.as_str().to_owned(),
+                    ));
+                }
+            }
+        }
+        let responder = self.world.register_system(system).entity();
+        Ok(self
+            .world
+            .spawn((
+                PolicyResponderFor(policy),
+                ResponderPoint(point),
+                id,
+                tenant,
+                RegisteredPolicyResponder(responder),
+            ))
+            .id())
+    }
+
+    /// Binds the exact registered system used to steer one request policy.
+    pub fn register_request_policy_responder<M>(
+        &mut self,
+        policy: Entity,
+        id: PolicyResponderId,
+        system: impl IntoSystem<In<RequestPolicyInvocation>, Option<RequestPolicyDecision>, M> + 'static,
+    ) -> Result<Entity, PolicyResponderRegistrationError>
+    where
+        M: 'static,
+    {
+        self.register_typed_policy_responder(policy, PolicyPoint::Request, id, system)
+    }
+
+    /// Binds the exact registered system used to steer one tool-call policy.
+    pub fn register_tool_call_policy_responder<M>(
+        &mut self,
+        policy: Entity,
+        id: PolicyResponderId,
+        system: impl IntoSystem<In<ToolCallPolicyInvocation>, Option<ToolCallPolicyDecision>, M>
+        + 'static,
+    ) -> Result<Entity, PolicyResponderRegistrationError>
+    where
+        M: 'static,
+    {
+        self.register_typed_policy_responder(policy, PolicyPoint::ToolCall, id, system)
+    }
+
+    /// Binds the exact registered system used to steer one invalid-tool policy.
+    pub fn register_invalid_tool_call_policy_responder<M>(
+        &mut self,
+        policy: Entity,
+        id: PolicyResponderId,
+        system: impl IntoSystem<
+            In<InvalidToolCallPolicyInvocation>,
+            Option<InvalidToolCallPolicyDecision>,
+            M,
+        > + 'static,
+    ) -> Result<Entity, PolicyResponderRegistrationError>
+    where
+        M: 'static,
+    {
+        self.register_typed_policy_responder(policy, PolicyPoint::InvalidToolCall, id, system)
+    }
+
+    /// Binds the exact registered system used to steer one tool-result policy.
+    pub fn register_tool_result_policy_responder<M>(
+        &mut self,
+        policy: Entity,
+        id: PolicyResponderId,
+        system: impl IntoSystem<In<ToolResultPolicyInvocation>, Option<ToolResultPolicyDecision>, M>
+        + 'static,
+    ) -> Result<Entity, PolicyResponderRegistrationError>
+    where
+        M: 'static,
+    {
+        self.register_typed_policy_responder(policy, PolicyPoint::ToolResult, id, system)
+    }
+
+    /// Binds the exact registered system used to steer one completion-response policy.
+    pub fn register_completion_response_policy_responder<M>(
+        &mut self,
+        policy: Entity,
+        id: PolicyResponderId,
+        system: impl IntoSystem<
+            In<CompletionResponsePolicyInvocation>,
+            Option<CompletionResponsePolicyDecision>,
+            M,
+        > + 'static,
+    ) -> Result<Entity, PolicyResponderRegistrationError>
+    where
+        M: 'static,
+    {
+        self.register_typed_policy_responder(policy, PolicyPoint::CompletionResponse, id, system)
+    }
+
+    /// Binds the exact registered system used to steer one streaming text-delta policy.
+    pub fn register_text_delta_policy_responder<M>(
+        &mut self,
+        policy: Entity,
+        id: PolicyResponderId,
+        system: impl IntoSystem<In<TextDeltaPolicyInvocation>, Option<TextDeltaPolicyDecision>, M>
+        + 'static,
+    ) -> Result<Entity, PolicyResponderRegistrationError>
+    where
+        M: 'static,
+    {
+        self.register_typed_policy_responder(policy, PolicyPoint::TextDelta, id, system)
+    }
+
+    /// Binds the exact registered system used to steer one streaming tool-call-delta policy.
+    pub fn register_tool_call_delta_policy_responder<M>(
+        &mut self,
+        policy: Entity,
+        id: PolicyResponderId,
+        system: impl IntoSystem<
+            In<ToolCallDeltaPolicyInvocation>,
+            Option<ToolCallDeltaPolicyDecision>,
+            M,
+        > + 'static,
+    ) -> Result<Entity, PolicyResponderRegistrationError>
+    where
+        M: 'static,
+    {
+        self.register_typed_policy_responder(policy, PolicyPoint::ToolCallDelta, id, system)
+    }
+
     /// Retires a policy from future snapshots while preserving accepted work.
     pub fn retire_policy(&mut self, policy: Entity) -> Result<(), SpawnError> {
         let Some(mut entity) = self.world.get_entity_mut(policy).ok() else {
             return Err(SpawnError::StaleEntity(policy));
         };
-        if !entity.contains::<Policy>() {
+        if !entity.contains::<PolicyMeta>() {
             return Err(SpawnError::StaleEntity(policy));
         }
         entity.insert(PolicyStatus::Retired);
@@ -5580,6 +6280,23 @@ pub enum SpawnError {
     /// Handle belongs to another authoritative world.
     #[error("handle belongs to a different runtime")]
     ForeignRuntime,
+}
+
+/// Validation failure while binding an exact steering responder to a policy.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum PolicyResponderRegistrationError {
+    /// Policy entity is stale or lacks required policy metadata.
+    #[error("stale policy entity {0:?}")]
+    StalePolicy(Entity),
+    /// The policy does not declare the requested lifecycle capability.
+    #[error("policy does not declare the `{0:?}` capability")]
+    CapabilityMismatch(PolicyPoint),
+    /// The policy already has a responder at this lifecycle point.
+    #[error("policy already has a responder for `{0:?}`")]
+    ConflictingResponder(PolicyPoint),
+    /// The stable binding identity is already used by this policy.
+    #[error("policy responder id `{0}` already exists")]
+    DuplicateResponderId(String),
 }
 
 /// Local driver error.
@@ -6638,7 +7355,13 @@ fn initialize_request_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
+    policies: Query<(
+        Entity,
+        &StableId,
+        &PolicyMeta,
+        &PolicyCapabilities,
+        Option<&PolicyStatus>,
+    )>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, pending, state) in &operations {
@@ -6653,19 +7376,19 @@ fn initialize_request_policy_evaluations(
         }
         let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy, status)| {
+            .filter(|(_, _, _, capabilities, status)| {
                 accepts_new_policy_evaluations(*status)
-                    && policy.rule.applies_to(PolicyPoint::Request)
+                    && capabilities.contains(PolicyPoint::Request)
             })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
+        ordered.sort_by(|(_, left_id, left, _, _), (_, right_id, right, _, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy, _)| AcceptedPolicy {
+            .map(|(entity, id, policy, _, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -6699,84 +7422,223 @@ fn initialize_request_policy_evaluations(
     }
 }
 
-fn bind_builtin_policy_observer(
+fn bind_builtin_policy_responder(
     event: On<Add, Policy>,
-    policies: Query<&Policy>,
+    policies: Query<(&StableId, &TenantId, &Policy)>,
     mut commands: Commands,
 ) {
-    let Ok(policy) = policies.get(event.entity) else {
+    let Ok((policy_id, tenant, policy)) = policies.get(event.entity) else {
         return;
     };
-    let observer = match &policy.rule {
+    let point = policy.rule.point();
+    commands.entity(event.entity).insert((
+        PolicyMeta {
+            order: policy.order,
+            revision: policy.revision,
+        },
+        PolicyCapabilities::new([point]),
+    ));
+    match &policy.rule {
+        PolicyRule::Allow => {
+            commands.entity(event.entity).insert(AllowRequestPolicy);
+        }
+        PolicyRule::DenyPromptContains(needle) => {
+            commands
+                .entity(event.entity)
+                .insert(DenyPromptContainsPolicy(needle.clone()));
+        }
+        PolicyRule::PatchRequest(patch) => {
+            commands
+                .entity(event.entity)
+                .insert(RequestPatchPolicy(patch.clone()));
+        }
+        PolicyRule::RewriteToolArguments { tool, arguments } => {
+            commands
+                .entity(event.entity)
+                .insert(RewriteToolArgumentsPolicy {
+                    tool: tool.clone(),
+                    arguments: arguments.clone(),
+                });
+        }
+        PolicyRule::SkipToolCall { tool, reason } => {
+            commands.entity(event.entity).insert(SkipToolCallPolicy {
+                tool: tool.clone(),
+                reason: reason.clone(),
+            });
+        }
+        PolicyRule::RepairInvalidTool { from, to } => {
+            commands
+                .entity(event.entity)
+                .insert(RepairInvalidToolPolicy {
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+        }
+        PolicyRule::RetryInvalidTool { tool, feedback } => {
+            commands
+                .entity(event.entity)
+                .insert(RetryInvalidToolPolicy {
+                    tool: tool.clone(),
+                    feedback: feedback.clone(),
+                });
+        }
+        PolicyRule::SkipInvalidTool { tool, reason } => {
+            commands.entity(event.entity).insert(SkipInvalidToolPolicy {
+                tool: tool.clone(),
+                reason: reason.clone(),
+            });
+        }
+        PolicyRule::RewriteToolResult { tool, presentation } => {
+            commands
+                .entity(event.entity)
+                .insert(RewriteToolResultPolicy {
+                    tool: tool.clone(),
+                    presentation: presentation.clone(),
+                });
+        }
+        PolicyRule::StopToolResult { tool, reason } => {
+            commands.entity(event.entity).insert(StopToolResultPolicy {
+                tool: tool.clone(),
+                reason: reason.clone(),
+            });
+        }
+        PolicyRule::RewriteCompletionText { text } => {
+            commands
+                .entity(event.entity)
+                .insert(RewriteCompletionTextPolicy(text.clone()));
+        }
+        PolicyRule::StopCompletionContains { needle, reason } => {
+            commands
+                .entity(event.entity)
+                .insert(StopCompletionContainsPolicy {
+                    needle: needle.clone(),
+                    reason: reason.clone(),
+                });
+        }
+        PolicyRule::StopTextDeltaContains { needle, reason } => {
+            commands
+                .entity(event.entity)
+                .insert(StopTextDeltaContainsPolicy {
+                    needle: needle.clone(),
+                    reason: reason.clone(),
+                });
+        }
+        PolicyRule::StopToolCallDeltaContains { needle, reason } => {
+            commands
+                .entity(event.entity)
+                .insert(StopToolCallDeltaContainsPolicy {
+                    needle: needle.clone(),
+                    reason: reason.clone(),
+                });
+        }
+        PolicyRule::RequireApproval { point, prompt } => {
+            commands.entity(event.entity).insert(RequireApprovalPolicy {
+                point: *point,
+                prompt: prompt.clone(),
+            });
+        }
+        PolicyRule::Custom(point) => {
+            commands.entity(event.entity).insert(CustomPolicy(*point));
+        }
+    }
+    let responder = match &policy.rule {
         PolicyRule::Custom(_) => None,
-        _ if policy.rule.applies_to(PolicyPoint::Request) => Some(
+        _ if point == PolicyPoint::Request => Some(
             commands
-                .spawn(Observer::new(apply_builtin_request_policy).with_entity(event.entity))
-                .id(),
+                .register_system(apply_builtin_request_policy)
+                .entity(),
         ),
-        _ if policy.rule.applies_to(PolicyPoint::ToolCall) => Some(
+        _ if point == PolicyPoint::ToolCall => Some(
             commands
-                .spawn(Observer::new(apply_builtin_tool_call_policy).with_entity(event.entity))
-                .id(),
+                .register_system(apply_builtin_tool_call_policy)
+                .entity(),
         ),
-        _ if policy.rule.applies_to(PolicyPoint::InvalidToolCall) => Some(
+        _ if point == PolicyPoint::InvalidToolCall => Some(
             commands
-                .spawn(
-                    Observer::new(apply_builtin_invalid_tool_call_policy).with_entity(event.entity),
-                )
-                .id(),
+                .register_system(apply_builtin_invalid_tool_call_policy)
+                .entity(),
         ),
-        _ if policy.rule.applies_to(PolicyPoint::ToolResult) => Some(
+        _ if point == PolicyPoint::ToolResult => Some(
             commands
-                .spawn(Observer::new(apply_builtin_tool_result_policy).with_entity(event.entity))
-                .id(),
+                .register_system(apply_builtin_tool_result_policy)
+                .entity(),
         ),
-        _ if policy.rule.applies_to(PolicyPoint::CompletionResponse) => Some(
+        _ if point == PolicyPoint::CompletionResponse => Some(
             commands
-                .spawn(
-                    Observer::new(apply_builtin_completion_response_policy)
-                        .with_entity(event.entity),
-                )
-                .id(),
+                .register_system(apply_builtin_completion_response_policy)
+                .entity(),
         ),
-        _ if policy.rule.applies_to(PolicyPoint::TextDelta) => Some(
+        _ if point == PolicyPoint::TextDelta => Some(
             commands
-                .spawn(Observer::new(apply_builtin_text_delta_policy).with_entity(event.entity))
-                .id(),
+                .register_system(apply_builtin_text_delta_policy)
+                .entity(),
+        ),
+        _ if point == PolicyPoint::ToolCallDelta => Some(
+            commands
+                .register_system(apply_builtin_tool_call_delta_policy)
+                .entity(),
         ),
         _ => None,
     };
-    if let Some(observer) = observer {
-        commands
-            .entity(event.entity)
-            .insert(BoundPolicyObserver(observer));
+    if let Some(responder) = responder {
+        commands.spawn((
+            PolicyResponderFor(event.entity),
+            ResponderPoint(point),
+            PolicyResponderId(format!("builtin:{}:{}", policy_id.as_str(), point.as_str())),
+            tenant.clone(),
+            RegisteredPolicyResponder(responder),
+        ));
     }
 }
 
-fn unbind_builtin_policy_observer(
-    event: On<Remove, Policy>,
-    bindings: Query<&BoundPolicyObserver>,
+fn dematerialize_removed_policy(event: On<Remove, Policy>, mut commands: Commands) {
+    commands.entity(event.entity).remove::<PolicyMeta>();
+}
+
+fn unbind_policy_responders(
+    event: On<Remove, PolicyMeta>,
+    bindings: Query<&PolicyResponders>,
+    responders: Query<&RegisteredPolicyResponder>,
     mut commands: Commands,
 ) {
-    if let Ok(binding) = bindings.get(event.entity) {
-        commands.entity(binding.0).despawn();
-        commands
-            .entity(event.entity)
-            .remove::<BoundPolicyObserver>();
+    cleanup_policy_responders(event.entity, &bindings, &responders, &mut commands);
+}
+
+fn cleanup_policy_responders(
+    policy: Entity,
+    bindings: &Query<&PolicyResponders>,
+    responders: &Query<&RegisteredPolicyResponder>,
+    commands: &mut Commands,
+) {
+    let Ok(bindings) = bindings.get(policy) else {
+        return;
+    };
+    for binding in bindings.iter() {
+        if let Ok(responder) = responders.get(binding) {
+            commands.unregister_system(SystemId::<(), ()>::from_entity(responder.0));
+            commands.entity(responder.0).despawn();
+        }
+        commands.entity(binding).despawn();
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn apply_builtin_request_policy(
-    mut invocation: On<RequestPolicyInvocation>,
-    policies: Query<&Policy>,
-) {
-    let Ok(policy) = policies.get(invocation.policy) else {
-        return;
+    In(invocation): In<RequestPolicyInvocation>,
+    policies: Query<(
+        Option<&AllowRequestPolicy>,
+        Option<&DenyPromptContainsPolicy>,
+        Option<&RequestPatchPolicy>,
+        Option<&RequireApprovalPolicy>,
+    )>,
+) -> Option<RequestPolicyDecision> {
+    let Ok((allow, deny, patch, approval)) = policies.get(invocation.policy) else {
+        return None;
     };
-    invocation.decision = Some(match &policy.rule {
-        PolicyRule::Allow => RequestPolicyDecision::Continue,
-        PolicyRule::PatchRequest(patch) => RequestPolicyDecision::Patch(patch.clone()),
-        PolicyRule::DenyPromptContains(needle) => {
+    Some(match (allow, deny, patch, approval) {
+        (Some(_), None, None, None) => RequestPolicyDecision::Continue,
+        (None, None, Some(patch), None) => RequestPolicyDecision::Patch(patch.0.clone()),
+        (None, Some(DenyPromptContainsPolicy(needle)), None, None) => {
             let denied =
                 serde_json::from_value::<CompletionMessage>(invocation.request.prompt.clone())
                     .ok()
@@ -6788,216 +7650,187 @@ fn apply_builtin_request_policy(
                 RequestPolicyDecision::Continue
             }
         }
-        PolicyRule::RequireApproval { prompt, .. } => {
-            RequestPolicyDecision::AwaitApproval(prompt.clone())
+        (None, None, None, Some(approval)) if approval.point == PolicyPoint::Request => {
+            RequestPolicyDecision::AwaitApproval(approval.prompt.clone())
         }
-        PolicyRule::RewriteToolArguments { .. }
-        | PolicyRule::SkipToolCall { .. }
-        | PolicyRule::RepairInvalidTool { .. }
-        | PolicyRule::RetryInvalidTool { .. }
-        | PolicyRule::SkipInvalidTool { .. }
-        | PolicyRule::RewriteToolResult { .. }
-        | PolicyRule::StopToolResult { .. }
-        | PolicyRule::RewriteCompletionText { .. }
-        | PolicyRule::StopCompletionContains { .. }
-        | PolicyRule::StopTextDeltaContains { .. }
-        | PolicyRule::Custom(_) => return,
-    });
+        _ => return None,
+    })
 }
 
 fn apply_builtin_tool_call_policy(
-    mut invocation: On<ToolCallPolicyInvocation>,
-    policies: Query<&Policy>,
-) {
-    let Ok(policy) = policies.get(invocation.policy) else {
-        return;
+    In(invocation): In<ToolCallPolicyInvocation>,
+    policies: Query<(
+        Option<&RewriteToolArgumentsPolicy>,
+        Option<&SkipToolCallPolicy>,
+        Option<&RequireApprovalPolicy>,
+    )>,
+) -> Option<ToolCallPolicyDecision> {
+    let Ok((rewrite, skip, approval)) = policies.get(invocation.policy) else {
+        return None;
     };
-    invocation.decision = Some(match &policy.rule {
-        PolicyRule::RewriteToolArguments { tool, arguments }
-            if tool
+    Some(match (rewrite, skip, approval) {
+        (Some(rewrite), None, None)
+            if rewrite
+                .tool
                 .as_ref()
                 .is_none_or(|name| name == &invocation.call.decision.name) =>
         {
-            ToolCallPolicyDecision::Rewrite(arguments.clone())
+            ToolCallPolicyDecision::Rewrite(rewrite.arguments.clone())
         }
-        PolicyRule::SkipToolCall { tool, reason }
-            if tool
+        (None, Some(skip), None)
+            if skip
+                .tool
                 .as_ref()
                 .is_none_or(|name| name == &invocation.call.decision.name) =>
         {
-            ToolCallPolicyDecision::Skip(reason.clone())
+            ToolCallPolicyDecision::Skip(skip.reason.clone())
         }
-        PolicyRule::RewriteToolArguments { .. } | PolicyRule::SkipToolCall { .. } => {
-            ToolCallPolicyDecision::Run
+        (Some(_), None, None) | (None, Some(_), None) => ToolCallPolicyDecision::Run,
+        (None, None, Some(approval)) if approval.point == PolicyPoint::ToolCall => {
+            ToolCallPolicyDecision::AwaitApproval(approval.prompt.clone())
         }
-        PolicyRule::RequireApproval { prompt, .. } => {
-            ToolCallPolicyDecision::AwaitApproval(prompt.clone())
-        }
-        PolicyRule::Allow
-        | PolicyRule::DenyPromptContains(_)
-        | PolicyRule::PatchRequest(_)
-        | PolicyRule::RepairInvalidTool { .. }
-        | PolicyRule::RetryInvalidTool { .. }
-        | PolicyRule::SkipInvalidTool { .. }
-        | PolicyRule::RewriteToolResult { .. }
-        | PolicyRule::StopToolResult { .. }
-        | PolicyRule::RewriteCompletionText { .. }
-        | PolicyRule::StopCompletionContains { .. }
-        | PolicyRule::StopTextDeltaContains { .. }
-        | PolicyRule::Custom(_) => return,
-    });
+        _ => return None,
+    })
 }
 
+#[allow(clippy::type_complexity)]
 fn apply_builtin_invalid_tool_call_policy(
-    mut invocation: On<InvalidToolCallPolicyInvocation>,
-    policies: Query<&Policy>,
-) {
-    let Ok(policy) = policies.get(invocation.policy) else {
-        return;
+    In(invocation): In<InvalidToolCallPolicyInvocation>,
+    policies: Query<(
+        Option<&RepairInvalidToolPolicy>,
+        Option<&RetryInvalidToolPolicy>,
+        Option<&SkipInvalidToolPolicy>,
+        Option<&RequireApprovalPolicy>,
+    )>,
+) -> Option<InvalidToolCallPolicyDecision> {
+    let Ok((repair, retry, skip, approval)) = policies.get(invocation.policy) else {
+        return None;
     };
     let emitted = &invocation.invalid.call.name;
-    invocation.decision = Some(match &policy.rule {
-        PolicyRule::RepairInvalidTool { from, to }
-            if from.as_ref().is_none_or(|name| name == emitted) =>
+    Some(match (repair, retry, skip, approval) {
+        (Some(repair), None, None, None)
+            if repair.from.as_ref().is_none_or(|name| name == emitted) =>
         {
-            InvalidToolCallPolicyDecision::Repair(to.clone())
+            InvalidToolCallPolicyDecision::Repair(repair.to.clone())
         }
-        PolicyRule::RetryInvalidTool { tool, feedback }
-            if tool.as_ref().is_none_or(|name| name == emitted) =>
+        (None, Some(retry), None, None)
+            if retry.tool.as_ref().is_none_or(|name| name == emitted) =>
         {
-            InvalidToolCallPolicyDecision::Retry(feedback.clone())
+            InvalidToolCallPolicyDecision::Retry(retry.feedback.clone())
         }
-        PolicyRule::SkipInvalidTool { tool, reason }
-            if tool.as_ref().is_none_or(|name| name == emitted) =>
-        {
-            InvalidToolCallPolicyDecision::Skip(reason.clone())
+        (None, None, Some(skip), None) if skip.tool.as_ref().is_none_or(|name| name == emitted) => {
+            InvalidToolCallPolicyDecision::Skip(skip.reason.clone())
         }
-        PolicyRule::RepairInvalidTool { .. }
-        | PolicyRule::RetryInvalidTool { .. }
-        | PolicyRule::SkipInvalidTool { .. } => InvalidToolCallPolicyDecision::Continue,
-        PolicyRule::RequireApproval { prompt, .. } => {
-            InvalidToolCallPolicyDecision::AwaitApproval(prompt.clone())
+        (Some(_), None, None, None) | (None, Some(_), None, None) | (None, None, Some(_), None) => {
+            InvalidToolCallPolicyDecision::Continue
         }
-        PolicyRule::Allow
-        | PolicyRule::DenyPromptContains(_)
-        | PolicyRule::PatchRequest(_)
-        | PolicyRule::RewriteToolArguments { .. }
-        | PolicyRule::SkipToolCall { .. }
-        | PolicyRule::RewriteToolResult { .. }
-        | PolicyRule::StopToolResult { .. }
-        | PolicyRule::RewriteCompletionText { .. }
-        | PolicyRule::StopCompletionContains { .. }
-        | PolicyRule::StopTextDeltaContains { .. }
-        | PolicyRule::Custom(_) => return,
-    });
+        (None, None, None, Some(approval)) if approval.point == PolicyPoint::InvalidToolCall => {
+            InvalidToolCallPolicyDecision::AwaitApproval(approval.prompt.clone())
+        }
+        _ => return None,
+    })
 }
 
 fn apply_builtin_tool_result_policy(
-    mut invocation: On<ToolResultPolicyInvocation>,
-    policies: Query<&Policy>,
-) {
-    let Ok(policy) = policies.get(invocation.policy) else {
-        return;
+    In(invocation): In<ToolResultPolicyInvocation>,
+    policies: Query<(
+        Option<&RewriteToolResultPolicy>,
+        Option<&StopToolResultPolicy>,
+        Option<&RequireApprovalPolicy>,
+    )>,
+) -> Option<ToolResultPolicyDecision> {
+    let Ok((rewrite, stop, approval)) = policies.get(invocation.policy) else {
+        return None;
     };
     let tool_name = &invocation.input.decision.name;
-    invocation.decision = Some(match &policy.rule {
-        PolicyRule::RewriteToolResult { tool, presentation }
-            if tool.as_ref().is_none_or(|name| name == tool_name) =>
+    Some(match (rewrite, stop, approval) {
+        (Some(rewrite), None, None)
+            if rewrite.tool.as_ref().is_none_or(|name| name == tool_name) =>
         {
-            ToolResultPolicyDecision::Rewrite(presentation.clone())
+            ToolResultPolicyDecision::Rewrite(rewrite.presentation.clone())
         }
-        PolicyRule::StopToolResult { tool, reason }
-            if tool.as_ref().is_none_or(|name| name == tool_name) =>
-        {
-            ToolResultPolicyDecision::Stop(reason.clone())
+        (None, Some(stop), None) if stop.tool.as_ref().is_none_or(|name| name == tool_name) => {
+            ToolResultPolicyDecision::Stop(stop.reason.clone())
         }
-        PolicyRule::RewriteToolResult { .. } | PolicyRule::StopToolResult { .. } => {
-            ToolResultPolicyDecision::Keep
+        (Some(_), None, None) | (None, Some(_), None) => ToolResultPolicyDecision::Keep,
+        (None, None, Some(approval)) if approval.point == PolicyPoint::ToolResult => {
+            ToolResultPolicyDecision::AwaitApproval(approval.prompt.clone())
         }
-        PolicyRule::RequireApproval { prompt, .. } => {
-            ToolResultPolicyDecision::AwaitApproval(prompt.clone())
-        }
-        PolicyRule::Allow
-        | PolicyRule::DenyPromptContains(_)
-        | PolicyRule::PatchRequest(_)
-        | PolicyRule::RewriteToolArguments { .. }
-        | PolicyRule::SkipToolCall { .. }
-        | PolicyRule::RepairInvalidTool { .. }
-        | PolicyRule::RetryInvalidTool { .. }
-        | PolicyRule::SkipInvalidTool { .. }
-        | PolicyRule::RewriteCompletionText { .. }
-        | PolicyRule::StopCompletionContains { .. }
-        | PolicyRule::StopTextDeltaContains { .. }
-        | PolicyRule::Custom(_) => return,
-    });
+        _ => return None,
+    })
 }
 
 fn apply_builtin_completion_response_policy(
-    mut invocation: On<CompletionResponsePolicyInvocation>,
-    policies: Query<&Policy>,
-) {
-    let Ok(policy) = policies.get(invocation.policy) else {
-        return;
+    In(invocation): In<CompletionResponsePolicyInvocation>,
+    policies: Query<(
+        Option<&RewriteCompletionTextPolicy>,
+        Option<&StopCompletionContainsPolicy>,
+        Option<&RequireApprovalPolicy>,
+    )>,
+) -> Option<CompletionResponsePolicyDecision> {
+    let Ok((rewrite, stop, approval)) = policies.get(invocation.policy) else {
+        return None;
     };
-    invocation.decision = Some(match &policy.rule {
-        PolicyRule::RewriteCompletionText { text } => {
-            CompletionResponsePolicyDecision::RewriteText(text.clone())
+    Some(match (rewrite, stop, approval) {
+        (Some(rewrite), None, None) => {
+            CompletionResponsePolicyDecision::RewriteText(rewrite.0.clone())
         }
-        PolicyRule::StopCompletionContains { needle, reason }
-            if invocation.response.text.contains(needle) =>
-        {
-            CompletionResponsePolicyDecision::Stop(reason.clone())
+        (None, Some(stop), None) if invocation.response.text.contains(&stop.needle) => {
+            CompletionResponsePolicyDecision::Stop(stop.reason.clone())
         }
-        PolicyRule::StopCompletionContains { .. } => CompletionResponsePolicyDecision::Continue,
-        PolicyRule::RequireApproval { prompt, .. } => {
-            CompletionResponsePolicyDecision::AwaitApproval(prompt.clone())
+        (None, Some(_), None) => CompletionResponsePolicyDecision::Continue,
+        (None, None, Some(approval)) if approval.point == PolicyPoint::CompletionResponse => {
+            CompletionResponsePolicyDecision::AwaitApproval(approval.prompt.clone())
         }
-        PolicyRule::Allow
-        | PolicyRule::DenyPromptContains(_)
-        | PolicyRule::PatchRequest(_)
-        | PolicyRule::RewriteToolArguments { .. }
-        | PolicyRule::SkipToolCall { .. }
-        | PolicyRule::RepairInvalidTool { .. }
-        | PolicyRule::RetryInvalidTool { .. }
-        | PolicyRule::SkipInvalidTool { .. }
-        | PolicyRule::RewriteToolResult { .. }
-        | PolicyRule::StopToolResult { .. }
-        | PolicyRule::StopTextDeltaContains { .. }
-        | PolicyRule::Custom(_) => return,
-    });
+        _ => return None,
+    })
 }
 
 fn apply_builtin_text_delta_policy(
-    mut invocation: On<TextDeltaPolicyInvocation>,
-    policies: Query<&Policy>,
-) {
-    let Ok(policy) = policies.get(invocation.policy) else {
-        return;
+    In(invocation): In<TextDeltaPolicyInvocation>,
+    policies: Query<(
+        Option<&StopTextDeltaContainsPolicy>,
+        Option<&RequireApprovalPolicy>,
+    )>,
+) -> Option<TextDeltaPolicyDecision> {
+    let Ok((stop, approval)) = policies.get(invocation.policy) else {
+        return None;
     };
-    invocation.decision = Some(match &policy.rule {
-        PolicyRule::StopTextDeltaContains { needle, reason }
-            if invocation.delta.contains(needle) =>
-        {
-            TextDeltaPolicyDecision::Stop(reason.clone())
+    Some(match (stop, approval) {
+        (Some(stop), None) if invocation.delta.contains(&stop.needle) => {
+            TextDeltaPolicyDecision::Stop(stop.reason.clone())
         }
-        PolicyRule::StopTextDeltaContains { .. } => TextDeltaPolicyDecision::Continue,
-        PolicyRule::RequireApproval { prompt, .. } => {
-            TextDeltaPolicyDecision::AwaitApproval(prompt.clone())
+        (Some(_), None) => TextDeltaPolicyDecision::Continue,
+        (None, Some(approval)) if approval.point == PolicyPoint::TextDelta => {
+            TextDeltaPolicyDecision::AwaitApproval(approval.prompt.clone())
         }
-        PolicyRule::Allow
-        | PolicyRule::DenyPromptContains(_)
-        | PolicyRule::PatchRequest(_)
-        | PolicyRule::RewriteToolArguments { .. }
-        | PolicyRule::SkipToolCall { .. }
-        | PolicyRule::RepairInvalidTool { .. }
-        | PolicyRule::RetryInvalidTool { .. }
-        | PolicyRule::SkipInvalidTool { .. }
-        | PolicyRule::RewriteToolResult { .. }
-        | PolicyRule::StopToolResult { .. }
-        | PolicyRule::RewriteCompletionText { .. }
-        | PolicyRule::StopCompletionContains { .. }
-        | PolicyRule::Custom(_) => return,
-    });
+        _ => return None,
+    })
+}
+
+fn apply_builtin_tool_call_delta_policy(
+    In(invocation): In<ToolCallDeltaPolicyInvocation>,
+    policies: Query<(
+        Option<&StopToolCallDeltaContainsPolicy>,
+        Option<&RequireApprovalPolicy>,
+    )>,
+) -> Option<ToolCallDeltaPolicyDecision> {
+    let Ok((stop, approval)) = policies.get(invocation.policy) else {
+        return None;
+    };
+    let fragment = match &invocation.content {
+        ToolCallDeltaContent::Name(name) | ToolCallDeltaContent::Delta(name) => name,
+    };
+    Some(match (stop, approval) {
+        (Some(stop), None) if fragment.contains(&stop.needle) => {
+            ToolCallDeltaPolicyDecision::Stop(stop.reason.clone())
+        }
+        (Some(_), None) => ToolCallDeltaPolicyDecision::Continue,
+        (None, Some(approval)) if approval.point == PolicyPoint::ToolCallDelta => {
+            ToolCallDeltaPolicyDecision::AwaitApproval(approval.prompt.clone())
+        }
+        _ => return None,
+    })
 }
 
 fn apply_request_patch(input: &mut ModelEffectInput, patch: RequestPatch) {
@@ -7030,6 +7863,37 @@ fn apply_request_patch(input: &mut ModelEffectInput, patch: RequestPatch) {
     if let Some(mut history) = patch.history {
         history.push(TranscriptEntry::Message(input.prompt.clone()));
         input.history = history;
+    }
+}
+
+fn policy_termination_error(
+    world: &World,
+    run: Entity,
+    operation: Entity,
+    policy_id: StableId,
+    revision: u64,
+    point: PolicyPoint,
+    reason: String,
+) -> CanonicalError {
+    let entity_id = |entity: Entity, kind: &str| {
+        world
+            .get::<StableId>(entity)
+            .cloned()
+            .unwrap_or_else(|| StableId::generated(format!("{kind}-{}", entity.to_bits())))
+    };
+    CanonicalError::PolicyTerminated {
+        termination: Box::new(PolicyTermination {
+            policy_id,
+            revision,
+            point,
+            reason,
+            run_id: entity_id(run, "run"),
+            operation_id: entity_id(operation, "operation"),
+            history: world
+                .get::<RunRecord>(run)
+                .map(|record| record.transcript.clone())
+                .unwrap_or_default(),
+        }),
     }
 }
 
@@ -7114,35 +7978,74 @@ fn begin_policy_approval(
         .id()
 }
 
-fn trigger_single_policy_responder<E>(
+fn run_policy_responder<E, D>(
     world: &mut World,
-    invocation: &mut E,
+    invocation: E,
     policy: Entity,
     policy_id: &StableId,
-) where
-    E: EntityEvent,
-    for<'a> <E as Event>::Trigger<'a>: Default,
+    point: PolicyPoint,
+) -> Option<D>
+where
+    E: Send + Sync + 'static,
+    D: 'static,
 {
-    let event_key = world.register_event_key::<E>();
-    let responders = {
-        let mut observers = world.query::<&Observer>();
-        observers
-            .iter(world)
-            .filter(|observer| {
-                observer.descriptor().event_keys().contains(&event_key)
-                    && (observer.descriptor().entities().is_empty()
-                        || observer.descriptor().entities().contains(&policy))
-            })
-            .count()
-    };
-    if responders == 1 {
-        world.trigger_ref(invocation);
-    } else {
+    let Some(bindings) = world.get::<PolicyResponders>(policy) else {
         tracing::warn!(
             policy = policy_id.as_str(),
-            responders,
-            "steering policy must have exactly one applicable responder"
+            "steering policy has no responder binding"
         );
+        return None;
+    };
+    if !world
+        .get::<PolicyCapabilities>(policy)
+        .is_some_and(|capabilities| capabilities.contains(point))
+    {
+        tracing::warn!(
+            policy = policy_id.as_str(),
+            point = point.as_str(),
+            "steering invocation does not match the policy capability"
+        );
+        return None;
+    }
+    let matching = bindings
+        .iter()
+        .filter_map(|binding| {
+            let binding_point = world.get::<ResponderPoint>(binding)?;
+            let responder = world.get::<RegisteredPolicyResponder>(binding)?;
+            (binding_point.0 == point).then_some((binding, responder.0))
+        })
+        .collect::<Vec<_>>();
+    let [(binding, responder)] = matching.as_slice() else {
+        tracing::warn!(
+            policy = policy_id.as_str(),
+            point = point.as_str(),
+            responders = matching.len(),
+            "steering policy must have exactly one explicit responder binding"
+        );
+        return None;
+    };
+    if world.get_entity(*binding).is_err() || world.get_entity(*responder).is_err() {
+        tracing::warn!(
+            policy = policy_id.as_str(),
+            point = point.as_str(),
+            "steering policy responder binding is stale"
+        );
+        return None;
+    }
+    match world.run_system_with(
+        SystemId::<In<E>, Option<D>>::from_entity(*responder),
+        invocation,
+    ) {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::warn!(
+                policy = policy_id.as_str(),
+                point = point.as_str(),
+                %error,
+                "steering policy responder failed"
+            );
+            None
+        }
     }
 }
 
@@ -7183,13 +8086,12 @@ fn evaluate_request_policies(world: &mut World) {
             mark_progress(&mut world.resource_mut::<Progress>());
             continue;
         };
-        let mut invocation = RequestPolicyInvocation {
+        let invocation = RequestPolicyInvocation {
             policy: policy.entity,
             evaluation: evaluation_entity,
             run,
             operation,
             request: evaluation.effective.clone(),
-            decision: None,
         };
         world.trigger(RequestPolicyInvoked {
             policy: policy.entity,
@@ -7198,8 +8100,8 @@ fn evaluate_request_policies(world: &mut World) {
             revision: policy.revision,
             cursor,
         });
-        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
-        let decision = invocation.decision.clone();
+        let decision =
+            run_policy_responder(world, invocation, policy.entity, &policy.id, policy.point);
         world.trigger(RequestPolicyDecided {
             policy: policy.entity,
             evaluation: evaluation_entity,
@@ -7258,20 +8160,23 @@ fn evaluate_request_policies(world: &mut World) {
                 {
                     evaluation.phase = RequestPolicyEvaluationPhase::Rejected {
                         policy: policy.id.clone(),
-                        reason,
+                        reason: reason.clone(),
                     };
                 }
+                let error = policy_termination_error(
+                    world,
+                    run,
+                    operation,
+                    policy.id.clone(),
+                    policy.revision,
+                    PolicyPoint::Request,
+                    reason,
+                );
                 if let Some(mut state) = world.get_mut::<OperationState>(operation) {
-                    state.phase = OperationPhase::Settled(OperationOutcome::Failure(
-                        CanonicalError::PolicyDenied {
-                            policy: policy.id.as_str().to_owned(),
-                        },
-                    ));
+                    state.phase = OperationPhase::Settled(OperationOutcome::Failure(error.clone()));
                 }
                 if let Some(mut state) = world.get_mut::<RunState>(run) {
-                    *state = RunState::Failed(CanonicalError::PolicyDenied {
-                        policy: policy.id.as_str().to_owned(),
-                    });
+                    *state = RunState::Failed(error);
                 }
             }
         }
@@ -7288,7 +8193,13 @@ fn initialize_tool_call_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
+    policies: Query<(
+        Entity,
+        &StableId,
+        &PolicyMeta,
+        &PolicyCapabilities,
+        Option<&PolicyStatus>,
+    )>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, pending, state) in &operations {
@@ -7303,19 +8214,19 @@ fn initialize_tool_call_policy_evaluations(
         }
         let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy, status)| {
+            .filter(|(_, _, _, capabilities, status)| {
                 accepts_new_policy_evaluations(*status)
-                    && policy.rule.applies_to(PolicyPoint::ToolCall)
+                    && capabilities.contains(PolicyPoint::ToolCall)
             })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
+        ordered.sort_by(|(_, left_id, left, _, _), (_, right_id, right, _, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy, _)| AcceptedPolicy {
+            .map(|(entity, id, policy, _, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -7392,16 +8303,16 @@ fn evaluate_tool_call_policies(world: &mut World) {
             mark_progress(&mut world.resource_mut::<Progress>());
             continue;
         };
-        let mut invocation = ToolCallPolicyInvocation {
+        let invocation = ToolCallPolicyInvocation {
             policy: policy.entity,
             evaluation: evaluation_entity,
             run,
             operation,
             call: evaluation.effective.clone(),
-            decision: None,
         };
-        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
-        match invocation.decision {
+        let decision =
+            run_policy_responder(world, invocation, policy.entity, &policy.id, policy.point);
+        match decision {
             Some(ToolCallPolicyDecision::Run) => {
                 if let Some(mut evaluation) =
                     world.get_mut::<ToolCallPolicyEvaluation>(evaluation_entity)
@@ -7436,7 +8347,12 @@ fn evaluate_tool_call_policies(world: &mut World) {
                 }
             }
             Some(ToolCallPolicyDecision::Skip(reason)) => {
-                let effective = invocation.call.clone();
+                let Some(effective) = world
+                    .get::<ToolCallPolicyEvaluation>(evaluation_entity)
+                    .map(|evaluation| evaluation.effective.clone())
+                else {
+                    continue;
+                };
                 world.entity_mut(operation).insert(effective.clone());
                 world.entity_mut(operation).remove::<PendingToolCall>();
                 if let Some(mut state) = world.get_mut::<OperationState>(operation) {
@@ -7446,8 +8362,8 @@ fn evaluate_tool_call_policies(world: &mut World) {
                             provider_result_id: effective.provider_result_id,
                             provider_call_id: effective.provider_call_id,
                             name: effective.decision.name,
-                            raw: serde_json::json!({"skipped": true, "reason": reason}),
-                            presentation: reason.clone(),
+                            raw: serde_json::json!({"skipped": true, "reason": reason}).into(),
+                            presentation: reason.clone().into(),
                             failure: None,
                         }),
                     ));
@@ -7468,20 +8384,23 @@ fn evaluate_tool_call_policies(world: &mut World) {
                 {
                     evaluation.phase = ToolCallPolicyEvaluationPhase::Rejected {
                         policy: policy.id.clone(),
-                        reason,
+                        reason: reason.clone(),
                     };
                 }
+                let error = policy_termination_error(
+                    world,
+                    run,
+                    operation,
+                    policy.id.clone(),
+                    policy.revision,
+                    PolicyPoint::ToolCall,
+                    reason,
+                );
                 if let Some(mut state) = world.get_mut::<OperationState>(operation) {
-                    state.phase = OperationPhase::Settled(OperationOutcome::Failure(
-                        CanonicalError::PolicyDenied {
-                            policy: policy.id.as_str().to_owned(),
-                        },
-                    ));
+                    state.phase = OperationPhase::Settled(OperationOutcome::Failure(error.clone()));
                 }
                 if let Some(mut state) = world.get_mut::<RunState>(run) {
-                    *state = RunState::Failed(CanonicalError::PolicyDenied {
-                        policy: policy.id.as_str().to_owned(),
-                    });
+                    *state = RunState::Failed(error);
                 }
             }
         }
@@ -7492,25 +8411,40 @@ fn evaluate_tool_call_policies(world: &mut World) {
 #[allow(clippy::type_complexity)]
 fn initialize_invalid_tool_call_policy_evaluations(
     mut commands: Commands,
-    operations: Query<
+    mut operations: Query<
         (
             Entity,
             &OperationOf,
             &PendingInvalidToolCall,
-            &OperationState,
+            &mut OperationState,
         ),
         Without<InvalidToolCallPolicyInitialized>,
     >,
-    runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
+    mut runs: Query<
+        (
+            &RunOf,
+            Option<&RunPolicies>,
+            Option<&RunControl>,
+            &mut RunState,
+        ),
+        Without<WaitingForChildren>,
+    >,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
+    policies: Query<(
+        Entity,
+        &StableId,
+        &PolicyMeta,
+        &PolicyCapabilities,
+        Option<&PolicyStatus>,
+    )>,
     mut progress: ResMut<Progress>,
 ) {
-    for (operation, operation_of, invalid, state) in &operations {
+    for (operation, operation_of, invalid, mut state) in &mut operations {
         if !matches!(state.phase, OperationPhase::Prepared) {
             continue;
         }
-        let Ok((run_of, run_policies, control)) = runs.get(operation_of.get()) else {
+        let Ok((run_of, run_policies, control, mut run_state)) = runs.get_mut(operation_of.get())
+        else {
             continue;
         };
         if !control_allows_internal_progress(control) {
@@ -7518,19 +8452,19 @@ fn initialize_invalid_tool_call_policy_evaluations(
         }
         let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy, status)| {
+            .filter(|(_, _, _, capabilities, status)| {
                 accepts_new_policy_evaluations(*status)
-                    && policy.rule.applies_to(PolicyPoint::InvalidToolCall)
+                    && capabilities.contains(PolicyPoint::InvalidToolCall)
             })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
+        ordered.sort_by(|(_, left_id, left, _, _), (_, right_id, right, _, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy, _)| AcceptedPolicy {
+            .map(|(entity, id, policy, _, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -7542,16 +8476,22 @@ fn initialize_invalid_tool_call_policy_evaluations(
             InvalidToolCallPolicyInitialized,
             AcceptedInvalidToolCallPolicies(snapshot.clone()),
         ));
-        commands.spawn((
-            EvaluationOfOperation(operation),
-            InvalidToolCallPolicyEvaluation {
-                run: operation_of.get(),
-                policies: snapshot,
-                cursor: 0,
-                invalid: invalid.clone(),
-                phase: InvalidToolCallPolicyEvaluationPhase::Evaluating,
-            },
-        ));
+        if snapshot.is_empty() {
+            let error = CanonicalError::UnknownTool(invalid.call.name.clone());
+            state.phase = OperationPhase::Settled(OperationOutcome::Failure(error.clone()));
+            *run_state = RunState::Failed(error);
+        } else {
+            commands.spawn((
+                EvaluationOfOperation(operation),
+                InvalidToolCallPolicyEvaluation {
+                    run: operation_of.get(),
+                    policies: snapshot,
+                    cursor: 0,
+                    invalid: invalid.clone(),
+                    phase: InvalidToolCallPolicyEvaluationPhase::Evaluating,
+                },
+            ));
+        }
         mark_progress(&mut progress);
     }
 }
@@ -7605,8 +8545,8 @@ fn settle_invalid_tool_as_feedback(
                 provider_result_id: input.provider_result_id,
                 provider_call_id: input.provider_call_id,
                 name: input.decision.name,
-                raw: serde_json::json!({"invalid_tool_call": kind, "feedback": feedback}),
-                presentation: feedback,
+                raw: serde_json::json!({"invalid_tool_call": kind, "feedback": feedback}).into(),
+                presentation: feedback.into(),
                 failure: None,
             },
         )));
@@ -7686,16 +8626,16 @@ fn evaluate_invalid_tool_call_policies(world: &mut World) {
             mark_progress(&mut world.resource_mut::<Progress>());
             continue;
         };
-        let mut invocation = InvalidToolCallPolicyInvocation {
+        let invocation = InvalidToolCallPolicyInvocation {
             policy: policy.entity,
             evaluation: evaluation_entity,
             run,
             operation,
             invalid: evaluation.invalid.clone(),
-            decision: None,
         };
-        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
-        match invocation.decision {
+        let decision =
+            run_policy_responder(world, invocation, policy.entity, &policy.id, policy.point);
+        match decision {
             Some(InvalidToolCallPolicyDecision::Continue) => {
                 if let Some(mut evaluation) =
                     world.get_mut::<InvalidToolCallPolicyEvaluation>(evaluation_entity)
@@ -7829,12 +8769,21 @@ fn evaluate_invalid_tool_call_policies(world: &mut World) {
                 {
                     state.phase = InvalidToolCallPolicyEvaluationPhase::Rejected {
                         policy: policy.id.clone(),
-                        reason,
+                        reason: reason.clone(),
                     };
                 }
-                let error = CanonicalError::PolicyDenied {
-                    policy: policy.id.as_str().to_owned(),
-                };
+                let mut error = policy_termination_error(
+                    world,
+                    run,
+                    operation,
+                    policy.id.clone(),
+                    policy.revision,
+                    PolicyPoint::InvalidToolCall,
+                    reason,
+                );
+                if let CanonicalError::PolicyTerminated { termination } = &mut error {
+                    termination.history = evaluation.invalid.diagnostic_history.clone();
+                }
                 if let Some(mut state) = world.get_mut::<OperationState>(operation) {
                     state.phase = OperationPhase::Settled(OperationOutcome::Failure(error.clone()));
                 }
@@ -8076,7 +9025,7 @@ fn publish_applied_tool_policy_observations(
             operation,
             run: operation_of.get(),
             status: tool_output_status(raw),
-            presentation: effective.presentation,
+            presentation: effective.presentation.telemetry_summary(),
         });
     }
 }
@@ -8104,7 +9053,7 @@ fn published_tool_result(output: &ToolEffectOutput) -> PublishedToolResult {
         provider_result_id: output.provider_result_id.clone(),
         provider_call_id: output.provider_call_id.clone(),
         name: output.name.clone(),
-        presentation: output.presentation.clone(),
+        presentation: output.presentation.telemetry_summary(),
         status: tool_output_status(output),
     }
 }
@@ -8444,7 +9393,13 @@ fn apply_effect_ingress(
     timeout: Res<EffectTimeoutTicks>,
     runs: Query<(&RunOf, Option<&RunPolicies>, &RunRecord)>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
+    policies: Query<(
+        Entity,
+        &StableId,
+        &PolicyMeta,
+        &PolicyCapabilities,
+        Option<&PolicyStatus>,
+    )>,
     run_subscriptions: Query<&RunSubscriptions>,
     mut subscriptions: Query<(&StreamSink, &mut SubscriptionState)>,
     mut progress: ResMut<Progress>,
@@ -8540,6 +9495,9 @@ fn apply_effect_ingress(
                 commands
                     .entity(diagnostics.operation)
                     .insert(ProviderResponseDiagnostics(diagnostics.diagnostics.clone()));
+                if let Some(typed) = &diagnostics.typed {
+                    typed.insert(&mut commands, diagnostics.operation);
+                }
                 mark_progress(&mut progress);
             }
             EffectIngress::Delta(delta) => {
@@ -8588,13 +9546,13 @@ fn apply_effect_ingress(
                         let mut stream_policies =
                             policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
                                 .filter_map(|entity| policies.get(entity).ok())
-                                .filter(|(_, _, policy, status)| {
+                                .filter(|(_, _, _, capabilities, status)| {
                                     accepts_new_policy_evaluations(*status)
-                                        && policy.rule.applies_to(PolicyPoint::TextDelta)
+                                        && capabilities.contains(PolicyPoint::TextDelta)
                                 })
                                 .collect::<Vec<_>>();
                         stream_policies.sort_by(
-                            |(_, left_id, left, _), (_, right_id, right, _)| {
+                            |(_, left_id, left, _, _), (_, right_id, right, _, _)| {
                                 left.order
                                     .cmp(&right.order)
                                     .then_with(|| left_id.cmp(right_id))
@@ -8602,7 +9560,7 @@ fn apply_effect_ingress(
                         );
                         let snapshot = stream_policies
                             .drain(..)
-                            .map(|(entity, id, policy, _)| AcceptedPolicy {
+                            .map(|(entity, id, policy, _, _)| AcceptedPolicy {
                                 id: id.clone(),
                                 entity,
                                 revision: policy.revision,
@@ -8655,6 +9613,52 @@ fn apply_effect_ingress(
                             internal_call_id: internal_call_id.clone(),
                             content: content.clone(),
                         });
+                        let mut stream_policies =
+                            policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
+                                .filter_map(|entity| policies.get(entity).ok())
+                                .filter(|(_, _, _, capabilities, status)| {
+                                    accepts_new_policy_evaluations(*status)
+                                        && capabilities.contains(PolicyPoint::ToolCallDelta)
+                                })
+                                .collect::<Vec<_>>();
+                        stream_policies.sort_by(
+                            |(_, left_id, left, _, _), (_, right_id, right, _, _)| {
+                                left.order
+                                    .cmp(&right.order)
+                                    .then_with(|| left_id.cmp(right_id))
+                            },
+                        );
+                        let snapshot = stream_policies
+                            .drain(..)
+                            .map(|(entity, id, policy, _, _)| AcceptedPolicy {
+                                id: id.clone(),
+                                entity,
+                                revision: policy.revision,
+                                order: policy.order,
+                                point: PolicyPoint::ToolCallDelta,
+                            })
+                            .collect::<Vec<_>>();
+                        if !snapshot.is_empty() {
+                            commands.spawn((
+                                EvaluationOfOperation(delta.operation),
+                                AcceptedToolCallDeltaPolicies(snapshot.clone()),
+                                ToolCallDeltaPolicyEvaluation {
+                                    run,
+                                    operation: delta.operation,
+                                    policies: snapshot,
+                                    cursor: 0,
+                                    turn,
+                                    sequence: delta.sequence,
+                                    provider_correlation: delta.provider_correlation.clone(),
+                                    id: id.clone(),
+                                    internal_call_id: internal_call_id.clone(),
+                                    content: content.clone(),
+                                    phase: ToolCallDeltaPolicyEvaluationPhase::Evaluating,
+                                },
+                            ));
+                            mark_progress(&mut progress);
+                            continue;
+                        }
                         publish_stream_item(
                             &mut commands,
                             run,
@@ -9009,7 +10013,13 @@ fn initialize_completion_response_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
+    policies: Query<(
+        Entity,
+        &StableId,
+        &PolicyMeta,
+        &PolicyCapabilities,
+        Option<&PolicyStatus>,
+    )>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, request, state) in &operations {
@@ -9026,19 +10036,19 @@ fn initialize_completion_response_policy_evaluations(
         }
         let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy, status)| {
+            .filter(|(_, _, _, capabilities, status)| {
                 accepts_new_policy_evaluations(*status)
-                    && policy.rule.applies_to(PolicyPoint::CompletionResponse)
+                    && capabilities.contains(PolicyPoint::CompletionResponse)
             })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
+        ordered.sort_by(|(_, left_id, left, _, _), (_, right_id, right, _, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy, _)| AcceptedPolicy {
+            .map(|(entity, id, policy, _, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -9123,17 +10133,17 @@ fn evaluate_completion_response_policies(world: &mut World) {
             mark_progress(&mut world.resource_mut::<Progress>());
             continue;
         };
-        let mut invocation = CompletionResponsePolicyInvocation {
+        let invocation = CompletionResponsePolicyInvocation {
             policy: policy.entity,
             evaluation: evaluation_entity,
             run,
             operation,
             request: evaluation.request,
             response: evaluation.effective,
-            decision: None,
         };
-        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
-        match invocation.decision {
+        let decision =
+            run_policy_responder(world, invocation, policy.entity, &policy.id, policy.point);
+        match decision {
             Some(CompletionResponsePolicyDecision::Continue) => {
                 if let Some(mut evaluation) =
                     world.get_mut::<CompletionResponsePolicyEvaluation>(evaluation_entity)
@@ -9177,13 +10187,20 @@ fn evaluate_completion_response_policies(world: &mut World) {
                 {
                     evaluation.phase = CompletionResponsePolicyEvaluationPhase::Rejected {
                         policy: policy.id.clone(),
-                        reason,
+                        reason: reason.clone(),
                     };
                 }
+                let error = policy_termination_error(
+                    world,
+                    run,
+                    operation,
+                    policy.id.clone(),
+                    policy.revision,
+                    PolicyPoint::CompletionResponse,
+                    reason,
+                );
                 if let Some(mut state) = world.get_mut::<RunState>(run) {
-                    *state = RunState::Failed(CanonicalError::PolicyDenied {
-                        policy: policy.id.as_str().to_owned(),
-                    });
+                    *state = RunState::Failed(error);
                 }
             }
         }
@@ -9269,7 +10286,7 @@ fn evaluate_text_delta_policies(world: &mut World) {
             mark_progress(&mut world.resource_mut::<Progress>());
             continue;
         };
-        let mut invocation = TextDeltaPolicyInvocation {
+        let invocation = TextDeltaPolicyInvocation {
             policy: policy.entity,
             evaluation: evaluation_entity,
             run,
@@ -9278,10 +10295,10 @@ fn evaluate_text_delta_policies(world: &mut World) {
             sequence: evaluation.sequence,
             delta: evaluation.delta,
             aggregated: evaluation.aggregated,
-            decision: None,
         };
-        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
-        match invocation.decision {
+        let decision =
+            run_policy_responder(world, invocation, policy.entity, &policy.id, policy.point);
+        match decision {
             Some(TextDeltaPolicyDecision::Continue) => {
                 if let Some(mut state) =
                     world.get_mut::<TextDeltaPolicyEvaluation>(evaluation_entity)
@@ -9317,13 +10334,190 @@ fn evaluate_text_delta_policies(world: &mut World) {
                 {
                     state.phase = TextDeltaPolicyEvaluationPhase::Rejected {
                         policy: policy.id.clone(),
-                        reason,
+                        reason: reason.clone(),
                     };
                 }
+                let error = policy_termination_error(
+                    world,
+                    run,
+                    evaluation.operation,
+                    policy.id.clone(),
+                    policy.revision,
+                    PolicyPoint::TextDelta,
+                    reason,
+                );
                 if let Some(mut state) = world.get_mut::<RunState>(run) {
-                    *state = RunState::Failed(CanonicalError::PolicyDenied {
-                        policy: policy.id.as_str().to_owned(),
-                    });
+                    *state = RunState::Failed(error);
+                }
+            }
+        }
+        mark_progress(&mut world.resource_mut::<Progress>());
+    }
+}
+
+fn publish_evaluated_tool_call_delta(
+    world: &mut World,
+    run: Entity,
+    sequence: u64,
+    id: &str,
+    internal_call_id: &str,
+    content: &ToolCallDeltaContent,
+) {
+    let subscriptions = world
+        .get::<RunSubscriptions>(run)
+        .map(|subscriptions| subscriptions.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for subscription in subscriptions {
+        if !matches!(
+            world.get::<SubscriptionState>(subscription),
+            Some(SubscriptionState::Active)
+        ) {
+            continue;
+        }
+        let sender = world
+            .get::<StreamSink>(subscription)
+            .map(|sink| sink.0.clone());
+        let Some(sender) = sender else {
+            continue;
+        };
+        if sender
+            .try_send(StreamItem::ToolCallDelta {
+                sequence,
+                id: id.to_owned(),
+                internal_call_id: internal_call_id.to_owned(),
+                content: content.clone(),
+            })
+            .is_err()
+        {
+            if let Some(mut state) = world.get_mut::<SubscriptionState>(subscription) {
+                *state = SubscriptionState::DroppedSlowConsumer;
+            }
+            world.entity_mut(subscription).remove::<StreamSink>();
+        }
+    }
+}
+
+fn evaluate_tool_call_delta_policies(world: &mut World) {
+    let mut query = world.query::<(Entity, &ToolCallDeltaPolicyEvaluation)>();
+    let mut ready = query
+        .iter(world)
+        .filter(|(_, evaluation)| {
+            matches!(
+                evaluation.phase,
+                ToolCallDeltaPolicyEvaluationPhase::Evaluating
+            )
+        })
+        .map(|(entity, evaluation)| {
+            (
+                entity,
+                evaluation.run,
+                evaluation.operation,
+                evaluation.sequence,
+                evaluation.cursor,
+            )
+        })
+        .collect::<Vec<_>>();
+    ready.retain(|(_, run, _, _, _)| world_allows_internal_progress(world, *run));
+    ready.sort_by(|left, right| {
+        let left_id = world.get::<StableId>(left.1);
+        let right_id = world.get::<StableId>(right.1);
+        left_id
+            .cmp(&right_id)
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.cmp(&right.4))
+            .then_with(|| left.0.to_bits().cmp(&right.0.to_bits()))
+    });
+    let mut operations = HashSet::new();
+    ready.retain(|(_, _, operation, _, _)| operations.insert(*operation));
+
+    for (evaluation_entity, run, _, _, cursor) in ready {
+        let Some(evaluation) = world
+            .get::<ToolCallDeltaPolicyEvaluation>(evaluation_entity)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(policy) = evaluation.policies.get(cursor).cloned() else {
+            publish_evaluated_tool_call_delta(
+                world,
+                run,
+                evaluation.sequence,
+                &evaluation.id,
+                &evaluation.internal_call_id,
+                &evaluation.content,
+            );
+            if let Some(mut state) =
+                world.get_mut::<ToolCallDeltaPolicyEvaluation>(evaluation_entity)
+            {
+                state.phase = ToolCallDeltaPolicyEvaluationPhase::Published;
+            }
+            mark_progress(&mut world.resource_mut::<Progress>());
+            continue;
+        };
+        let invocation = ToolCallDeltaPolicyInvocation {
+            policy: policy.entity,
+            evaluation: evaluation_entity,
+            run,
+            operation: evaluation.operation,
+            turn: evaluation.turn,
+            sequence: evaluation.sequence,
+            provider_correlation: evaluation.provider_correlation,
+            id: evaluation.id,
+            internal_call_id: evaluation.internal_call_id,
+            content: evaluation.content,
+        };
+        let decision =
+            run_policy_responder(world, invocation, policy.entity, &policy.id, policy.point);
+        match decision {
+            Some(ToolCallDeltaPolicyDecision::Continue) => {
+                if let Some(mut state) =
+                    world.get_mut::<ToolCallDeltaPolicyEvaluation>(evaluation_entity)
+                {
+                    state.cursor += 1;
+                }
+            }
+            Some(ToolCallDeltaPolicyDecision::AwaitApproval(prompt)) => {
+                let approval = begin_policy_approval(
+                    world,
+                    evaluation_entity,
+                    run,
+                    &policy,
+                    PolicyPoint::ToolCallDelta,
+                    prompt,
+                );
+                if let Some(mut state) =
+                    world.get_mut::<ToolCallDeltaPolicyEvaluation>(evaluation_entity)
+                {
+                    state.phase = ToolCallDeltaPolicyEvaluationPhase::WaitingApproval {
+                        operation: approval,
+                        policy: policy.id.clone(),
+                    };
+                }
+            }
+            decision @ (Some(ToolCallDeltaPolicyDecision::Stop(_)) | None) => {
+                let reason = match decision {
+                    Some(ToolCallDeltaPolicyDecision::Stop(reason)) => reason,
+                    _ => "policy did not provide a steering decision".to_owned(),
+                };
+                if let Some(mut state) =
+                    world.get_mut::<ToolCallDeltaPolicyEvaluation>(evaluation_entity)
+                {
+                    state.phase = ToolCallDeltaPolicyEvaluationPhase::Rejected {
+                        policy: policy.id.clone(),
+                        reason: reason.clone(),
+                    };
+                }
+                let error = policy_termination_error(
+                    world,
+                    run,
+                    evaluation.operation,
+                    policy.id.clone(),
+                    policy.revision,
+                    PolicyPoint::ToolCallDelta,
+                    reason,
+                );
+                if let Some(mut state) = world.get_mut::<RunState>(run) {
+                    *state = RunState::Failed(error);
                 }
             }
         }
@@ -9340,7 +10534,13 @@ fn initialize_tool_result_policy_evaluations(
     >,
     runs: Query<(&RunOf, Option<&RunPolicies>, Option<&RunControl>), Without<WaitingForChildren>>,
     agents: Query<Option<&AgentPolicies>>,
-    policies: Query<(Entity, &StableId, &Policy, Option<&PolicyStatus>)>,
+    policies: Query<(
+        Entity,
+        &StableId,
+        &PolicyMeta,
+        &PolicyCapabilities,
+        Option<&PolicyStatus>,
+    )>,
     mut progress: ResMut<Progress>,
 ) {
     for (operation, operation_of, input, state) in &operations {
@@ -9357,19 +10557,19 @@ fn initialize_tool_result_policy_evaluations(
         }
         let mut ordered = policy_entities(agents.get(run_of.get()).ok().flatten(), run_policies)
             .filter_map(|entity| policies.get(entity).ok())
-            .filter(|(_, _, policy, status)| {
+            .filter(|(_, _, _, capabilities, status)| {
                 accepts_new_policy_evaluations(*status)
-                    && policy.rule.applies_to(PolicyPoint::ToolResult)
+                    && capabilities.contains(PolicyPoint::ToolResult)
             })
             .collect::<Vec<_>>();
-        ordered.sort_by(|(_, left_id, left, _), (_, right_id, right, _)| {
+        ordered.sort_by(|(_, left_id, left, _, _), (_, right_id, right, _, _)| {
             left.order
                 .cmp(&right.order)
                 .then_with(|| left_id.cmp(right_id))
         });
         let snapshot = ordered
             .into_iter()
-            .map(|(entity, id, policy, _)| AcceptedPolicy {
+            .map(|(entity, id, policy, _, _)| AcceptedPolicy {
                 id: id.clone(),
                 entity,
                 revision: policy.revision,
@@ -9457,17 +10657,17 @@ fn evaluate_tool_result_policies(world: &mut World) {
             mark_progress(&mut world.resource_mut::<Progress>());
             continue;
         };
-        let mut invocation = ToolResultPolicyInvocation {
+        let invocation = ToolResultPolicyInvocation {
             policy: policy.entity,
             evaluation: evaluation_entity,
             run,
             operation,
             input: evaluation.input,
             result: evaluation.effective,
-            decision: None,
         };
-        trigger_single_policy_responder(world, &mut invocation, policy.entity, &policy.id);
-        match invocation.decision {
+        let decision =
+            run_policy_responder(world, invocation, policy.entity, &policy.id, policy.point);
+        match decision {
             Some(ToolResultPolicyDecision::Keep) => {
                 if let Some(mut evaluation) =
                     world.get_mut::<ToolResultPolicyEvaluation>(evaluation_entity)
@@ -9511,13 +10711,20 @@ fn evaluate_tool_result_policies(world: &mut World) {
                 {
                     evaluation.phase = ToolResultPolicyEvaluationPhase::Rejected {
                         policy: policy.id.clone(),
-                        reason,
+                        reason: reason.clone(),
                     };
                 }
+                let error = policy_termination_error(
+                    world,
+                    run,
+                    operation,
+                    policy.id.clone(),
+                    policy.revision,
+                    PolicyPoint::ToolResult,
+                    reason,
+                );
                 if let Some(mut state) = world.get_mut::<RunState>(run) {
-                    *state = RunState::Failed(CanonicalError::PolicyDenied {
-                        policy: policy.id.as_str().to_owned(),
-                    });
+                    *state = RunState::Failed(error);
                 }
             }
         }
@@ -9685,18 +10892,49 @@ fn apply_policy_approval_results(world: &mut World) {
             } else {
                 evaluation.phase = TextDeltaPolicyEvaluationPhase::Rejected {
                     policy: input.policy_id.clone(),
-                    reason: rejection_reason,
+                    reason: rejection_reason.clone(),
+                };
+            }
+        }
+        if let Some(mut evaluation) =
+            world.get_mut::<ToolCallDeltaPolicyEvaluation>(evaluation_entity)
+            && matches!(
+                evaluation.phase,
+                ToolCallDeltaPolicyEvaluationPhase::WaitingApproval {
+                    operation: waiting,
+                    ..
+                } if waiting == operation
+            )
+        {
+            matched = true;
+            if approved {
+                evaluation.cursor += 1;
+                evaluation.phase = ToolCallDeltaPolicyEvaluationPhase::Evaluating;
+            } else {
+                evaluation.phase = ToolCallDeltaPolicyEvaluationPhase::Rejected {
+                    policy: input.policy_id.clone(),
+                    reason: rejection_reason.clone(),
                 };
             }
         }
 
-        if matched
-            && !approved
-            && let Some(mut state) = world.get_mut::<RunState>(run)
-        {
-            *state = RunState::Failed(CanonicalError::PolicyDenied {
-                policy: input.policy_id.as_str().to_owned(),
-            });
+        if matched && !approved {
+            let evaluated_operation = world
+                .get::<EvaluationOfOperation>(evaluation_entity)
+                .map(Relationship::get)
+                .unwrap_or(operation);
+            let error = policy_termination_error(
+                world,
+                run,
+                evaluated_operation,
+                input.policy_id.clone(),
+                input.revision,
+                input.point,
+                rejection_reason,
+            );
+            if let Some(mut state) = world.get_mut::<RunState>(run) {
+                *state = RunState::Failed(error);
+            }
         }
         world.entity_mut(operation).insert(PolicyApprovalApplied);
         mark_progress(&mut world.resource_mut::<Progress>());
@@ -10186,8 +11424,9 @@ fn commit_tool_batches(
                 mark_progress(&mut progress);
                 continue 'batches;
             }
-            let presentation_overrides_raw =
-                effective.is_some_and(|effective| effective.0.presentation != output.presentation);
+            let presentation_overrides_raw = output.presentation != output.raw
+                || effective
+                    .is_some_and(|effective| effective.0.presentation != output.presentation);
             results.push((
                 effective.map_or_else(|| output.clone(), |effective| effective.0.clone()),
                 presentation_overrides_raw,
@@ -10379,13 +11618,13 @@ mod tests {
     record_lifecycle_event!(record_run_cancelled, RunCancelled, "run-cancelled");
 
     fn inspect_request_policy(
-        mut event: On<RequestPolicyInvocation>,
+        In(event): In<RequestPolicyInvocation>,
         policies: Query<&InspectRequestPolicy>,
-    ) {
+    ) -> Option<RequestPolicyDecision> {
         let Ok(policy) = policies.get(event.policy) else {
-            return;
+            return None;
         };
-        event.decision = Some(
+        Some(
             if event.request.instructions == policy.expected_instructions {
                 RequestPolicyDecision::Patch(
                     RequestPatch::new().instructions(policy.replacement_instructions.clone()),
@@ -10393,22 +11632,49 @@ mod tests {
             } else {
                 RequestPolicyDecision::Stop("earlier rewrite was not visible".to_owned())
             },
-        );
+        )
     }
 
-    fn allow_custom_request(mut event: On<RequestPolicyInvocation>) {
-        event.decision = Some(RequestPolicyDecision::Continue);
+    fn allow_custom_request(_: In<RequestPolicyInvocation>) -> Option<RequestPolicyDecision> {
+        Some(RequestPolicyDecision::Continue)
     }
 
-    fn stop_custom_request(mut event: On<RequestPolicyInvocation>) {
-        event.decision = Some(RequestPolicyDecision::Stop("ambiguous".to_owned()));
+    fn stop_custom_request(_: In<RequestPolicyInvocation>) -> Option<RequestPolicyDecision> {
+        Some(RequestPolicyDecision::Stop("ambiguous".to_owned()))
+    }
+
+    #[derive(Component)]
+    struct MultiPointPolicy {
+        instructions: String,
+        completion: String,
+    }
+
+    fn apply_multi_point_request(
+        In(event): In<RequestPolicyInvocation>,
+        policies: Query<&MultiPointPolicy>,
+    ) -> Option<RequestPolicyDecision> {
+        policies.get(event.policy).ok().map(|policy| {
+            RequestPolicyDecision::Patch(
+                RequestPatch::new().instructions(policy.instructions.clone()),
+            )
+        })
+    }
+
+    fn apply_multi_point_completion(
+        In(event): In<CompletionResponsePolicyInvocation>,
+        policies: Query<&MultiPointPolicy>,
+    ) -> Option<CompletionResponsePolicyDecision> {
+        policies
+            .get(event.policy)
+            .ok()
+            .map(|policy| CompletionResponsePolicyDecision::RewriteText(policy.completion.clone()))
     }
 
     fn inspect_provider_diagnostics(
-        mut event: On<CompletionResponsePolicyInvocation>,
+        In(event): In<CompletionResponsePolicyInvocation>,
         diagnostics: Query<&ProviderResponseDiagnostics>,
-    ) {
-        event.decision = Some(
+    ) -> Option<CompletionResponsePolicyDecision> {
+        Some(
             if diagnostics.get(event.operation).is_ok_and(|diagnostics| {
                 diagnostics.0["provider_request_id"] == "provider-response"
             }) {
@@ -10416,89 +11682,98 @@ mod tests {
             } else {
                 CompletionResponsePolicyDecision::Stop("provider diagnostics missing".to_owned())
             },
-        );
+        )
     }
 
     fn inspect_tool_policy(
-        mut event: On<ToolCallPolicyInvocation>,
+        In(event): In<ToolCallPolicyInvocation>,
         policies: Query<&InspectToolPolicy>,
-    ) {
+    ) -> Option<ToolCallPolicyDecision> {
         let Ok(policy) = policies.get(event.policy) else {
-            return;
+            return None;
         };
-        event.decision = Some(if event.call.arguments == policy.expected_arguments {
+        Some(if event.call.arguments == policy.expected_arguments {
             ToolCallPolicyDecision::Rewrite(policy.replacement_arguments.clone())
         } else {
             ToolCallPolicyDecision::Stop("earlier argument rewrite was not visible".to_owned())
-        });
+        })
     }
 
     fn finish_tool_policy(
-        mut event: On<ToolCallPolicyInvocation>,
+        In(event): In<ToolCallPolicyInvocation>,
         policies: Query<&TerminalToolPolicy>,
-    ) {
+    ) -> Option<ToolCallPolicyDecision> {
         let Ok(policy) = policies.get(event.policy) else {
-            return;
+            return None;
         };
-        event.decision = Some(if event.call.arguments != policy.expected_arguments {
+        Some(if event.call.arguments != policy.expected_arguments {
             ToolCallPolicyDecision::Stop("earlier rewrite was not retained".to_owned())
         } else if policy.stop {
             ToolCallPolicyDecision::Stop("operator stopped dispatch".to_owned())
         } else {
             ToolCallPolicyDecision::Skip("operator skipped dispatch".to_owned())
-        });
+        })
     }
 
-    fn isolate_tool_call_policy(mut event: On<ToolCallPolicyInvocation>) {
+    fn isolate_tool_call_policy(
+        In(event): In<ToolCallPolicyInvocation>,
+    ) -> Option<ToolCallPolicyDecision> {
         let Some(value) = event.call.arguments["value"].as_i64() else {
-            event.decision = Some(ToolCallPolicyDecision::Stop(
+            return Some(ToolCallPolicyDecision::Stop(
                 "missing isolated input".to_owned(),
             ));
-            return;
         };
-        event.decision = Some(ToolCallPolicyDecision::Rewrite(
+        Some(ToolCallPolicyDecision::Rewrite(
             serde_json::json!({"value": value + 10}),
-        ));
+        ))
     }
 
-    fn stop_second_tool_call(mut event: On<ToolCallPolicyInvocation>) {
-        event.decision = Some(if event.call.call_id == "second" {
+    fn stop_second_tool_call(
+        In(event): In<ToolCallPolicyInvocation>,
+    ) -> Option<ToolCallPolicyDecision> {
+        Some(if event.call.call_id == "second" {
             ToolCallPolicyDecision::Stop("second call terminates the batch".to_owned())
         } else {
             ToolCallPolicyDecision::Run
-        });
+        })
     }
 
     fn inspect_tool_result_policy(
-        mut event: On<ToolResultPolicyInvocation>,
+        In(event): In<ToolResultPolicyInvocation>,
         policies: Query<&InspectToolResultPolicy>,
-    ) {
+    ) -> Option<ToolResultPolicyDecision> {
         let Ok(policy) = policies.get(event.policy) else {
-            return;
+            return None;
         };
-        event.decision = Some(
+        Some(
             if event.result.presentation == policy.expected_presentation {
-                ToolResultPolicyDecision::Rewrite(policy.replacement_presentation.clone())
+                ToolResultPolicyDecision::Rewrite(policy.replacement_presentation.clone().into())
             } else {
                 ToolResultPolicyDecision::Stop("earlier result rewrite was not visible".to_owned())
             },
-        );
+        )
     }
 
-    fn fail_invalid_tool(mut event: On<InvalidToolCallPolicyInvocation>) {
-        event.decision = Some(InvalidToolCallPolicyDecision::Fail);
+    fn fail_invalid_tool(
+        _: In<InvalidToolCallPolicyInvocation>,
+    ) -> Option<InvalidToolCallPolicyDecision> {
+        Some(InvalidToolCallPolicyDecision::Fail)
     }
 
-    fn skip_invalid_tool(mut event: On<InvalidToolCallPolicyInvocation>) {
-        event.decision = Some(InvalidToolCallPolicyDecision::Skip(
+    fn skip_invalid_tool(
+        _: In<InvalidToolCallPolicyInvocation>,
+    ) -> Option<InvalidToolCallPolicyDecision> {
+        Some(InvalidToolCallPolicyDecision::Skip(
             "synthetic skip".to_owned(),
-        ));
+        ))
     }
 
-    fn stop_invalid_tool(mut event: On<InvalidToolCallPolicyInvocation>) {
-        event.decision = Some(InvalidToolCallPolicyDecision::Stop(
+    fn stop_invalid_tool(
+        _: In<InvalidToolCallPolicyInvocation>,
+    ) -> Option<InvalidToolCallPolicyDecision> {
+        Some(InvalidToolCallPolicyDecision::Stop(
             "operator stopped the run".to_owned(),
-        ));
+        ))
     }
 
     fn record_finished_turn(event: On<ModelTurnFinished>, mut turns: ResMut<FinishedTurns>) {
@@ -10540,6 +11815,20 @@ mod tests {
 
     fn runtime() -> Runtime {
         Runtime::new(RuntimeConfig::default()).unwrap()
+    }
+
+    fn policy_termination<'a>(
+        runtime: &'a Runtime,
+        run: Entity,
+        expected_policy: &str,
+    ) -> &'a PolicyTermination {
+        let Some(RunState::Failed(CanonicalError::PolicyTerminated { termination })) =
+            runtime.world().get::<RunState>(run)
+        else {
+            panic!("expected policy termination");
+        };
+        assert_eq!(termination.policy_id.as_str(), expected_policy);
+        termination
     }
 
     fn runtime_with_tool() -> (Runtime, AgentHandle) {
@@ -10783,8 +12072,8 @@ mod tests {
                     provider_result_id: input.provider_result_id.clone(),
                     provider_call_id: input.provider_call_id.clone(),
                     name: input.decision.name.clone(),
-                    raw: serde_json::json!({"answer": 42}),
-                    presentation: "42".to_owned(),
+                    raw: serde_json::json!({"answer": 42}).into(),
+                    presentation: "42".into(),
                     failure: None,
                 })),
             })
@@ -11475,8 +12764,8 @@ mod tests {
                     provider_result_id: "beta-call".to_owned(),
                     provider_call_id: None,
                     name: "beta".to_owned(),
-                    raw: serde_json::json!("ok"),
-                    presentation: "ok".to_owned(),
+                    raw: serde_json::json!("ok").into(),
+                    presentation: "ok".into(),
                     failure: None,
                 })),
             })
@@ -11702,6 +12991,10 @@ mod tests {
             .world_mut()
             .query_filtered::<Entity, With<TextDeltaPolicyEvaluation>>();
         assert_eq!(evaluations.iter(runtime.world()).count(), 0);
+        let mut tool_evaluations = runtime
+            .world_mut()
+            .query_filtered::<Entity, With<ToolCallDeltaPolicyEvaluation>>();
+        assert_eq!(tool_evaluations.iter(runtime.world()).count(), 0);
     }
 
     #[test]
@@ -11779,8 +13072,8 @@ mod tests {
         assert!(matches!(
             stream.try_recv().unwrap(),
             Some(StreamItem::Finished(StreamTerminal::Failed(
-                CanonicalError::PolicyDenied { policy }
-            ))) if policy == "stream-guard"
+                CanonicalError::PolicyTerminated { termination }
+            ))) if termination.policy_id.as_str() == "stream-guard"
         ));
         assert_eq!(stream.try_recv().unwrap(), None);
         let mut evaluations = runtime
@@ -11798,6 +13091,164 @@ mod tests {
             })
             .unwrap();
         assert_eq!(accepted, ["a-pass-first", "stream-guard"]);
+    }
+
+    #[test]
+    fn tool_call_delta_policy_preserves_correlation_and_stops_before_publication() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("tool-delta-guard"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 3,
+                    rule: PolicyRule::StopToolCallDeltaContains {
+                        needle: "secret".to_owned(),
+                        reason: "unsafe tool arguments".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let (_, stream) = runtime.handle().prompt_stream(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .delta_sender()
+            .try_send(EffectDelta {
+                operation: request.operation,
+                generation: request.generation,
+                sequence: 0,
+                provider_correlation: Some("provider-call-7".to_owned()),
+                kind: EffectDeltaKind::ToolCall {
+                    id: "call-7".to_owned(),
+                    internal_call_id: "internal-7".to_owned(),
+                    content: ToolCallDeltaContent::Delta("{\"secret\":".to_owned()),
+                },
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        assert!(matches!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::Finished(StreamTerminal::Failed(
+                CanonicalError::PolicyTerminated { termination }
+            ))) if termination.policy_id.as_str() == "tool-delta-guard"
+        ));
+        assert_eq!(stream.try_recv().unwrap(), None);
+        let mut evaluations = runtime.world_mut().query::<(
+            &AcceptedToolCallDeltaPolicies,
+            &ToolCallDeltaPolicyEvaluation,
+        )>();
+        let (accepted, evaluation) = evaluations.iter(runtime.world()).next().unwrap();
+        assert_eq!(accepted.0[0].point, PolicyPoint::ToolCallDelta);
+        assert_eq!(evaluation.sequence, 0);
+        assert_eq!(
+            evaluation.provider_correlation.as_deref(),
+            Some("provider-call-7")
+        );
+        assert_eq!(evaluation.id, "call-7");
+        assert_eq!(evaluation.internal_call_id, "internal-7");
+    }
+
+    #[test]
+    fn tool_call_delta_policy_awaits_correlated_approval() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        runtime
+            .spawn_policy(
+                id("tool-delta-approval"),
+                tenant("a"),
+                Policy {
+                    order: 0,
+                    revision: 4,
+                    rule: PolicyRule::RequireApproval {
+                        point: PolicyPoint::ToolCallDelta,
+                        prompt: "approve streamed tool arguments".to_owned(),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+        let (_, stream) = runtime.handle().prompt_stream(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        runtime
+            .effects()
+            .delta_sender()
+            .try_send(EffectDelta {
+                operation: request.operation,
+                generation: request.generation,
+                sequence: 0,
+                provider_correlation: Some("provider-call-9".to_owned()),
+                kind: EffectDeltaKind::ToolCall {
+                    id: "call-9".to_owned(),
+                    internal_call_id: "internal-9".to_owned(),
+                    content: ToolCallDeltaContent::Name("lookup".to_owned()),
+                },
+            })
+            .unwrap();
+
+        runtime.run_until_stalled().unwrap();
+        assert_eq!(stream.try_recv().unwrap(), None);
+        let approval = runtime.effects().try_recv().unwrap().unwrap();
+        let approval_input = approval.policy_approval_input().unwrap();
+        assert_eq!(approval_input.point, PolicyPoint::ToolCallDelta);
+        assert_eq!(approval_input.revision, 4);
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: approval.operation,
+                generation: approval.generation,
+                result: Ok(EffectOutput::PolicyApproval(PolicyApprovalEffectOutput {
+                    approved: true,
+                    reason: Some("reviewed".to_owned()),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+
+        assert!(matches!(
+            stream.try_recv().unwrap(),
+            Some(StreamItem::ToolCallDelta {
+                sequence: 0,
+                id,
+                internal_call_id,
+                content: ToolCallDeltaContent::Name(name),
+            }) if id == "call-9" && internal_call_id == "internal-9" && name == "lookup"
+        ));
     }
 
     #[test]
@@ -12133,12 +13584,12 @@ mod tests {
         runtime.run_until_stalled().unwrap();
         assert_eq!(runtime.effects().try_recv().unwrap(), None);
         let run = runtime.resolve_run(&pending).unwrap();
-        assert_eq!(
-            runtime.world().get::<RunState>(run.entity()),
-            Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                policy: "deny-secret".to_owned(),
-            }))
-        );
+        let termination = policy_termination(&runtime, run.entity(), "deny-secret");
+        assert_eq!(termination.revision, 4);
+        assert_eq!(termination.point, PolicyPoint::Request);
+        assert_eq!(termination.reason, "prompt contains `secret`");
+        assert_eq!(termination.run_id, *pending.stable_id());
+        assert!(!termination.history.is_empty());
         let operation = runtime
             .world()
             .get::<RunOperations>(run.entity())
@@ -12146,6 +13597,7 @@ mod tests {
             .iter()
             .next()
             .unwrap();
+        assert!(termination.operation_id.as_str().starts_with("operation-"));
         assert_eq!(
             runtime.world().get::<AcceptedPolicies>(operation),
             Some(&AcceptedPolicies(vec![AcceptedPolicy {
@@ -12472,8 +13924,8 @@ mod tests {
                     provider_result_id: "beta-call".to_owned(),
                     provider_call_id: None,
                     name: "beta".to_owned(),
-                    raw: serde_json::json!("ok"),
-                    presentation: "ok".to_owned(),
+                    raw: serde_json::json!("ok").into(),
+                    presentation: "ok".into(),
                     failure: None,
                 })),
             })
@@ -12644,6 +14096,143 @@ mod tests {
     }
 
     #[test]
+    fn serialized_policy_input_materializes_typed_runtime_facts() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let policy = runtime
+            .spawn_policy(
+                id("typed-rewrite"),
+                tenant("a"),
+                Policy {
+                    order: 3,
+                    revision: 7,
+                    rule: PolicyRule::RewriteToolArguments {
+                        tool: Some("lookup".to_owned()),
+                        arguments: serde_json::json!({"query": "typed"}),
+                    },
+                },
+                agent,
+            )
+            .unwrap();
+
+        assert_eq!(
+            runtime.world().get::<PolicyCapabilities>(policy),
+            Some(&PolicyCapabilities::new([PolicyPoint::ToolCall]))
+        );
+        assert_eq!(
+            runtime.world().get::<RewriteToolArgumentsPolicy>(policy),
+            Some(&RewriteToolArgumentsPolicy {
+                tool: Some("lookup".to_owned()),
+                arguments: serde_json::json!({"query": "typed"}),
+            })
+        );
+        assert!(runtime.world().get::<RequestPatchPolicy>(policy).is_none());
+    }
+
+    #[test]
+    fn extension_owned_typed_policy_can_serve_multiple_points() {
+        let mut runtime = runtime();
+        let model = runtime
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = runtime
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let policy = runtime
+            .spawn_typed_policy(
+                id("multi-point"),
+                tenant("a"),
+                PolicyMeta {
+                    order: 2,
+                    revision: 9,
+                },
+                PolicyCapabilities::new([PolicyPoint::Request, PolicyPoint::CompletionResponse]),
+                MultiPointPolicy {
+                    instructions: "typed request".to_owned(),
+                    completion: "typed completion".to_owned(),
+                },
+                agent,
+            )
+            .unwrap();
+        runtime
+            .register_request_policy_responder(
+                policy,
+                PolicyResponderId::new("multi-point:request").unwrap(),
+                apply_multi_point_request,
+            )
+            .unwrap();
+        runtime
+            .register_completion_response_policy_responder(
+                policy,
+                PolicyResponderId::new("multi-point:completion").unwrap(),
+                apply_multi_point_completion,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.register_tool_call_policy_responder(
+                policy,
+                PolicyResponderId::new("multi-point:wrong").unwrap(),
+                isolate_tool_call_policy,
+            ),
+            Err(PolicyResponderRegistrationError::CapabilityMismatch(
+                PolicyPoint::ToolCall
+            ))
+        );
+
+        let pending = runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        let request = runtime.effects().try_recv().unwrap().unwrap();
+        assert_eq!(request.model_input().unwrap().instructions, "typed request");
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: request.operation,
+                generation: request.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "provider completion".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        runtime.run_until_stalled().unwrap();
+
+        let run = runtime.resolve_run(&pending).unwrap();
+        assert_eq!(
+            runtime.world().get::<RunState>(run.entity()),
+            Some(&RunState::Completed(RunOutput {
+                text: "typed completion".to_owned(),
+                usage: Usage::default(),
+            }))
+        );
+    }
+
+    #[test]
     fn targeted_custom_policy_observes_earlier_effective_request() {
         let mut runtime = runtime();
         let model = runtime
@@ -12693,8 +14282,14 @@ mod tests {
             .insert(InspectRequestPolicy {
                 expected_instructions: "rewritten once".to_owned(),
                 replacement_instructions: "rewritten twice".to_owned(),
-            })
-            .observe(inspect_request_policy);
+            });
+        runtime
+            .register_request_policy_responder(
+                custom,
+                PolicyResponderId::new("inspect-request").unwrap(),
+                inspect_request_policy,
+            )
+            .unwrap();
 
         runtime.handle().prompt(agent, "hello").unwrap();
         runtime.run_until_stalled().unwrap();
@@ -12740,16 +14335,11 @@ mod tests {
         runtime.run_until_stalled().unwrap();
         assert_eq!(runtime.effects().try_recv().unwrap(), None);
         let run = runtime.resolve_run(&pending).unwrap();
-        assert_eq!(
-            runtime.world().get::<RunState>(run.entity()),
-            Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                policy: "unbound".to_owned(),
-            }))
-        );
+        policy_termination(&runtime, run.entity(), "unbound");
     }
 
     #[test]
-    fn multiple_steering_responders_fail_closed_without_registration_order() {
+    fn conflicting_explicit_responder_registration_is_rejected() {
         let mut runtime = runtime();
         let model = runtime
             .spawn_model(
@@ -12779,22 +14369,26 @@ mod tests {
             )
             .unwrap();
         runtime
-            .world_mut()
-            .entity_mut(policy)
-            .observe(allow_custom_request)
-            .observe(stop_custom_request);
-        let pending = runtime.handle().prompt(agent, "hello").unwrap();
-
-        runtime.run_until_stalled().unwrap();
-
-        assert_eq!(runtime.effects().try_recv().unwrap(), None);
-        let run = runtime.resolve_run(&pending).unwrap();
+            .register_request_policy_responder(
+                policy,
+                PolicyResponderId::new("allow").unwrap(),
+                allow_custom_request,
+            )
+            .unwrap();
         assert_eq!(
-            runtime.world().get::<RunState>(run.entity()),
-            Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                policy: "ambiguous-policy".to_owned(),
-            }))
+            runtime.register_request_policy_responder(
+                policy,
+                PolicyResponderId::new("stop").unwrap(),
+                stop_custom_request,
+            ),
+            Err(PolicyResponderRegistrationError::ConflictingResponder(
+                PolicyPoint::Request
+            ))
         );
+
+        runtime.handle().prompt(agent, "hello").unwrap();
+        runtime.run_until_stalled().unwrap();
+        assert!(runtime.effects().try_recv().unwrap().is_some());
     }
 
     #[test]
@@ -12889,10 +14483,15 @@ mod tests {
                 first,
             )
             .unwrap();
-        let run_policy_observer = runtime
+        let run_policy_binding = runtime
             .world()
-            .get::<BoundPolicyObserver>(run_policy)
-            .expect("run-local policy must bind a targeted observer")
+            .get::<PolicyResponders>(run_policy)
+            .and_then(|bindings| bindings.iter().next())
+            .expect("run-local policy must bind an explicit responder");
+        let run_policy_responder = runtime
+            .world()
+            .get::<RegisteredPolicyResponder>(run_policy_binding)
+            .expect("binding must reference a registered system")
             .0;
 
         for request in model_requests {
@@ -12949,7 +14548,8 @@ mod tests {
 
         runtime.world_mut().despawn(first.entity());
         assert!(runtime.world().get_entity(run_policy).is_err());
-        assert!(runtime.world().get_entity(run_policy_observer).is_err());
+        assert!(runtime.world().get_entity(run_policy_binding).is_err());
+        assert!(runtime.world().get_entity(run_policy_responder).is_err());
     }
 
     #[test]
@@ -13186,12 +14786,9 @@ mod tests {
         runtime.run_until_stalled().unwrap();
         assert_eq!(runtime.effects().try_recv().unwrap(), None);
         let run = runtime.resolve_run(&pending).unwrap();
-        assert_eq!(
-            runtime.world().get::<RunState>(run.entity()),
-            Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                policy: "tool-approval".to_owned(),
-            }))
-        );
+        let termination = policy_termination(&runtime, run.entity(), "tool-approval");
+        assert_eq!(termination.point, PolicyPoint::ToolCall);
+        assert_eq!(termination.reason, "operator denied");
     }
 
     #[test]
@@ -13343,21 +14940,24 @@ mod tests {
             )
             .unwrap();
         runtime
-            .world_mut()
-            .entity_mut(policy)
-            .observe(inspect_provider_diagnostics);
+            .register_completion_response_policy_responder(
+                policy,
+                PolicyResponderId::new("inspect-provider").unwrap(),
+                inspect_provider_diagnostics,
+            )
+            .unwrap();
         let pending = runtime.handle().prompt(agent, "hello").unwrap();
         runtime.run_until_stalled().unwrap();
         let request = runtime.effects().try_recv().unwrap().unwrap();
         let sender = runtime.effects().completion_sender();
         sender
-            .try_send_provider_diagnostics(ProviderDiagnosticsIngress {
-                operation: request.operation,
-                generation: request.generation,
-                diagnostics: serde_json::json!({
+            .try_send_provider_diagnostics(ProviderDiagnosticsIngress::serialized(
+                request.operation,
+                request.generation,
+                serde_json::json!({
                     "provider_request_id": "provider-response"
                 }),
-            })
+            ))
             .unwrap();
         sender
             .try_send(EffectCompletion {
@@ -13434,12 +15034,7 @@ mod tests {
 
         runtime.run_until_stalled().unwrap();
         let run = runtime.resolve_run(&pending).unwrap();
-        assert_eq!(
-            runtime.world().get::<RunState>(run.entity()),
-            Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                policy: "stop-response".to_owned(),
-            }))
-        );
+        policy_termination(&runtime, run.entity(), "stop-response");
         assert!(runtime.run_committed_turns(run).is_empty());
     }
 
@@ -13479,8 +15074,14 @@ mod tests {
             .insert(InspectToolPolicy {
                 expected_arguments: serde_json::json!({"step": 1}),
                 replacement_arguments: serde_json::json!({"step": 2}),
-            })
-            .observe(inspect_tool_policy);
+            });
+        runtime
+            .register_tool_call_policy_responder(
+                second,
+                PolicyResponderId::new("inspect-tool").unwrap(),
+                inspect_tool_policy,
+            )
+            .unwrap();
 
         runtime.handle().prompt(agent, "use lookup").unwrap();
         runtime.run_until_stalled().unwrap();
@@ -13551,8 +15152,14 @@ mod tests {
                 .insert(TerminalToolPolicy {
                     expected_arguments: serde_json::json!({"rewritten": true}),
                     stop,
-                })
-                .observe(finish_tool_policy);
+                });
+            runtime
+                .register_tool_call_policy_responder(
+                    terminal,
+                    PolicyResponderId::new(format!("{terminal_id}-responder")).unwrap(),
+                    finish_tool_policy,
+                )
+                .unwrap();
 
             let pending = runtime.handle().prompt(agent, "use lookup").unwrap();
             runtime.run_until_stalled().unwrap();
@@ -13588,12 +15195,7 @@ mod tests {
 
             if stop {
                 assert_eq!(runtime.effects().try_recv().unwrap(), None);
-                assert_eq!(
-                    runtime.world().get::<RunState>(run.entity()),
-                    Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                        policy: terminal_id.to_owned(),
-                    }))
-                );
+                policy_termination(&runtime, run.entity(), terminal_id);
             } else {
                 let next_model = runtime.effects().try_recv().unwrap().unwrap();
                 let result = &next_model.model_input().unwrap().tool_results[0];
@@ -13625,9 +15227,12 @@ mod tests {
             )
             .unwrap();
         runtime
-            .world_mut()
-            .entity_mut(policy)
-            .observe(isolate_tool_call_policy);
+            .register_tool_call_policy_responder(
+                policy,
+                PolicyResponderId::new("isolated-rewrite").unwrap(),
+                isolate_tool_call_policy,
+            )
+            .unwrap();
         runtime.handle().prompt(agent, "two lookups").unwrap();
         runtime.run_until_stalled().unwrap();
         let model = runtime.effects().try_recv().unwrap().unwrap();
@@ -13692,9 +15297,12 @@ mod tests {
             )
             .unwrap();
         runtime
-            .world_mut()
-            .entity_mut(policy)
-            .observe(stop_second_tool_call);
+            .register_tool_call_policy_responder(
+                policy,
+                PolicyResponderId::new("stop-second").unwrap(),
+                stop_second_tool_call,
+            )
+            .unwrap();
         let pending = runtime.handle().prompt(agent, "two lookups").unwrap();
         runtime.run_until_stalled().unwrap();
         let model = runtime.effects().try_recv().unwrap().unwrap();
@@ -13731,12 +15339,7 @@ mod tests {
         runtime.run_until_stalled().unwrap();
         assert_eq!(runtime.effects().try_recv().unwrap(), None);
         let run = runtime.resolve_run(&pending).unwrap();
-        assert_eq!(
-            runtime.world().get::<RunState>(run.entity()),
-            Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                policy: "stop-second".to_owned(),
-            }))
-        );
+        policy_termination(&runtime, run.entity(), "stop-second");
         let mut tools = runtime
             .world_mut()
             .query_filtered::<&OperationState, With<ToolEffectInput>>();
@@ -13822,7 +15425,7 @@ mod tests {
                     revision: 1,
                     rule: PolicyRule::RewriteToolResult {
                         tool: Some("lookup".to_owned()),
-                        presentation: "redacted once".to_owned(),
+                        presentation: "redacted once".into(),
                     },
                 },
                 agent,
@@ -13846,8 +15449,14 @@ mod tests {
             .insert(InspectToolResultPolicy {
                 expected_presentation: "redacted once".to_owned(),
                 replacement_presentation: "redacted twice".to_owned(),
-            })
-            .observe(inspect_tool_result_policy);
+            });
+        runtime
+            .register_tool_result_policy_responder(
+                second,
+                PolicyResponderId::new("inspect-result").unwrap(),
+                inspect_tool_result_policy,
+            )
+            .unwrap();
         let (pending, tool) = advance_to_lookup_tool(&mut runtime, agent);
         runtime
             .effects()
@@ -13860,8 +15469,8 @@ mod tests {
                     provider_result_id: "call".to_owned(),
                     provider_call_id: None,
                     name: "lookup".to_owned(),
-                    raw: serde_json::json!({"secret": 42}),
-                    presentation: "unredacted".to_owned(),
+                    raw: serde_json::json!({"secret": 42}).into(),
+                    presentation: "unredacted".into(),
                     failure: Some(ToolEffectFailure {
                         message: "operator-only refusal detail".to_owned(),
                         retryable: Some(false),
@@ -13915,6 +15524,76 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_policy_preserves_structured_multimodal_presentation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::message::{DocumentSourceKind, Image, ImageMediaType, ToolResultContent};
+
+        let (mut runtime, agent) = runtime_with_tool();
+        runtime
+            .world_mut()
+            .insert_resource(FinalizedToolResults::default());
+        runtime
+            .world_mut()
+            .add_observer(record_finalized_tool_result);
+        let presentation = ToolOutput::content(crate::OneOrMany::many([
+            ToolResultContent::json(serde_json::json!({"status": "redacted"})),
+            ToolResultContent::Image(Image {
+                data: DocumentSourceKind::url("https://example.invalid/redacted.png"),
+                media_type: Some(ImageMediaType::PNG),
+                detail: None,
+                additional_params: None,
+            }),
+        ])?);
+        runtime.spawn_policy(
+            id("rich-result"),
+            tenant("a"),
+            Policy {
+                order: 1,
+                revision: 1,
+                rule: PolicyRule::RewriteToolResult {
+                    tool: Some("lookup".to_owned()),
+                    presentation: presentation.clone(),
+                },
+            },
+            agent,
+        )?;
+        let (_, tool) = advance_to_lookup_tool(&mut runtime, agent);
+        runtime
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: tool.operation,
+                generation: tool.generation,
+                result: Ok(EffectOutput::Tool(ToolEffectOutput {
+                    call_id: "call".to_owned(),
+                    provider_result_id: "call".to_owned(),
+                    provider_call_id: None,
+                    name: "lookup".to_owned(),
+                    raw: serde_json::json!({"secret": 42}).into(),
+                    presentation: "unredacted".into(),
+                    failure: None,
+                })),
+            })?;
+
+        runtime.run_until_stalled()?;
+        let next_model = runtime
+            .effects()
+            .try_recv()?
+            .ok_or("missing model request")?;
+        let result = &next_model
+            .model_input()
+            .ok_or("expected model effect")?
+            .tool_results[0];
+        assert_eq!(result.raw, serde_json::json!({"secret": 42}));
+        assert_eq!(result.presentation, presentation);
+        let finalized = &runtime.world().resource::<FinalizedToolResults>().0;
+        assert_eq!(finalized[0].presentation, "<typed tool output: 2 parts>");
+        assert!(!finalized[0].presentation.contains("redacted.png"));
+
+        Ok(())
+    }
+
+    #[test]
     fn stopped_tool_result_is_not_committed_or_redispatched() {
         let (mut runtime, agent) = runtime_with_tool();
         runtime
@@ -13950,8 +15629,8 @@ mod tests {
                     provider_result_id: "call".to_owned(),
                     provider_call_id: None,
                     name: "lookup".to_owned(),
-                    raw: serde_json::json!({"secret": 42}),
-                    presentation: "secret".to_owned(),
+                    raw: serde_json::json!({"secret": 42}).into(),
+                    presentation: "secret".into(),
                     failure: None,
                 })),
             })
@@ -13960,12 +15639,7 @@ mod tests {
         runtime.run_until_stalled().unwrap();
         assert_eq!(runtime.effects().try_recv().unwrap(), None);
         let run = runtime.resolve_run(&pending).unwrap();
-        assert_eq!(
-            runtime.world().get::<RunState>(run.entity()),
-            Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                policy: "stop-result".to_owned(),
-            }))
-        );
+        policy_termination(&runtime, run.entity(), "stop-result");
         assert!(
             !runtime
                 .world()
@@ -14220,8 +15894,8 @@ mod tests {
                     provider_result_id: "call-1".to_owned(),
                     provider_call_id: None,
                     name: "second".to_owned(),
-                    raw: serde_json::json!({"result": 1}),
-                    presentation: "second result".to_owned(),
+                    raw: serde_json::json!({"result": 1}).into(),
+                    presentation: "second result".into(),
                     failure: None,
                 })),
             })
@@ -14254,8 +15928,8 @@ mod tests {
                     provider_result_id: "call-0".to_owned(),
                     provider_call_id: None,
                     name: "first".to_owned(),
-                    raw: serde_json::json!({"result": 0}),
-                    presentation: "first result".to_owned(),
+                    raw: serde_json::json!({"result": 0}).into(),
+                    presentation: "first result".into(),
                     failure: None,
                 })),
             })
@@ -14271,8 +15945,8 @@ mod tests {
                     provider_result_id: "call-0".to_owned(),
                     provider_call_id: None,
                     name: "first".to_owned(),
-                    raw: serde_json::json!({"result": 0}),
-                    presentation: "first result".to_owned(),
+                    raw: serde_json::json!({"result": 0}).into(),
+                    presentation: "first result".into(),
                     failure: None,
                 },
                 ToolEffectOutput {
@@ -14280,8 +15954,8 @@ mod tests {
                     provider_result_id: "call-1".to_owned(),
                     provider_call_id: None,
                     name: "second".to_owned(),
-                    raw: serde_json::json!({"result": 1}),
-                    presentation: "second result".to_owned(),
+                    raw: serde_json::json!({"result": 1}).into(),
+                    presentation: "second result".into(),
                     failure: None,
                 },
             ]
@@ -14344,18 +16018,18 @@ mod tests {
                     provider_result_id: "call-0".to_owned(),
                     provider_call_id: None,
                     name: "first".to_owned(),
-                    raw: serde_json::json!({"result": 0}),
-                    content: "first result".to_owned(),
-                    presentation_overrides_raw: false,
+                    raw: serde_json::json!({"result": 0}).into(),
+                    content: "first result".into(),
+                    presentation_overrides_raw: true,
                 },
                 TranscriptEntry::ToolResult {
                     call_id: "call-1".to_owned(),
                     provider_result_id: "call-1".to_owned(),
                     provider_call_id: None,
                     name: "second".to_owned(),
-                    raw: serde_json::json!({"result": 1}),
-                    content: "second result".to_owned(),
-                    presentation_overrides_raw: false,
+                    raw: serde_json::json!({"result": 1}).into(),
+                    content: "second result".into(),
+                    presentation_overrides_raw: true,
                 },
                 TranscriptEntry::Assistant("done".to_owned()),
             ]
@@ -14511,6 +16185,31 @@ mod tests {
                 .unwrap()
                 .expected,
             2
+        );
+        let invalid_operation = runtime
+            .world()
+            .get::<BatchOperations>(batch)
+            .unwrap()
+            .iter()
+            .find(|operation| {
+                runtime
+                    .world()
+                    .get::<PendingInvalidToolCall>(*operation)
+                    .is_some()
+            })
+            .unwrap();
+        assert_eq!(
+            runtime
+                .world()
+                .get::<AcceptedInvalidToolCallPolicies>(invalid_operation),
+            Some(&AcceptedInvalidToolCallPolicies::default())
+        );
+        assert!(
+            runtime
+                .world()
+                .get::<OperationPolicyEvaluations>(invalid_operation)
+                .is_none(),
+            "the no-policy path must not allocate an evaluation entity"
         );
     }
 
@@ -14673,7 +16372,7 @@ mod tests {
         }
 
         type InvalidPolicyCase = (
-            fn(On<InvalidToolCallPolicyInvocation>),
+            fn(In<InvalidToolCallPolicyInvocation>) -> Option<InvalidToolCallPolicyDecision>,
             Expected,
             &'static str,
         );
@@ -14683,7 +16382,7 @@ mod tests {
             (stop_invalid_tool, Expected::Stop, "stop-invalid"),
         ];
 
-        for (observer, expected, policy_id) in cases {
+        for (responder, expected, policy_id) in cases {
             let (mut runtime, agent) = runtime_with_tool();
             let policy = runtime
                 .spawn_policy(
@@ -14697,7 +16396,13 @@ mod tests {
                     agent,
                 )
                 .unwrap();
-            runtime.world_mut().entity_mut(policy).observe(observer);
+            runtime
+                .register_invalid_tool_call_policy_responder(
+                    policy,
+                    PolicyResponderId::new(format!("{policy_id}-responder")).unwrap(),
+                    responder,
+                )
+                .unwrap();
             let pending = submit_invalid_tool_call(&mut runtime, agent, "missing");
             let run = runtime.resolve_run(&pending).unwrap();
 
@@ -14708,12 +16413,9 @@ mod tests {
                         "missing".to_owned()
                     )))
                 ),
-                Expected::Stop => assert_eq!(
-                    runtime.world().get::<RunState>(run.entity()),
-                    Some(&RunState::Failed(CanonicalError::PolicyDenied {
-                        policy: policy_id.to_owned()
-                    }))
-                ),
+                Expected::Stop => {
+                    policy_termination(&runtime, run.entity(), policy_id);
+                }
                 Expected::Skip => {
                     let next_model = runtime.effects().try_recv().unwrap().unwrap();
                     let input = next_model.model_input().unwrap();
@@ -16726,7 +18428,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_policy_observers_are_removed_with_policy_lifecycle() {
+    fn built_in_policy_responders_are_removed_with_policy_lifecycle() {
         let (mut runtime, agent) = runtime_with_tool();
         let removed_policy = runtime
             .spawn_policy(
@@ -16740,22 +18442,28 @@ mod tests {
                 agent,
             )
             .unwrap();
-        let removed_observer = runtime
+        let removed_binding = runtime
             .world()
-            .get::<BoundPolicyObserver>(removed_policy)
-            .expect("On<Add, Policy> must bind its targeted observer")
+            .get::<PolicyResponders>(removed_policy)
+            .and_then(|bindings| bindings.iter().next())
+            .expect("On<Add, Policy> must bind an explicit responder");
+        let removed_responder = runtime
+            .world()
+            .get::<RegisteredPolicyResponder>(removed_binding)
+            .unwrap()
             .0;
-        assert!(runtime.world().get::<Observer>(removed_observer).is_some());
+        assert!(runtime.world().get_entity(removed_responder).is_ok());
 
         runtime
             .world_mut()
             .entity_mut(removed_policy)
             .remove::<Policy>();
-        assert!(runtime.world().get_entity(removed_observer).is_err());
+        assert!(runtime.world().get_entity(removed_binding).is_err());
+        assert!(runtime.world().get_entity(removed_responder).is_err());
         assert!(
             runtime
                 .world()
-                .get::<BoundPolicyObserver>(removed_policy)
+                .get::<PolicyResponders>(removed_policy)
                 .is_none()
         );
 
@@ -16774,13 +18482,53 @@ mod tests {
                 agent,
             )
             .unwrap();
-        let despawned_observer = runtime
+        let despawned_binding = runtime
             .world()
-            .get::<BoundPolicyObserver>(despawned_policy)
+            .get::<PolicyResponders>(despawned_policy)
+            .and_then(|bindings| bindings.iter().next())
+            .unwrap();
+        let despawned_responder = runtime
+            .world()
+            .get::<RegisteredPolicyResponder>(despawned_binding)
             .unwrap()
             .0;
         runtime.world_mut().despawn(despawned_policy);
-        assert!(runtime.world().get_entity(despawned_observer).is_err());
+        assert!(runtime.world().get_entity(despawned_binding).is_err());
+        assert!(runtime.world().get_entity(despawned_responder).is_err());
+
+        let typed_policy = runtime
+            .spawn_typed_policy(
+                id("typed-lifecycle"),
+                tenant("a"),
+                PolicyMeta {
+                    order: 0,
+                    revision: 1,
+                },
+                PolicyCapabilities::new([PolicyPoint::Request]),
+                (),
+                agent,
+            )
+            .unwrap();
+        let typed_binding = runtime
+            .register_request_policy_responder(
+                typed_policy,
+                PolicyResponderId::new("typed-lifecycle:request").unwrap(),
+                allow_custom_request,
+            )
+            .unwrap();
+        let typed_responder = runtime
+            .world()
+            .get::<RegisteredPolicyResponder>(typed_binding)
+            .unwrap()
+            .0;
+        runtime.retire_policy(typed_policy).unwrap();
+        assert_eq!(
+            runtime.world().get::<PolicyStatus>(typed_policy),
+            Some(&PolicyStatus::Retired)
+        );
+        runtime.world_mut().despawn(typed_policy);
+        assert!(runtime.world().get_entity(typed_binding).is_err());
+        assert!(runtime.world().get_entity(typed_responder).is_err());
     }
 
     #[test]
@@ -17306,6 +19054,157 @@ mod tests {
     }
 
     #[test]
+    fn active_run_snapshot_remaps_rebound_multi_point_typed_policy() {
+        let mut source = runtime();
+        let model = source
+            .spawn_model(
+                id("model"),
+                tenant("a"),
+                ModelCapability {
+                    provider: "fake".to_owned(),
+                    model: "test".to_owned(),
+                    revision: 1,
+                    retired: false,
+                },
+            )
+            .unwrap();
+        let agent = source
+            .spawn_agent(id("agent"), tenant("a"), Agent::default(), model)
+            .unwrap();
+        let policy = source
+            .spawn_typed_policy(
+                id("typed-policy"),
+                tenant("a"),
+                PolicyMeta {
+                    order: 3,
+                    revision: 8,
+                },
+                PolicyCapabilities::new([PolicyPoint::Request, PolicyPoint::CompletionResponse]),
+                MultiPointPolicy {
+                    instructions: "before checkpoint".to_owned(),
+                    completion: "after checkpoint".to_owned(),
+                },
+                agent,
+            )
+            .unwrap();
+        source
+            .register_request_policy_responder(
+                policy,
+                PolicyResponderId::new("typed-policy:request").unwrap(),
+                apply_multi_point_request,
+            )
+            .unwrap();
+        source
+            .register_completion_response_policy_responder(
+                policy,
+                PolicyResponderId::new("typed-policy:completion").unwrap(),
+                apply_multi_point_completion,
+            )
+            .unwrap();
+        let domain = source.snapshot().unwrap();
+
+        let pending = source
+            .handle()
+            .prompt(agent, "checkpoint typed policy")
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        let original_model = source.effects().try_recv().unwrap().unwrap();
+        assert_eq!(
+            original_model.model_input().unwrap().instructions,
+            "before checkpoint"
+        );
+        let run = source.resolve_run(&pending).unwrap();
+        source
+            .handle()
+            .pause_with_mode(run, PauseMode::CancelAndSuspend)
+            .unwrap();
+        source.run_until_stalled().unwrap();
+        assert_eq!(
+            source.effects().try_recv_cancellation().unwrap(),
+            Some(EffectCancellation {
+                operation: original_model.operation,
+                generation: original_model.generation,
+            })
+        );
+        let snapshot = source.snapshot_active_run(run).unwrap();
+
+        let mut restored = runtime();
+        let restored_domain = restored.restore(domain).unwrap();
+        let restored_agent = AgentHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: restored_domain.0[&id("agent")],
+        };
+        let restored_policy = restored
+            .spawn_typed_policy(
+                id("typed-policy"),
+                tenant("a"),
+                PolicyMeta {
+                    order: 3,
+                    revision: 8,
+                },
+                PolicyCapabilities::new([PolicyPoint::Request, PolicyPoint::CompletionResponse]),
+                MultiPointPolicy {
+                    instructions: "before checkpoint".to_owned(),
+                    completion: "after checkpoint".to_owned(),
+                },
+                restored_agent,
+            )
+            .unwrap();
+        restored
+            .register_request_policy_responder(
+                restored_policy,
+                PolicyResponderId::new("typed-policy:request").unwrap(),
+                apply_multi_point_request,
+            )
+            .unwrap();
+        restored
+            .register_completion_response_policy_responder(
+                restored_policy,
+                PolicyResponderId::new("typed-policy:completion").unwrap(),
+                apply_multi_point_completion,
+            )
+            .unwrap();
+
+        let restored_runs = restored.restore_active_run(snapshot).unwrap();
+        let restored_run = RunHandle {
+            runtime_id: restored.handle.runtime_id,
+            entity: restored_runs.0[pending.stable_id()],
+        };
+        restored.handle().resume(restored_run).unwrap();
+        restored.run_until_stalled().unwrap();
+        let resumed_model = restored.effects().try_recv().unwrap().unwrap();
+        assert!(resumed_model.generation > original_model.generation);
+        assert_eq!(
+            restored.accepted_policies(resumed_model.operation).unwrap(),
+            vec![AcceptedPolicyDebug {
+                id: id("typed-policy"),
+                revision: 8,
+                order: 3,
+                point: PolicyPoint::Request,
+            }]
+        );
+        restored
+            .effects()
+            .completion_sender()
+            .try_send(EffectCompletion {
+                operation: resumed_model.operation,
+                generation: resumed_model.generation,
+                result: Ok(EffectOutput::Model(ModelEffectOutput {
+                    assistant_message: None,
+                    text: "provider text".to_owned(),
+                    usage: Usage::default(),
+                    tool_calls: Vec::new(),
+                })),
+            })
+            .unwrap();
+        restored.run_until_stalled().unwrap();
+        assert!(matches!(
+            restored.observe_run(restored_run).unwrap(),
+            Some(RunState::Completed(RunOutput { text, .. })) if text == "after checkpoint"
+        ));
+    }
+
+    #[test]
     fn active_run_snapshot_restores_waiting_tool_effect() {
         let (mut source, agent) = runtime_with_tool();
         let domain = source.snapshot().unwrap();
@@ -17352,8 +19251,8 @@ mod tests {
                     provider_result_id: input.provider_result_id.clone(),
                     provider_call_id: input.provider_call_id.clone(),
                     name: input.decision.name.clone(),
-                    raw: serde_json::json!({"answer": 42}),
-                    presentation: "42".to_owned(),
+                    raw: serde_json::json!({"answer": 42}).into(),
+                    presentation: "42".into(),
                     failure: None,
                 })),
             })
@@ -17477,7 +19376,7 @@ mod tests {
             &serde_json::to_string(&source.snapshot_active_run(run).unwrap()).unwrap(),
         )
         .unwrap();
-        assert_eq!(snapshot.version, 4);
+        assert_eq!(snapshot.version, 5);
         assert_eq!(snapshot.run_policies.len(), 2);
         assert_eq!(snapshot.run_policies[0].id, id("run-rewrite"));
         assert_eq!(snapshot.run_policies[0].run_id, *pending.stable_id());
@@ -17646,11 +19545,11 @@ mod tests {
         source.run_until_stalled().unwrap();
         let completion_sender = source.effects().completion_sender();
         completion_sender
-            .try_send_provider_diagnostics(ProviderDiagnosticsIngress {
-                operation: request.operation,
-                generation: request.generation,
-                diagnostics: serde_json::json!({"provider_request_id": "response-7"}),
-            })
+            .try_send_provider_diagnostics(ProviderDiagnosticsIngress::serialized(
+                request.operation,
+                request.generation,
+                serde_json::json!({"provider_request_id": "response-7"}),
+            ))
             .unwrap();
         completion_sender
             .try_send(EffectCompletion {
@@ -17759,8 +19658,8 @@ mod tests {
                     provider_result_id: input.provider_result_id.clone(),
                     provider_call_id: input.provider_call_id.clone(),
                     name: input.decision.name.clone(),
-                    raw: serde_json::json!({"answer": 42}),
-                    presentation: "42".to_owned(),
+                    raw: serde_json::json!({"answer": 42}).into(),
+                    presentation: "42".into(),
                     failure: None,
                 })),
             })

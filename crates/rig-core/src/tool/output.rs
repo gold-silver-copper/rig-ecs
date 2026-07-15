@@ -2,7 +2,7 @@
 
 use std::any::Any;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{OneOrMany, message::ToolResultContent, tool::ToolExecutionError};
 
@@ -15,10 +15,16 @@ use crate::{OneOrMany, message::ToolResultContent, tool::ToolExecutionError};
 /// [`serde_json::Value`], including a JSON string, stays JSON. Multimodal tools
 /// opt in explicitly with [`Self::content`]. Rig never reparses text as JSON to
 /// guess whether it represents rich content.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(transparent)]
 pub struct ToolOutput {
     content: OneOrMany<ToolResultContent>,
 }
+
+// Canonical tool content contains no floating-point values with non-reflexive
+// equality. Keeping `Eq` here lets durable ECS state retain its stronger
+// equality contract while carrying typed multimodal content.
+impl Eq for ToolOutput {}
 
 impl ToolOutput {
     /// Construct literal text output.
@@ -51,7 +57,17 @@ impl ToolOutput {
         }
 
         match self.content.first_ref() {
-            ToolResultContent::Text(text) if text.additional_params.is_none() => Some(&text.text),
+            ToolResultContent::Text(text)
+                if text
+                    .additional_params
+                    .as_ref()
+                    .is_none_or(serde_json::Value::is_null)
+                    || text.additional_params.as_ref().is_some_and(|value| {
+                        value.as_object().is_some_and(serde_json::Map::is_empty)
+                    }) =>
+            {
+                Some(&text.text)
+            }
             ToolResultContent::Text(_)
             | ToolResultContent::Image(_)
             | ToolResultContent::Json { .. } => None,
@@ -93,6 +109,50 @@ impl ToolOutput {
             serde_json::to_string(&self.content)
                 .unwrap_or_else(|_| "<structured tool output>".to_string())
         }
+    }
+
+    /// Returns whether the stable rendered form contains `needle`.
+    pub fn contains(&self, needle: &str) -> bool {
+        self.render().contains(needle)
+    }
+
+    /// Render content-safe telemetry text without embedding structured or
+    /// binary payloads in spans and lifecycle events.
+    pub fn telemetry_summary(&self) -> String {
+        self.as_text().map_or_else(
+            || format!("<typed tool output: {} parts>", self.content.len()),
+            str::to_owned,
+        )
+    }
+}
+
+impl std::fmt::Display for ToolOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render())
+    }
+}
+
+impl PartialEq<str> for ToolOutput {
+    fn eq(&self, other: &str) -> bool {
+        self.as_text() == Some(other)
+    }
+}
+
+impl PartialEq<&str> for ToolOutput {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl PartialEq<String> for ToolOutput {
+    fn eq(&self, other: &String) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<serde_json::Value> for ToolOutput {
+    fn eq(&self, other: &serde_json::Value) -> bool {
+        self.as_json() == Some(other)
     }
 }
 
@@ -157,6 +217,9 @@ where
         if let Some(content) = value.downcast_ref::<OneOrMany<ToolResultContent>>() {
             return Ok(ToolOutput::content(content.clone()));
         }
+        if let Some(output) = value.downcast_ref::<ToolOutput>() {
+            return Ok(output.clone());
+        }
         let is_explicit_json = value.is::<serde_json::Value>();
 
         serde_json::to_value(self)
@@ -168,12 +231,6 @@ where
                 ToolExecutionError::other(format!("failed to serialize tool output: {error}"))
                     .with_source(error)
             })
-    }
-}
-
-impl IntoToolOutput for ToolOutput {
-    fn into_tool_output(self) -> Result<ToolOutput, ToolExecutionError> {
-        Ok(self)
     }
 }
 

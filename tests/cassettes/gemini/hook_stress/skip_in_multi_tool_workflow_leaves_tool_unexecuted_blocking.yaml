@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":14,"y":6},"name":"add"},"thoughtSignature":"signature_REDACTED_1"},{"functionCall":{"args":{"x":40,"y":9},"name":"subtract"}}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":38,"promptTokenCount":181,"promptTokensDetails":[{"modality":"TEXT","tokenCount":181}],"serviceTier":"standard","thoughtsTokenCount":54,"totalTokenCount":273}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":14,"y":6},"name":"add"},"thoughtSignature":"signature_REDACTED_1"},{"functionCall":{"args":{"x":40,"y":9},"name":"subtract"}}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":38,"promptTokenCount":181,"promptTokensDetails":[{"modality":"TEXT","tokenCount":181}],"serviceTier":"standard","thoughtsTokenCount":53,"totalTokenCount":272}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The `add` tool successfully computed 14 + 6 = 20. The `subtract` tool is offline, so I cannot compute 40 - 9."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":37,"promptTokenCount":256,"promptTokensDetails":[{"modality":"TEXT","tokenCount":256}],"serviceTier":"standard","totalTokenCount":293}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"14 + 6 = 20. The subtract tool is offline, so I cannot compute 40 - 9.","thoughtSignature":"signature_REDACTED_2"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":27,"promptTokenCount":256,"promptTokensDetails":[{"modality":"TEXT","tokenCount":256}],"serviceTier":"standard","thoughtsTokenCount":56,"totalTokenCount":339}}'

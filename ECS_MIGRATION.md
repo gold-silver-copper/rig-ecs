@@ -670,6 +670,7 @@ The table below is the audit map for the pre-ECS runtime. Test names refer to
 | --- | --- | --- | --- | --- |
 | blocking prompt loop | run/model-operation entities progressed by `RigSchedule` | `AgentFacade::prompt`, `RuntimeHandle::prompt` | `model_effect_round_trip_uses_world_resident_schedule` | `agent` |
 | streaming prompt loop | ordered `EffectIngressMessage` deltas plus run subscription entities | `prompt_stream`, `RunStream` | streaming sequence, parity, slow-consumer, and adapter suites | `agent_stream_chat` |
+| streamed tool-call steering | durable ordered delta evaluations retaining sequence and provider/Rig correlation | `ToolCallDeltaStopPolicyBundle`, `ToolCallDeltaPolicyInvocation` | tool-call delta stop/no-policy fast-path tests | `agent_stream_chat` |
 | completion-call hook | durable request-policy evaluation entity and targeted invocation event | `RequestPatchPolicyBundle`, `RequestPolicyInvocation` | request patch/order/non-sticky tests | `request_hook` |
 | completion-response hook | response-policy evaluation before model commit | `CompletionResponsePolicyInvocation` | completion rewrite/stop tests | `request_hook` observes the corresponding applied boundary |
 | model-turn-finished hook | observe-only targeted entity event | `ModelTurnFinished` | `completion_response_policy_runs_before_commit_and_emits_turn_event` | `agent_with_tools_otel` |
@@ -686,7 +687,7 @@ The table below is the audit map for the pre-ECS runtime. Test names refer to
 | active `AgentRun` serialization | stable-ID `ActiveRunSnapshot` | `snapshot_active_run`, `restore_active_run` | every waiting-phase restoration test | `agent_with_durable_approval` |
 | child-agent delegation | `ParentRun`/`ChildRuns`, `WaitingForChildren`, explicit ordinal | `spawn_agent`, `spawn_child_run` | deterministic result and cancellation tests | `agent_with_agent_tool` |
 | telemetry hooks | observe-only entity events and optional typed counters | `LifecycleTelemetryBundle` | lifecycle event ordering and telemetry tests | `agent_with_tools_otel` |
-| provider diagnostics | canonical effect outcome plus immutable `ProviderResponseDiagnostics` on the model operation | `CompletionModelAdapter::execute_with_diagnostics` and generation-validated diagnostics ingress | response-policy query, facade retention, streaming ingress, and snapshot tests | provider examples |
+| provider diagnostics | canonical effect outcome plus immutable serialized and concrete typed response components on the model operation | `TypedProviderResponseDiagnostics<M::Response>`, `ProviderResponseDiagnostics`, and generation-validated ingress | typed facade query, response-policy query, streaming ingress, and snapshot tests | provider examples |
 | WASM | identical ECS state with target-specific effect transport only | normal Rust bounds | WASM compile gate | browser-capable core consumers |
 
 ## Hook-to-ECS migration guide
@@ -706,6 +707,7 @@ earlier policy. Observer registration order has no semantic role.
 | tool call | `ToolCallPolicyInvocation` | `ToolCallPrepared`, `ToolExecutionStarted` |
 | tool result | `ToolResultPolicyInvocation` | `ToolExecutionSettled`, `ToolResultPresentationFinalized` |
 | stream text delta | `TextDeltaPolicyInvocation` | `TextDeltaObserved`, `StreamResponseFinished` |
+| stream tool-call delta | `ToolCallDeltaPolicyInvocation` | `ToolCallDeltaObserved`, `StreamResponseFinished` |
 
 `RequestPatch` is operation-local. The evaluation retains the baseline request,
 the reduced `accumulated` patch, and the current effective request separately.
@@ -713,6 +715,13 @@ Context appends, provider parameters shallow-merge, active tools intersect, and
 scalar/history fields use last-writer-wins. Repeated last-writer fields emit a
 structured warning containing the field and later policy ID. The next turn is
 always rebuilt from agent/run state, never from the prior patched input.
+
+Every fail-closed responder, explicit stop, and rejected approval terminates
+with `CanonicalError::PolicyTerminated`. Its `PolicyTermination` retains the
+accepted stable policy ID and revision, lifecycle point, exact reason, stable
+run and operation IDs, and the complete transcript at the decision boundary.
+The high-level facade preserves that record while translating the outcome into
+the ordinary prompt-cancellation surface.
 
 Asynchronous policy behavior creates a `PolicyApproval` operation related to
 the evaluation. The evaluation remains at its cursor while the owned request is
@@ -800,7 +809,7 @@ scheduling-shard boundary for distinct trust domains.
 
 ## Active-run snapshot format
 
-`ActiveRunSnapshot` format version 4 contains only stable domain IDs plus opaque
+`ActiveRunSnapshot` format version 5 contains only stable domain IDs plus opaque
 snapshot-local references. It records:
 
 - root and descendant runs, parent identity, child ordinal, and committed-child status;

@@ -126,8 +126,8 @@ pub fn complete_tool(runtime: &Runtime, request: &EffectRequest, presentation: &
                 provider_result_id: input.provider_result_id.clone(),
                 provider_call_id: input.provider_call_id.clone(),
                 name: input.decision.name.clone(),
-                raw: serde_json::json!({"value": 42}),
-                presentation: presentation.to_owned(),
+                raw: serde_json::json!({"value": 42}).into(),
+                presentation: presentation.into(),
                 failure: None,
             })),
         })?;

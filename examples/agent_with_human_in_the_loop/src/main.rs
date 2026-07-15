@@ -11,15 +11,12 @@ mod ecs_demo;
 use std::io::Write;
 
 use anyhow::{Context, Result};
-use rig::bevy_ecs::{
-    observer::On,
-    prelude::{Component, Query},
-};
+use rig::bevy_ecs::prelude::{Component, In, Query};
 use rig::runtime::{
     EffectCompletion, EffectOutput, ModelEffectOutput, ModelToolCall, Policy,
-    PolicyApprovalEffectOutput, PolicyPoint, PolicyRule, RunState, ToolCallPolicyDecision,
-    ToolCallPolicyEvaluation, ToolCallPolicyEvaluationPhase, ToolCallPolicyInvocation,
-    ToolCapability, ToolEffectInput, ToolGrant, Usage,
+    PolicyApprovalEffectOutput, PolicyPoint, PolicyResponderId, PolicyRule, RunState,
+    ToolCallPolicyDecision, ToolCallPolicyEvaluation, ToolCallPolicyEvaluationPhase,
+    ToolCallPolicyInvocation, ToolCapability, ToolEffectInput, ToolGrant, Usage,
 };
 
 const SEND_EMAIL: &str = "send_email";
@@ -34,10 +31,10 @@ enum ReviewerDecision {
 }
 
 fn apply_reviewer_decision(
-    mut event: On<ToolCallPolicyInvocation>,
+    In(event): In<ToolCallPolicyInvocation>,
     decisions: Query<&ReviewerDecision>,
-) {
-    event.decision = Some(match decisions.get(event.policy) {
+) -> Option<ToolCallPolicyDecision> {
+    Some(match decisions.get(event.policy) {
         Ok(ReviewerDecision::Run) => ToolCallPolicyDecision::Run,
         Ok(ReviewerDecision::Rewrite(arguments)) => {
             ToolCallPolicyDecision::Rewrite(arguments.clone())
@@ -47,7 +44,7 @@ fn apply_reviewer_decision(
         Err(_) => ToolCallPolicyDecision::Stop(
             "reviewer decision was missing; refusing to execute".to_owned(),
         ),
-    });
+    })
 }
 
 fn ask(prompt: &str) -> Option<String> {
@@ -214,10 +211,11 @@ fn main() -> Result<()> {
         },
         agent,
     )?;
-    runtime
-        .world_mut()
-        .entity_mut(decision_policy)
-        .observe(apply_reviewer_decision);
+    runtime.register_tool_call_policy_responder(
+        decision_policy,
+        PolicyResponderId::new("apply-human-decision")?,
+        apply_reviewer_decision,
+    )?;
 
     let pending = runtime.handle().prompt(
         agent,

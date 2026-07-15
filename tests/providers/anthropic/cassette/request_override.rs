@@ -8,13 +8,13 @@ use std::sync::{
 use rig::{
     bevy_ecs::{
         observer::{Observer, On},
-        prelude::Commands,
+        prelude::{Commands, In},
     },
     client::CompletionClient,
     providers::anthropic,
     runtime::{
-        CompletionRequestPrepared, ModelToolChoice, PolicyPoint, PolicyRule, PolicyStatus,
-        RequestPatch, RequestPolicyDecision, RequestPolicyInvocation,
+        CompletionRequestPrepared, ModelToolChoice, PolicyPoint, PolicyResponderId, PolicyRule,
+        PolicyStatus, RequestPatch, RequestPolicyDecision, RequestPolicyInvocation,
     },
     streaming::StreamingPrompt,
     tool::Tool,
@@ -85,12 +85,12 @@ impl Tool for GetTime {
     }
 }
 
-fn patch_first_turn(mut event: On<RequestPolicyInvocation>) {
-    event.decision = Some(RequestPolicyDecision::Patch(
+fn patch_first_turn(In(_event): In<RequestPolicyInvocation>) -> Option<RequestPolicyDecision> {
+    Some(RequestPolicyDecision::Patch(
         RequestPatch::new()
             .active_tools([GetWeather::NAME])
             .tool_choice(ModelToolChoice::Required),
-    ));
+    ))
 }
 
 #[derive(Deserialize)]
@@ -134,9 +134,12 @@ async fn run(client: anthropic::Client, streaming: bool, weather: GetWeather) {
     agent
         .with_runtime_mut(|runtime| {
             runtime
-                .world_mut()
-                .entity_mut(policy)
-                .observe(patch_first_turn);
+                .register_request_policy_responder(
+                    policy,
+                    PolicyResponderId::new("first-turn-weather").unwrap(),
+                    patch_first_turn,
+                )
+                .expect("request responder should register");
             runtime.world_mut().spawn(Observer::new(
                 move |_event: On<CompletionRequestPrepared>, mut commands: Commands| {
                     commands.entity(policy).insert(PolicyStatus::Retired);

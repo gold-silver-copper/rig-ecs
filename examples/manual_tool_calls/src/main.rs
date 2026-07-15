@@ -103,8 +103,8 @@ fn execute(input: &ToolEffectInput) -> Result<ToolEffectOutput> {
         provider_result_id: input.provider_result_id.clone(),
         provider_call_id: input.provider_call_id.clone(),
         name: input.decision.name.clone(),
-        raw: serde_json::json!(value),
-        presentation: value.to_string(),
+        raw: serde_json::json!(value).into(),
+        presentation: value.to_string().into(),
         failure: None,
     })
 }

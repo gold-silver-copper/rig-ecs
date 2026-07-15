@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The word ''lantern'' was echoed back."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":9,"promptTokenCount":90,"promptTokensDetails":[{"modality":"TEXT","tokenCount":90}],"serviceTier":"standard","totalTokenCount":99}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"I echoed the word ''lantern'' back to you. The result of the echo operation was ''modern:lantern''."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":23,"promptTokenCount":90,"promptTokensDetails":[{"modality":"TEXT","tokenCount":90}],"serviceTier":"standard","totalTokenCount":113}}'

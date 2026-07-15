@@ -11,11 +11,11 @@ mod ecs_demo;
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use rig::bevy_ecs::{observer::On, prelude::Component};
+use rig::bevy_ecs::prelude::{Component, In};
 use rig::runtime::{
     EffectCompletion, EffectOutput, ModelEffectOutput, ModelToolCall, Policy, PolicyPoint,
-    PolicyRule, RunState, ToolCallPolicyDecision, ToolCallPolicyInvocation, ToolCapability,
-    ToolGrant, Usage,
+    PolicyResponderId, PolicyRule, RunState, ToolCallPolicyDecision, ToolCallPolicyInvocation,
+    ToolCapability, ToolGrant, Usage,
 };
 
 const SEARCH_WEB: &str = "search_web";
@@ -28,14 +28,14 @@ struct ApprovalRules {
 }
 
 fn enforce_approval_rules(
-    mut event: On<ToolCallPolicyInvocation>,
+    In(event): In<ToolCallPolicyInvocation>,
     rules: rig::bevy_ecs::prelude::Query<&ApprovalRules>,
-) {
+) -> Option<ToolCallPolicyDecision> {
     let Ok(rules) = rules.get(event.policy) else {
-        return;
+        return None;
     };
     let name = event.call.decision.name.as_str();
-    event.decision = Some(if rules.auto_approve.contains(name) {
+    Some(if rules.auto_approve.contains(name) {
         ToolCallPolicyDecision::Run
     } else if name == TRANSFER_FUNDS {
         match event
@@ -57,7 +57,7 @@ fn enforce_approval_rules(
         ToolCallPolicyDecision::Skip(format!(
             "denied by policy: `{name}` is not on the approved tool list"
         ))
-    });
+    })
 }
 
 fn install_tool(
@@ -112,8 +112,12 @@ fn main() -> Result<()> {
         .insert(ApprovalRules {
             auto_approve: BTreeSet::from([SEARCH_WEB.to_owned()]),
             max_auto_transfer: 1_000,
-        })
-        .observe(enforce_approval_rules);
+        });
+    runtime.register_tool_call_policy_responder(
+        policy,
+        PolicyResponderId::new("approval-rules")?,
+        enforce_approval_rules,
+    )?;
 
     let pending = runtime
         .handle()

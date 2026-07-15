@@ -17,7 +17,7 @@ then:
   header:
   - name: content-type
     value: text/event-stream
-  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"x\":10,\"y\":4},\"name\":\"subtract\"},\"thoughtSignature\":\"signature_REDACTED_1\"}],\"role\":\"model\"},\"finishMessage\":\"Model generated function call(s).\",\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_1\",\"usageMetadata\":{\"candidatesTokenCount\":19,\"promptTokenCount\":244,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":244}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":108,\"totalTokenCount\":371}}\r\n\r\n"
+  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"x\":10,\"y\":4},\"name\":\"subtract\"},\"thoughtSignature\":\"signature_REDACTED_1\"}],\"role\":\"model\"},\"finishMessage\":\"Model generated function call(s).\",\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_1\",\"usageMetadata\":{\"candidatesTokenCount\":19,\"promptTokenCount\":244,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":244}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":135,\"totalTokenCount\":398}}\r\n\r\n"
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:streamGenerateContent
@@ -38,7 +38,7 @@ then:
   header:
   - name: content-type
     value: text/event-stream
-  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"x\":3,\"y\":5},\"name\":\"add\"},\"thoughtSignature\":\"signature_REDACTED_2\"}],\"role\":\"model\"},\"finishMessage\":\"Model generated function call(s).\",\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_2\",\"usageMetadata\":{\"candidatesTokenCount\":18,\"promptTokenCount\":384,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":384}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":24,\"totalTokenCount\":426}}\r\n\r\n"
+  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"x\":3,\"y\":5},\"name\":\"add\"},\"thoughtSignature\":\"signature_REDACTED_2\"}],\"role\":\"model\"},\"finishMessage\":\"Model generated function call(s).\",\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_2\",\"usageMetadata\":{\"candidatesTokenCount\":18,\"promptTokenCount\":411,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":411}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":26,\"totalTokenCount\":455}}\r\n\r\n"
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:streamGenerateContent
@@ -59,7 +59,7 @@ then:
   header:
   - name: content-type
     value: text/event-stream
-  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"x\":6,\"y\":8},\"name\":\"multiply\"},\"thoughtSignature\":\"signature_REDACTED_3\"}],\"role\":\"model\"},\"finishMessage\":\"Model generated function call(s).\",\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_3\",\"usageMetadata\":{\"candidatesTokenCount\":18,\"promptTokenCount\":439,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":439}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":32,\"totalTokenCount\":489}}\r\n\r\n"
+  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"x\":6,\"y\":8},\"name\":\"multiply\"},\"thoughtSignature\":\"signature_REDACTED_3\"}],\"role\":\"model\"},\"finishMessage\":\"Model generated function call(s).\",\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_3\",\"usageMetadata\":{\"candidatesTokenCount\":18,\"promptTokenCount\":468,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":468}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":35,\"totalTokenCount\":521}}\r\n\r\n"
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:streamGenerateContent
@@ -80,7 +80,7 @@ then:
   header:
   - name: content-type
     value: text/event-stream
-  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"x\":48,\"y\":3},\"name\":\"divide\"},\"thoughtSignature\":\"signature_REDACTED_4\"}],\"role\":\"model\"},\"finishMessage\":\"Model generated function call(s).\",\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_4\",\"usageMetadata\":{\"candidatesTokenCount\":19,\"promptTokenCount\":503,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":503}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":42,\"totalTokenCount\":564}}\r\n\r\n"
+  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"args\":{\"x\":48,\"y\":3},\"name\":\"divide\"},\"thoughtSignature\":\"signature_REDACTED_4\"}],\"role\":\"model\"},\"finishMessage\":\"Model generated function call(s).\",\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_4\",\"usageMetadata\":{\"candidatesTokenCount\":19,\"promptTokenCount\":535,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":535}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":37,\"totalTokenCount\":591}}\r\n\r\n"
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:streamGenerateContent
@@ -101,4 +101,4 @@ then:
   header:
   - name: content-type
     value: text/event-stream
-  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"The calculation of ((10 - 4) * (3 + 5)) / 3 yields a result of 16. This value is obtained by first performing the subtractions and additions within the parentheses\",\"thoughtSignature\":\"signature_REDACTED_5\"}],\"role\":\"model\"},\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_5\",\"usageMetadata\":{\"candidatesTokenCount\":43,\"promptTokenCount\":578,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":578}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":23,\"totalTokenCount\":644}}\r\n\r\ndata: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\", then multiplying those results, and finally dividing by 3.\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_5\",\"usageMetadata\":{\"candidatesTokenCount\":56,\"promptTokenCount\":578,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":578}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":23,\"totalTokenCount\":657}}\r\n\r\n"
+  body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"The calculation of ((10 - 4) * (3 + 5)) / 3 yields a final result of 16.\",\"thoughtSignature\":\"signature_REDACTED_5\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"modelVersion\":\"gemini-2.5-flash\",\"responseId\":\"id_REDACTED_5\",\"usageMetadata\":{\"candidatesTokenCount\":29,\"promptTokenCount\":605,\"promptTokensDetails\":[{\"modality\":\"TEXT\",\"tokenCount\":605}],\"serviceTier\":\"standard\",\"thoughtsTokenCount\":28,\"totalTokenCount\":662}}\r\n\r\n"

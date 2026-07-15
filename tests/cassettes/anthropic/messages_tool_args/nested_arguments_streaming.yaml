@@ -29,7 +29,7 @@ then:
     data: {"delta":{"text":"I'll book that","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" trip to Kyoto right away!","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" trip to Kyoto right now!","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":0,"type":"content_block_stop"}
@@ -41,52 +41,58 @@ then:
     data: {"delta":{"partial_json":"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"{\"i","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"{\"iti","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"tinerar","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"nerary\": {\"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"y\": {\"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"city\":\"Ky","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"city\":\"Kyot","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"oto","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"o\",\"days","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"\",\"da","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"\":3,\"act","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"ys\":3,\"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"ivities\":[\"t","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"activi","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"emples\"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"ties\":","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":",\"tea","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"[\"te","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":" ceremon","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"mples\",\"tea ","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"y\"],\"lodgi","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"cere","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"ng\":","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"mony\"],\"lodg","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"{\"name\":","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"ing\":{\"name\"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"\"Sakura ","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":":\"Saku","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"Inn\",\"room","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"ra I","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"s\":2}}}","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"nn","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+
+    event: content_block_delta
+    data: {"delta":{"partial_json":"\",\"ro","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+
+    event: content_block_delta
+    data: {"delta":{"partial_json":"oms\":2}}}","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":1,"type":"content_block_stop"}

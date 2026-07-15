@@ -15,7 +15,7 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{},"name":"fetch_motto"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":11,"promptTokenCount":61,"promptTokensDetails":[{"modality":"TEXT","tokenCount":61}],"serviceTier":"standard","thoughtsTokenCount":32,"totalTokenCount":104}}'
+  body: '{"candidates":[{"content":{"parts":[{"functionCall":{"args":{},"name":"fetch_motto"},"thoughtSignature":"signature_REDACTED_1"}],"role":"model"},"finishMessage":"Model generated function call(s).","finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_1","usageMetadata":{"candidatesTokenCount":11,"promptTokenCount":61,"promptTokensDetails":[{"modality":"TEXT","tokenCount":61}],"serviceTier":"standard","thoughtsTokenCount":31,"totalTokenCount":103}}'
 ---
 when:
   path: /v1beta/models/gemini-2.5-flash:generateContent
@@ -34,4 +34,4 @@ then:
   header:
   - name: content-type
     value: application/json; charset=UTF-8
-  body: '{"candidates":[{"content":{"parts":[{"text":"The exact tool result is `{\"fetch_motto_response\": {\"result\": \"steady\"}}`."}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":21,"promptTokenCount":88,"promptTokensDetails":[{"modality":"TEXT","tokenCount":88}],"serviceTier":"standard","totalTokenCount":109}}'
+  body: '{"candidates":[{"content":{"parts":[{"text":"The tool returned: `{\"fetch_motto_response\": {\"result\": \"steady\"}}`"}],"role":"model"},"finishReason":"STOP","index":0}],"modelVersion":"gemini-2.5-flash","responseId":"id_REDACTED_2","usageMetadata":{"candidatesTokenCount":20,"promptTokenCount":88,"promptTokensDetails":[{"modality":"TEXT","tokenCount":88}],"serviceTier":"standard","totalTokenCount":108}}'

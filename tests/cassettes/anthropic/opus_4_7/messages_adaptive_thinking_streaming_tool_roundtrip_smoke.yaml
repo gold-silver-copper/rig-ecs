@@ -38,22 +38,16 @@ then:
     data: {"delta":{"partial_json":"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"{\"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"{\"city\": ","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"partial_json":"city","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
-
-    event: content_block_delta
-    data: {"delta":{"partial_json":"\": \"","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
-
-    event: content_block_delta
-    data: {"delta":{"partial_json":"Tokyo\"}","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
+    data: {"delta":{"partial_json":"\"Tokyo\"}","type":"input_json_delta"},"index":1,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":1,"type":"content_block_stop"}
 
     event: message_delta
-    data: {"delta":{"stop_details":null,"stop_reason":"tool_use","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":913,"output_tokens":100,"output_tokens_details":{"thinking_tokens":30}}}
+    data: {"delta":{"stop_details":null,"stop_reason":"tool_use","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":913,"output_tokens":106,"output_tokens_details":{"thinking_tokens":36}}}
 
     event: message_stop
     data: {"type":"message_stop"}
@@ -90,19 +84,19 @@ then:
     data: {"delta":{"text":"Here's the current weather in","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":" Tokyo, Japan:\n\n- **Temperature:** 72°F (22°C)\n- **Conditions:** Sunny with light clouds\n- **Humidity:** 45%\n- **Wind:","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" Tokyo:\n\n- **Temperature:** 72°F (22°C)\n- **Conditions:** Sunny with light clouds\n- **Humidity:** 45%\n- **","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"** 8 mph NW\n\n**Packing recommendation:** Definitely pack **sunscreen**! ☀️ With sunny sk","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"Wind:** 8 mph NW\n\n**Recommendation:** Pack the **sunscreen**! ☀️ With sunny sk","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"ies, mild temperatures, and low humidity, you won't need an umbrella today. The U","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":"ies, mild temperatures, and low humidity, there's no rain in sight. Sunscreen will","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"V exposure from the sun is your main concern, so sunscreen (and ma","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" protect you from UV exposure while you're out exploring. You can leave the umbrella at home for","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_delta
-    data: {"delta":{"text":"ybe sunglasses) will serve you well. Enjoy your trip!","type":"text_delta"},"index":0,"type":"content_block_delta"}
+    data: {"delta":{"text":" now, though it's always wise to check the forecast again closer to your trip.","type":"text_delta"},"index":0,"type":"content_block_delta"}
 
     event: content_block_stop
     data: {"index":0,"type":"content_block_stop"}

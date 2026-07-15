@@ -58,7 +58,7 @@ async fn run(client: anthropic::Client, streaming: bool, tool: GetUserRecord) {
         1,
         PolicyRule::RewriteToolResult {
             tool: Some("get_user_record".to_owned()),
-            presentation: REDACTED.to_owned(),
+            presentation: REDACTED.into(),
         },
     )
     .unwrap();

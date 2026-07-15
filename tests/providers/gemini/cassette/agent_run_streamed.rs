@@ -7,14 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use rig::agent::{MultiTurnStreamItem, StreamingError};
-use rig::bevy_ecs::prelude::On;
+use rig::bevy_ecs::prelude::{In, On};
 use rig::client::CompletionClient;
 use rig::completion::PromptError;
 use rig::message::ToolChoice;
 use rig::providers::gemini;
 use rig::runtime::{
-    InvalidToolCallDetected, ModelTurnFinished, PendingInvalidToolCall, PolicyPoint, PolicyRule,
-    ToolCallPolicyDecision, ToolCallPolicyInvocation, ToolCallPrepared,
+    InvalidToolCallDetected, ModelTurnFinished, PendingInvalidToolCall, PolicyPoint,
+    PolicyResponderId, PolicyRule, ToolCallPolicyDecision, ToolCallPolicyInvocation,
+    ToolCallPrepared,
 };
 use rig::streaming::StreamingPrompt;
 
@@ -324,12 +325,15 @@ async fn builtin_streaming_cancellation_history_includes_assistant_turn() {
             .expect("stream stop policy should install");
             agent
                 .with_runtime_mut(move |runtime| {
-                    runtime.world_mut().entity_mut(policy).observe(
-                        |mut event: On<ToolCallPolicyInvocation>| {
-                            event.decision =
-                                Some(ToolCallPolicyDecision::Stop(STOP_REASON.to_owned()));
-                        },
-                    );
+                    runtime
+                        .register_tool_call_policy_responder(
+                            policy,
+                            PolicyResponderId::new("stream-stop-add").unwrap(),
+                            |In(_event): In<ToolCallPolicyInvocation>| {
+                                Some(ToolCallPolicyDecision::Stop(STOP_REASON.to_owned()))
+                            },
+                        )
+                        .expect("streaming tool-call responder should register");
                 })
                 .expect("stream stop observer should install");
 
