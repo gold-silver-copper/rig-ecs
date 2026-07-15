@@ -157,6 +157,7 @@ name = "agent_with_approval_policy"
 version = "0.40.0"
 dependencies = [
  "anyhow",
+ "bevy_ecs",
  "rig",
  "serde",
  "serde_json",
@@ -215,6 +216,7 @@ name = "agent_with_human_in_the_loop"
 version = "0.40.0"
 dependencies = [
  "anyhow",
+ "bevy_ecs",
  "rig",
  "serde",
  "serde_json",
@@ -13003,6 +13005,7 @@ name = "tool_result_outcomes"
 version = "0.40.0"
 dependencies = [
  "anyhow",
+ "bevy_ecs",
  "rig",
  "serde",
  "serde_json",
